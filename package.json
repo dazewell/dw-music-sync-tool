@@ -1,0 +1,39 @@
+{
+  "name": "dw-music-sync-tool",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-first playlist backups and a foundation for deliberate cross-platform music sync",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "bin": {
+    "music-library": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc && node scripts/copy-web.mjs",
+    "start": "node dist/cli.js serve",
+    "dev": "tsx src/cli.ts serve",
+    "demo": "node dist/cli.js serve --demo",
+    "backup": "node dist/cli.js backup",
+    "typecheck": "tsc --noEmit",
+    "test:browser": "playwright test",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "google-auth-library": "^10.3.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.18.0",
+    "@types/supertest": "^6.0.3",
+    "supertest": "^7.1.4",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
