@@ -39,7 +39,7 @@ function provider(): PlaylistProvider {
   return {
     id: "youtube", coverage: "Synthetic fixture",
     listPlaylists: async () => [playlist],
-    getPlaylist: async () => ({ playlist, warnings: [], entries: [] }),
+    getPlaylist: async item => ({ playlist: item, warnings: [], entries: [] }),
   };
 }
 
@@ -48,10 +48,11 @@ type Boundary = "owner" | "initial-manifest-stage" | "intent-stage" | "intent"
   | "checkpoint-stage" | "checkpoint" | "cleanup";
 
 /** Copy the actual durable bytes at a write boundary, without a real process crash. */
-async function snapshot(boundary: Boundary): Promise<string> {
+async function snapshot(boundary: Boundary, playlistCount = 1): Promise<string> {
   let id: string | undefined;
+  let captures = 0;
   const capture = async (directory: string) => {
-    if (id) return;
+    if (id || ++captures !== playlistCount) return;
     id = path.basename(directory);
     await fs.cp(directory, path.join(root, id), { recursive: true });
   };
@@ -74,6 +75,8 @@ async function snapshot(boundary: Boundary): Promise<string> {
       const text = await fs.readFile(source);
       expect(output.size).toBe(text.length);
       expect(output.sha256).toBe(createHash("sha256").update(text).digest("hex"));
+      const format = file.endsWith(".json") ? "json" : file.endsWith(".csv") ? "csv" : "m3u";
+      expect(intent.result.integrity[format]).toEqual({ size: output.size, sha256: output.sha256 });
       if (file.endsWith(".json")) { before = "json-stage"; after = "json"; }
       if (file.endsWith(".csv")) { before = "csv-stage"; after = "csv"; }
       if (file.endsWith(".m3u8")) { before = "m3u-stage"; after = "full"; }
@@ -100,7 +103,14 @@ async function snapshot(boundary: Boundary): Promise<string> {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date(startedAt));
   try {
-    await runBackup(provider(), path.join(scratch, "source"));
+    const fixture = provider();
+    if (playlistCount > 1) {
+      const [playlist] = await fixture.listPlaylists();
+      fixture.listPlaylists = async () => Array.from({ length: playlistCount }, (_, index) => ({
+        ...playlist!, id: `fixture-${index}`,
+      }));
+    }
+    await runBackup(fixture, path.join(scratch, "source"));
   } finally {
     vi.useRealTimers();
     renameSpy.mockRestore();
@@ -146,6 +156,14 @@ describe("durable interruption boundaries", () => {
       totals: { playlists: 1, completed: checkpointed ? 1 : 0, failed: 0, entries: 0 },
     });
     expect(recovered!.playlists).toHaveLength(checkpointed ? 1 : 0);
+    if (checkpointed) {
+      for (const format of ["json", "csv", "m3u"] as const) {
+        const bytes = before[recovered!.playlists[0]!.files![format]]!;
+        expect(recovered!.playlists[0]!.integrity![format]).toEqual({
+          size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+        });
+      }
+    }
     for (const [name, bytes] of Object.entries(before)) {
       if (name !== "manifest.json") expect(await fs.readFile(path.join(root, id, name))).toEqual(bytes);
     }
@@ -328,6 +346,47 @@ describe("unprovable ownership remains protected", () => {
 });
 
 describe("recovery and journal retention retries", () => {
+  it("still accepts original evidence from a legacy pending journal without backfilling a manifest", async () => {
+    const id = await snapshot("checkpoint");
+    const manifest = await readManifest(root, id);
+    delete manifest.playlists[0]!.integrity;
+    const intent = await pending(id);
+    delete intent.result.integrity;
+    await fs.writeFile(path.join(root, id, "manifest.json"), JSON.stringify(manifest));
+    await fs.writeFile(path.join(root, id, BACKUP_PENDING_FILENAME), JSON.stringify(intent));
+    const [recovered] = await recoverInterruptedBackups(root);
+    expect(recovered!.playlists[0]!.integrity).toBeUndefined();
+    expect((await readManifest(root, id)).playlists[0]!.integrity).toBeUndefined();
+    expect(await pruneExpiredBackups(root, expiry)).toEqual({ deleted: [id], warnings: [] });
+  });
+
+  it.each([false, true])(
+    "checks earlier checkpointed exports alongside a later interrupted playlist (replacement: %s)",
+    async replace => {
+      const id = await snapshot("full", 2);
+      const [manifest] = await recoverInterruptedBackups(root);
+      expect(manifest!.playlists).toHaveLength(1);
+      expect(manifest!.playlists[0]!.integrity).toBeDefined();
+      expect((await pending(id)).index).toBe(1);
+      if (replace) {
+        const filename = path.join(root, id, manifest!.playlists[0]!.files!.csv);
+        const bytes = await fs.readFile(filename);
+        await fs.writeFile(filename, Buffer.alloc(bytes.length, "u"));
+      }
+      const before = await contents(id);
+      const unlink = vi.spyOn(fs, "unlink");
+      const result = await pruneExpiredBackups(root, expiry);
+      if (replace) {
+        expect(result.deleted).toEqual([]);
+        expect(result.warnings.join(" ")).toContain("recorded contents");
+        expect(unlink).not.toHaveBeenCalled();
+        expect(await contents(id)).toEqual(before);
+      } else {
+        expect(result).toEqual({ deleted: [id], warnings: [] });
+      }
+    },
+  );
+
   it.each(["export-cleanup", "checkpoint", "journal-cleanup"] as const)(
     "retains a usable intent after a caught %s failure, not just an abrupt stop",
     async boundary => {

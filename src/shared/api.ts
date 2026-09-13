@@ -5,6 +5,10 @@ export interface StatusResponse {
   demo: boolean;
   configured: boolean;
   connected: boolean;
+  connectionError: {
+    code: "GOOGLE_TOKEN_INVALID" | "GOOGLE_CONFIG_INVALID";
+    message: string;
+  } | null;
   csrfToken: string;
   backupDirectory: string;
   redirectUri: string;

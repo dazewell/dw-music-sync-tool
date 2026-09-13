@@ -103,6 +103,12 @@ describe("complete local playlist archives", () => {
       const hash = createHash("sha256").update(`youtube:${playlists[index]!.id}`).digest("hex").slice(0, 12);
       const basename = `Favorites-${hash}-${String(index + 1).padStart(4, "0")}`;
       expect(result.files).toEqual({ json: `${basename}.json`, csv: `${basename}.csv`, m3u: `${basename}.m3u8` });
+      for (const format of ["json", "csv", "m3u"] as const) {
+        const bytes = await fs.readFile(await resolveBackupFile(root, manifest.id, result.files![format]));
+        expect(result.integrity![format]).toEqual({
+          size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+        });
+      }
       const archive = JSON.parse(await fs.readFile(await resolveBackupFile(root, manifest.id, result.files!.json), "utf8"));
       expect(archive).toMatchObject({
         schemaVersion: 1, playlist: playlists[index],
@@ -410,6 +416,25 @@ describe("failures and recoverable checkpoints", () => {
 });
 
 describe("safe backup discovery and file resolution", () => {
+  it.each(["hash", "negative-size", "fractional-size", "missing-format", "extra-field", "null"] as const)(
+    "rejects invalid completed integrity metadata: %s",
+    async corruption => {
+      const manifest = await successfulBackup();
+      const result = manifest.playlists[0]!;
+      const integrity = structuredClone(result.integrity!) as unknown as Record<string, unknown>;
+      if (corruption === "hash") integrity.json = { size: 1, sha256: "invalid" };
+      if (corruption === "negative-size") integrity.json = { ...result.integrity!.json, size: -1 };
+      if (corruption === "fractional-size") integrity.json = { ...result.integrity!.json, size: 0.5 };
+      if (corruption === "missing-format") delete integrity.csv;
+      if (corruption === "extra-field") integrity.other = result.integrity!.json;
+      await fs.writeFile(path.join(root, manifest.id, "manifest.json"), JSON.stringify({
+        ...manifest,
+        playlists: [{ ...result, integrity: corruption === "null" ? null : integrity }],
+      }));
+      await expect(readManifest(root, manifest.id)).rejects.toMatchObject({ code: "INVALID_MANIFEST" });
+    },
+  );
+
   it("returns an empty collection for missing roots and ignores unrelated directories", async () => {
     expect(await listBackups(path.join(root, "not-created"))).toEqual([]);
     expect(await recoverInterruptedBackups(path.join(root, "not-created"))).toEqual([]);

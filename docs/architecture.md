@@ -42,6 +42,10 @@ without mixing credentials into domain records.
 `src/providers/youtube.ts` owns endpoint details, pagination, response validation,
 quota/rate-limit handling and coverage statements. `src/auth/google.ts` owns
 Google credentials and token refresh. Neither knows about HTML or filenames.
+A single validated pending token save is completed before using authorization;
+multiple or unprovable intents require explicit inspection rather than guessing
+their order. Disconnect enumerates validated pending tokens independently of the
+main file and revokes/removes both, with explicit remote and local failure states.
 
 `src/core/backup.ts` and storage helpers own run lifecycle, portable filenames,
 atomic writes, export formats and history. JSON is the authoritative archive;
@@ -55,11 +59,22 @@ preflight and execution, inventory reads and credential-changing operations so
 disconnect or token replacement cannot interleave with a provider read. Conflicting
 API operations return explicit 409 responses; browser OAuth callbacks preserve
 the redirect-based error flow and do not consume pending state on a mismatch.
+Status returns a typed `connectionError` alongside the session/CSRF information
+for malformed tokens or Desktop-client configuration, with `connected: false`
+and the known configuration state. Other errors still fail the request. The UI
+retains actionable errors and offers a connection recheck independent of playlist
+reads; a failed status check clears stale authorization before controls render.
 The manifest, rather than browser
 memory, is the durable record. Process locks protect both the data directory and
 backup directory, including when different accounts choose a shared output path.
 After acquiring both, the CLI recovers interrupted manifests before starting
 cleanup or accepting work. These are local locks, not distributed locks.
+Locks atomically publish a prepopulated directory with a nonce-specific marker.
+Release removes only that lease's unique marker and then attempts an atomic
+empty-directory removal, so a stale release cannot unlink a successor's marker.
+Concurrent/repeated release calls share one promise. Legacy regular lock files
+remain blocking; stop older application versions before upgrading, and never
+manually remove a live lock.
 
 ## Backup semantics and limitations
 
@@ -72,6 +87,9 @@ cleanup or accepting work. These are local locks, not distributed locks.
   verified owner-only empty runs; uncheckpointed outputs with validated intents
   remain unavailable for download but eligible for normal expiry. Unknown,
   changed or unprovable leftovers remain protected and produce an explicit error.
+  Manifest v1 adds optional `playlists[].integrity.{json,csv,m3u}` records containing
+  original `{size, sha256}` values. New completed exports retain these values
+  before their pending intent is removed; failed and legacy results omit them.
 - Keep existing run contents unchanged until their 30-day expiry; don't turn a
   failed fetch into an empty playlist or overwrite a previously good export.
 - Fingerprint ordered provider-native identities, not display names, added dates
@@ -86,6 +104,11 @@ cleanup or accepting work. These are local locks, not distributed locks.
   Persistent per-run ownership markers and validated manifests gate deletion.
   `src/core/retention.ts` preflights managed files and removes only recognized,
   expired, inactive runs without following links or recursively deleting content.
+  Original manifest/journal hashes protect against same-name replacements; missing
+  files allow retry of partial deletion, but reappearing or changed files stop it.
+  Legacy manifests remain readable, but exports without original integrity proof
+  are preserved with a cleanup warning and require manual resolution. Existing
+  contents are never silently hashed and adopted as ownership evidence.
   `src/services/retention.ts` shares startup/minute cleanup between server and CLI.
   Failures are visible; expired data is not served and unresolved cleanup blocks
   new backups. User-created copies and shutdown/sleep gaps are explicitly outside

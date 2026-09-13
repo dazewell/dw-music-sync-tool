@@ -59,6 +59,13 @@ verification and consent requirements depend on how you distribute the app.
 No Spotify account, Soundiiz subscription or YouTube Music Premium subscription
 is needed for this release.
 
+If saved tokens are malformed, the interface keeps **Connect Google** available
+and shows the connection error so you can authorize again. For a missing or
+invalid Desktop client JSON, replace the file at its configured path and use
+**Recheck connection**; this does not read playlists or reload the page. Changing
+the configured path still requires a server restart. Other status failures remain
+explicit and can be retried after the reported local problem is resolved.
+
 ## Local files and commands
 
 ```powershell
@@ -72,10 +79,16 @@ node dist\cli.js --help
 
 Close the web app before running the standalone backup command. Runtime locks
 protect both the application data directory and backup directory, so different
-accounts cannot race over a shared output folder. If a process crashes, inspect
-the `runtime.lock` files in those two directories (including the `demo`
-subdirectories in demo mode), verify their recorded PID is no longer running,
-then remove **only those lock files**.
+accounts cannot race over a shared output folder. Each `runtime.lock` is a
+directory containing a uniquely named JSON ownership marker. If a process
+crashes, inspect those markers in both locations (including the `demo`
+subdirectories in demo mode), verify the recorded PID is no longer running,
+then remove **only that marker and its empty lock directory**. Older versions
+used a regular `runtime.lock` file; it remains blocking until the same PID check
+and explicit removal. Stop older versions before upgrading or starting the new
+version; never remove or modify a live process's lock. Unpublished
+`.runtime-lock-<nonce>` staging directories can remain after a crash but do not
+hold a lock; use the same marker/PID checks before removing them.
 
 Each run has a new directory under `backups` and a `manifest.json` describing its
 coverage, counts, per-playlist files, fingerprints, warnings and failures.
@@ -99,6 +112,8 @@ manifest. Export intent journals record exact output and staging paths, sizes an
 hashes before publication, so validated uncheckpointed files can expire safely
 without being advertised as completed exports. Unrecognized or changed leftovers
 are preserved with an inspection error rather than guessed to be safe to delete.
+Completed results retain each export's original byte count and SHA-256 hash in
+the manifest, allowing cleanup to detect replacement files even at a known name.
 The CLI prints the final manifest as JSON to stdout and progress to stderr; it exits
 nonzero for partial or failed runs.
 
@@ -143,9 +158,18 @@ OS credential-vault integration is not implemented. Client files, tokens, `.env`
 local state and the default backup directory are Git-ignored. Custom paths are
 your responsibility; do not commit credentials or private library exports.
 
+An interrupted credential save is recovered from a single intact pending file
+before authorization is used. Pending files are checked for the exact generated
+name, token shape, read-only scope, ordinary-file ownership and changes during
+inspection. Ambiguous, partial or unsafe leftovers produce an explicit error
+instead of silently being accepted or deleted; inspect them in the private token
+directory before retrying.
+
 Disconnect revokes/removes authorization. Review any reported revocation failure
 and revoke access in your [Google account](https://myaccount.google.com/permissions)
-if necessary. Disconnect does not itself remove exports. Google's revocation and
+if necessary. Disconnect also revokes/removes validated pending credentials,
+even when the main token file was never published; a failed local cleanup is
+not reported as success. Disconnect does not itself remove exports. Google's revocation and
 user-deletion requirements are separate from routine 30-day retention: remove
 app-managed exports and any user-created copies when those requirements apply.
 Do not treat routine expiry as satisfying every revocation/deletion obligation.
@@ -162,8 +186,13 @@ There is no express local-personal-export exception. In this application:
 - Cleanup runs on startup, before a backup, and once per minute while the app is
   running. New snapshots do not reset old snapshots' deadlines.
 - Only positively marked, expired, inactive run directories with valid manifests
-  and recognized files are eligible. Cleanup removes known files individually;
+  and original export-integrity evidence are eligible. Cleanup verifies content
+  before deleting any exports and rechecks files during deletion. It removes known files individually;
   unrelated files, unmarked folders, symlinks and unexpected content are preserved.
+- **Earlier backups without original integrity records remain readable but
+  require manual cleanup at expiry.** The app will not trust freshly calculated
+  hashes as proof that existing files are still its original exports. These runs
+  produce a cleanup warning and require inspection/removal before another backup.
 - Cleanup errors are visible, expired exports are not offered for download, and
   starting another backup is blocked until cleanup problems are resolved.
 - **A stopped or sleeping local app cannot enforce the deadline.** Leave it

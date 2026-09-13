@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,11 @@ const mocks = vi.hoisted(() => ({
   refresh: vi.fn(),
   revoke: vi.fn(),
 }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, unlink: vi.fn(actual.unlink) };
+});
 
 vi.mock("google-auth-library", () => ({
   CodeChallengeMethod: { S256: "S256" },
@@ -70,7 +76,124 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(directory, { recursive: true, force: true });
+});
+
+describe("interrupted Google credential saves", () => {
+  const pendingPath = (digit = "a") => `${tokenFile}.${digit.repeat(24)}.pending`;
+
+  beforeEach(async () => {
+    await writeFile(credentialsFile, JSON.stringify(config));
+    await mkdir(join(directory, "private"));
+  });
+
+  it("recovers a fully flushed pending token before reporting connection status", async () => {
+    const tokens = freshTokens();
+    await writeFile(pendingPath(), JSON.stringify(tokens));
+    expect(await auth.status()).toEqual({ configured: true, connected: true });
+    expect(JSON.parse(await readFile(tokenFile, "utf8"))).toEqual(tokens);
+    expect(await readdir(join(directory, "private"))).toEqual(["token.json"]);
+    expect(mocks.getToken).not.toHaveBeenCalled();
+    expect(mocks.refresh).not.toHaveBeenCalled();
+  });
+
+  it("finishes a pending refresh-token rotation before using the previous token", async () => {
+    await saveTokens(freshTokens());
+    await writeFile(pendingPath(), JSON.stringify({ ...freshTokens(), access_token: "new-access", refresh_token: "rotated" }));
+    expect(await auth.getAccessToken()).toBe("new-access");
+    expect(JSON.parse(await readFile(tokenFile, "utf8")).refresh_token).toBe("rotated");
+  });
+
+  it("revokes and removes an orphan even when the main token was never published", async () => {
+    await writeFile(pendingPath(), JSON.stringify(freshTokens()));
+    await auth.disconnect();
+    expect(mocks.revoke).toHaveBeenCalledWith("secret-refresh-token");
+    expect(await readdir(join(directory, "private"))).toEqual([]);
+  });
+
+  it("rejects ambiguous recovery but disconnect can revoke every validated intent", async () => {
+    await saveTokens(freshTokens());
+    await writeFile(pendingPath(), JSON.stringify({ ...freshTokens(), refresh_token: "first" }));
+    await writeFile(pendingPath("b"), JSON.stringify({ ...freshTokens(), refresh_token: "second" }));
+    await expect(auth.status()).rejects.toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    await auth.disconnect();
+    expect(mocks.revoke.mock.calls.map(call => call[0]).sort()).toEqual(["first", "second", "secret-refresh-token"]);
+    expect(await readdir(join(directory, "private"))).toEqual([]);
+  });
+
+  it("keeps remote revocation failures explicit while removing all local credentials", async () => {
+    await writeFile(pendingPath(), JSON.stringify(freshTokens()));
+    mocks.revoke.mockRejectedValue(new Error("secret-refresh-token remote details"));
+    const error = await auth.disconnect().catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "GOOGLE_REVOKE_FAILED" });
+    expect(String(error)).not.toContain("secret-refresh-token");
+    expect(await readdir(join(directory, "private"))).toEqual([]);
+  });
+
+  it.each([
+    "partial secret-refresh-token",
+    JSON.stringify({ ...freshTokens(), unrelated: "user data" }),
+    JSON.stringify({ ...freshTokens(), scope: "https://www.googleapis.com/auth/youtube" }),
+  ])("preserves unprovable pending data and never reports a successful disconnect %#", async (source) => {
+    await writeFile(pendingPath(), source);
+    await expect(auth.status()).rejects.toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    const error = await auth.disconnect().catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    expect(String(error)).not.toContain("secret-refresh-token");
+    expect(await readFile(pendingPath(), "utf8")).toBe(source);
+    expect(mocks.revoke).not.toHaveBeenCalled();
+  });
+
+  it("preserves hard-linked pending credentials", async () => {
+    const external = join(directory, "external.json");
+    const source = JSON.stringify(freshTokens());
+    await writeFile(external, source);
+    await fs.link(external, pendingPath());
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    expect(await readFile(external, "utf8")).toBe(source);
+    expect(await readFile(pendingPath(), "utf8")).toBe(source);
+  });
+
+  it("does not follow a pending directory junction or overwrite a linked target", async () => {
+    const external = join(directory, "external");
+    await mkdir(external);
+    await fs.symlink(external, pendingPath(), "junction");
+    await expect(auth.status()).rejects.toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    expect((await fs.lstat(pendingPath())).isSymbolicLink()).toBe(true);
+  });
+
+  it("keeps unrelated pending-like filenames untouched", async () => {
+    await writeFile(`${tokenFile}.notes.pending`, "user notes");
+    await writeFile(join(directory, "private", `other.json.${"a".repeat(24)}.pending`), "other app data");
+    await auth.disconnect();
+    expect(await readdir(join(directory, "private"))).toHaveLength(2);
+    expect(mocks.revoke).not.toHaveBeenCalled();
+  });
+
+  it("reports changed pending files rather than unlinking them or hiding remaining credentials", async () => {
+    await saveTokens(freshTokens());
+    await writeFile(pendingPath(), JSON.stringify(freshTokens()));
+    mocks.revoke.mockImplementation(async () => { await writeFile(pendingPath(), "replacement user content"); });
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_DISCONNECT_LOCAL_FAILED" });
+    expect(await readFile(pendingPath(), "utf8")).toBe("replacement user content");
+    expect(JSON.parse(await readFile(tokenFile, "utf8"))).toMatchObject({ refresh_token: "secret-refresh-token" });
+  });
+
+  it("does not report success if local pending cleanup fails", async () => {
+    await writeFile(pendingPath(), JSON.stringify(freshTokens()));
+    vi.mocked(fs.unlink).mockRejectedValueOnce(new Error("synthetic permissions failure"));
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_DISCONNECT_LOCAL_FAILED" });
+    expect(await readFile(pendingPath(), "utf8")).toContain("secret-refresh-token");
+  });
+
+  it("does not skip the main token after a pending file disappears during revocation", async () => {
+    await saveTokens(freshTokens());
+    await writeFile(pendingPath(), JSON.stringify(freshTokens()));
+    mocks.revoke.mockImplementation(async () => { await fs.unlink(pendingPath()); });
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_DISCONNECT_LOCAL_FAILED" });
+    expect(JSON.parse(await readFile(tokenFile, "utf8"))).toMatchObject({ refresh_token: "secret-refresh-token" });
+  });
 });
 
 describe("GoogleAuth configuration and PKCE", () => {

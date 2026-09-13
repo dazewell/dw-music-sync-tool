@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { readManifest, runBackup } from "../src/core/backup.js";
+import { listBackups, readManifest, recoverInterruptedBackups, resolveBackupFile, runBackup } from "../src/core/backup.js";
 import type { BackupManifest, PlaylistProvider } from "../src/core/models.js";
 import { backupExpiresAt, pruneExpiredBackups, RETENTION_DAYS } from "../src/core/retention.js";
 import { BACKUP_OWNER_APP, BACKUP_OWNER_FILENAME } from "../src/core/storage.js";
@@ -58,6 +58,33 @@ async function backup(date = startedAt, fixture = provider(), directory = root):
 
 function runPath(manifest: BackupManifest, file?: string): string {
   return file ? path.join(root, manifest.id, file) : path.join(root, manifest.id);
+}
+
+async function runContents(manifest: BackupManifest): Promise<Record<string, Buffer>> {
+  return Object.fromEntries(await Promise.all((await fs.readdir(runPath(manifest))).map(async name => [
+    name, await fs.readFile(runPath(manifest, name)),
+  ])));
+}
+
+async function backupWithStatus(status: "complete" | "partial" | "interrupted"): Promise<BackupManifest> {
+  const fixture = provider();
+  if (status === "partial") {
+    const [playlist] = await fixture.listPlaylists();
+    const original = fixture.getPlaylist;
+    fixture.listPlaylists = async () => [playlist!, { ...playlist!, id: "failed" }];
+    fixture.getPlaylist = async item => {
+      if (item.id === "failed") throw new Error("Synthetic playlist failure");
+      return original(item);
+    };
+  }
+  const manifest = await backup(startedAt, fixture);
+  if (status === "interrupted") {
+    await fs.writeFile(runPath(manifest, "manifest.json"), JSON.stringify({
+      ...manifest, status: "running", completedAt: null,
+    }));
+    return (await recoverInterruptedBackups(root))[0]!;
+  }
+  return manifest;
 }
 
 describe("rolling 30-day expiration", () => {
@@ -253,6 +280,219 @@ describe("positive ownership and deletion preflight", () => {
     expect(result.warnings.join(" ")).toContain("protected run metadata");
     expect(unlink).not.toHaveBeenCalled();
   });
+});
+
+describe("original integrity evidence for completed exports", () => {
+  it.each(["json", "csv", "m3u"] as const)(
+    "preserves the entire run after a same-size %s replacement, even with the original mtime",
+    async format => {
+      const manifest = await backup();
+      const filename = runPath(manifest, manifest.playlists[0]!.files![format]);
+      const before = await fs.stat(filename);
+      const replacement = Buffer.alloc(before.size, "x");
+      await fs.unlink(filename);
+      await fs.writeFile(filename, replacement);
+      await fs.utimes(filename, before.atime, before.mtime);
+      const contents = await runContents(manifest);
+      const unlink = vi.spyOn(fs, "unlink");
+      const result = await pruneExpiredBackups(root, expiry);
+      expect(result.deleted).toEqual([]);
+      expect(result.warnings.join(" ")).toContain("recorded contents");
+      expect(unlink).not.toHaveBeenCalled();
+      expect(await runContents(manifest)).toEqual(contents);
+      expect(await fs.readFile(filename)).toEqual(replacement);
+    },
+  );
+
+  it.each(["complete", "partial", "interrupted"] as const)(
+    "requires original evidence for every completed playlist of a %s run",
+    async status => {
+      const manifest = await backupWithStatus(status);
+      expect(manifest.status).toBe(status);
+      const filename = runPath(manifest, manifest.playlists[0]!.files!.csv);
+      await fs.writeFile(filename, "Unrelated user content");
+      const before = await runContents(manifest);
+      const unlink = vi.spyOn(fs, "unlink");
+      const result = await pruneExpiredBackups(root, expiry);
+      expect(result.deleted).toEqual([]);
+      expect(result.warnings.join(" ")).toContain("recorded size");
+      expect(unlink).not.toHaveBeenCalled();
+      expect(await runContents(manifest)).toEqual(before);
+    },
+  );
+
+  it.each(["complete", "partial", "interrupted"] as const)(
+    "keeps %s legacy archives readable but never backfills or deletes unverifiable exports",
+    async status => {
+      const manifest = await backupWithStatus(status);
+      for (const playlist of manifest.playlists) delete playlist.integrity;
+      await fs.writeFile(runPath(manifest, "manifest.json"), JSON.stringify(manifest));
+      expect(await readManifest(root, manifest.id)).toEqual(manifest);
+      expect(await listBackups(root)).toEqual([manifest]);
+      expect(await resolveBackupFile(root, manifest.id, manifest.playlists[0]!.files!.json))
+        .toBe(runPath(manifest, manifest.playlists[0]!.files!.json));
+      const before = await runContents(manifest);
+      expect(await recoverInterruptedBackups(root)).toEqual([]);
+      const unlink = vi.spyOn(fs, "unlink");
+      const result = await pruneExpiredBackups(root, expiry);
+      expect(result.deleted).toEqual([]);
+      expect(result.warnings.join(" ")).toContain("no original integrity evidence");
+      expect(unlink).not.toHaveBeenCalled();
+      expect(await runContents(manifest)).toEqual(before);
+      expect((await readManifest(root, manifest.id)).playlists[0]!.integrity).toBeUndefined();
+    },
+  );
+
+  it("verifies the last export's hash before unlinking the first export", async () => {
+    const manifest = await backup();
+    const filename = runPath(manifest, manifest.playlists[0]!.files!.m3u);
+    const bytes = await fs.readFile(filename);
+    bytes[0] = bytes[0] === 35 ? 32 : 35;
+    await fs.writeFile(filename, bytes);
+    const before = await runContents(manifest);
+    const unlink = vi.spyOn(fs, "unlink");
+    expect((await pruneExpiredBackups(root, expiry)).warnings.join(" ")).toContain("recorded contents");
+    expect(unlink).not.toHaveBeenCalled();
+    expect(await runContents(manifest)).toEqual(before);
+  });
+
+  it.each(["size", "sha256"] as const)("preserves a run when persisted %s evidence is changed", async field => {
+    const manifest = await backup();
+    const proof = manifest.playlists[0]!.integrity!.m3u;
+    if (field === "size") proof.size++;
+    else proof.sha256 = "0".repeat(64);
+    await fs.writeFile(runPath(manifest, "manifest.json"), JSON.stringify(manifest));
+    const before = await runContents(manifest);
+    const unlink = vi.spyOn(fs, "unlink");
+    const result = await pruneExpiredBackups(root, expiry);
+    expect(result.deleted).toEqual([]);
+    expect(result.warnings.join(" ")).toContain("recorded");
+    expect(unlink).not.toHaveBeenCalled();
+    expect(await runContents(manifest)).toEqual(before);
+  });
+
+  it("rechecks the pathname when a file is replaced while its original open handle is being verified", async () => {
+    const manifest = await backup();
+    const filename = runPath(manifest, manifest.playlists[0]!.files!.json);
+    const outside = path.join(scratch, "moved-original.json");
+    const bytes = await fs.readFile(filename);
+    const open = fs.open;
+    let verifications = 0;
+    vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      if (String(args[0]) === filename && ++verifications === 2) {
+        const stat = handle.stat.bind(handle);
+        let stats = 0;
+        vi.spyOn(handle, "stat").mockImplementation(async () => {
+          const info = await stat();
+          if (++stats === 2) {
+            await fs.rename(filename, outside);
+            await fs.writeFile(filename, Buffer.alloc(bytes.length, "u"));
+          }
+          return info;
+        });
+      }
+      return handle;
+    });
+    const unlink = vi.spyOn(fs, "unlink");
+    const result = await pruneExpiredBackups(root, expiry);
+    expect(verifications).toBe(2);
+    expect(result.deleted).toEqual([]);
+    expect(result.warnings.join(" ")).toContain("replaced while");
+    expect(unlink).not.toHaveBeenCalled();
+    expect(await fs.readFile(filename)).toEqual(Buffer.alloc(bytes.length, "u"));
+    expect(await fs.readFile(outside)).toEqual(bytes);
+  });
+
+  it("preserves a replacement recreated at a path already deleted by an interrupted retention pass", async () => {
+    const manifest = await backup();
+    const files = manifest.playlists[0]!.files!;
+    const original = await fs.readFile(runPath(manifest, files.json));
+    const unlink = fs.unlink;
+    vi.spyOn(fs, "unlink").mockImplementation(async filename => {
+      if (String(filename).endsWith(".csv")) throw new Error("Locked");
+      await unlink(filename);
+    });
+    expect((await pruneExpiredBackups(root, expiry)).warnings.join(" ")).toContain("safe retry");
+    await expect(fs.stat(runPath(manifest, files.json))).rejects.toMatchObject({ code: "ENOENT" });
+    vi.restoreAllMocks();
+    await fs.writeFile(runPath(manifest, files.json), Buffer.alloc(original.length, "u"));
+    const before = await runContents(manifest);
+    const retryUnlink = vi.spyOn(fs, "unlink");
+    expect((await pruneExpiredBackups(root, expiry)).warnings.join(" ")).toContain("recorded contents");
+    expect(retryUnlink).not.toHaveBeenCalled();
+    expect(await runContents(manifest)).toEqual(before);
+  });
+
+  it("rejects a hard-linked completed export before unlinking any file", async () => {
+    const manifest = await backup();
+    const filename = runPath(manifest, manifest.playlists[0]!.files!.m3u);
+    const outside = path.join(scratch, "user-copy");
+    const original = await fs.readFile(filename);
+    await fs.link(filename, outside);
+    const unlink = vi.spyOn(fs, "unlink");
+    const result = await pruneExpiredBackups(root, expiry);
+    expect(result.deleted).toEqual([]);
+    expect(result.warnings.join(" ")).toContain("unlinked file");
+    expect(unlink).not.toHaveBeenCalled();
+    expect(await fs.readFile(outside)).toEqual(original);
+    expect(await fs.readFile(filename)).toEqual(original);
+  });
+
+  it.each(["replace", "hardlink", "manifest"] as const)(
+    "rejects a concurrent %s after hashing but before the first deletion",
+    async mutation => {
+      const manifest = await backup();
+      const output = runPath(manifest, manifest.playlists[0]!.files!.m3u);
+      const bytes = await fs.readFile(output);
+      const readdir = fs.readdir;
+      let runReads = 0;
+      const hook = vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
+        const entries = await (readdir as (...values: unknown[]) => Promise<unknown>)(...args);
+        if (String(args[0]) === runPath(manifest) && ++runReads === 2) {
+          if (mutation === "replace") await fs.writeFile(output, Buffer.alloc(bytes.length, "r"));
+          if (mutation === "hardlink") await fs.link(output, path.join(scratch, "user-link"));
+          if (mutation === "manifest") await fs.appendFile(runPath(manifest, "manifest.json"), " ");
+        }
+        return entries as Awaited<ReturnType<typeof fs.readdir>>;
+      });
+      const unlink = vi.spyOn(fs, "unlink");
+      const result = await pruneExpiredBackups(root, expiry);
+      expect(runReads).toBeGreaterThanOrEqual(2);
+      expect(result.deleted).toEqual([]);
+      expect(result.warnings.join(" ")).toMatch(/changed|unlinked/);
+      expect(unlink).not.toHaveBeenCalled();
+      hook.mockRestore();
+      expect(await fs.readdir(runPath(manifest))).toContain(manifest.playlists[0]!.files!.json);
+    },
+  );
+
+  it.each(["missing", "deleted"] as const)(
+    "does not adopt a %s export that reappears during a retention pass",
+    async boundary => {
+      const manifest = await backup();
+      const files = manifest.playlists[0]!.files!;
+      const json = runPath(manifest, files.json);
+      const bytes = await fs.readFile(json);
+      if (boundary === "missing") await fs.unlink(json);
+      const readdir = fs.readdir;
+      let runReads = 0;
+      vi.spyOn(fs, "readdir").mockImplementation(async (...args) => {
+        if (String(args[0]) === runPath(manifest) && ++runReads === (boundary === "missing" ? 2 : 3)) {
+          await fs.writeFile(json, Buffer.alloc(bytes.length, "u"));
+        }
+        return (readdir as (...values: unknown[]) => Promise<Awaited<ReturnType<typeof fs.readdir>>>)(...args);
+      });
+      const unlink = vi.spyOn(fs, "unlink");
+      const result = await pruneExpiredBackups(root, expiry);
+      expect(result.deleted).toEqual([]);
+      expect(result.warnings.join(" ")).toContain("reappeared");
+      expect(unlink).toHaveBeenCalledTimes(boundary === "missing" ? 0 : 1);
+      expect(await fs.readFile(json)).toEqual(Buffer.alloc(bytes.length, "u"));
+      expect(await fs.stat(runPath(manifest, files.csv))).toBeDefined();
+      expect((await readManifest(root, manifest.id)).playlists[0]!.integrity).toEqual(manifest.playlists[0]!.integrity);
+    },
+  );
 });
 
 describe("safe retries after partial filesystem failure", () => {

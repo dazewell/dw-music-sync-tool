@@ -6,6 +6,7 @@ import { z } from "zod";
 import { AppError, errorMessage } from "./errors.js";
 import {
   BACKUP_OWNER_APP, BACKUP_OWNER_FILENAME, BACKUP_PENDING_FILENAME, readManifest, readPendingExports,
+  verifyExportIntegrity,
 } from "./storage.js";
 
 export const RETENTION_DAYS = 30;
@@ -40,7 +41,8 @@ function hasCode(error: unknown, code: string): boolean {
 
 function unchanged(before: Stats, after: Stats): boolean {
   return before.dev === after.dev && before.ino === after.ino
-    && before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
+    && before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs
+    && before.nlink === after.nlink;
 }
 
 async function assertRun(root: string, id: string, identity?: Stats): Promise<string> {
@@ -157,18 +159,34 @@ async function pruneRun(root: string, id: string, now: number): Promise<"deleted
   if (!files.has(BACKUP_OWNER_FILENAME) || !files.has("manifest.json")) {
     throw new Error("ownership marker or manifest disappeared during inspection");
   }
+  const integrity = new Map(pending?.integrity);
+  for (const playlist of manifest.playlists) {
+    if (!playlist.files) continue;
+    for (const format of ["json", "csv", "m3u"] as const) {
+      const name = playlist.files[format];
+      const proof = playlist.integrity?.[format];
+      if (proof) integrity.set(name, proof);
+      if (!integrity.has(name)) {
+        throw new Error(`no original integrity evidence for "${name}"; legacy exports require manual inspection, not automatic deletion`);
+      }
+    }
+  }
+  const verified = new Map(pending?.present);
+  for (const [name, proof] of integrity) {
+    if (pending?.integrity.has(name)) continue;
+    const info = await verifyExportIntegrity(directory, name, proof);
+    if (info) verified.set(name, info);
+  }
   if (await readMetadata(directory, BACKUP_OWNER_FILENAME, 4_096) !== ownerText
     || await readMetadata(directory, "manifest.json", 16 * 1_024 * 1_024) !== manifestText
     || (pending && await readMetadata(directory, BACKUP_PENDING_FILENAME, 1_024 * 1_024) !== pending.text)) {
     throw new Error("ownership marker, manifest, or pending intent changed during inspection");
   }
-  if (pending) {
-    for (const name of pending.files) {
-      const before = pending.present.get(name);
-      const after = files.get(name);
-      if (before ? !after || !unchanged(before, after) : after) {
-        throw new Error("pending exports changed after content verification");
-      }
+  for (const name of integrity.keys()) {
+    const before = verified.get(name);
+    const after = files.get(name);
+    if (before ? !after || !unchanged(before, after) : after) {
+      throw new Error("exports changed after content verification");
     }
   }
   // Missing declared exports are allowed so interrupted deletions can be retried.
@@ -176,19 +194,32 @@ async function pruneRun(root: string, id: string, now: number): Promise<"deleted
     ...outputs, ".active.json", ...(pending ? [BACKUP_PENDING_FILENAME] : []),
     "manifest.json", BACKUP_OWNER_FILENAME,
   ];
+  const remaining = new Set(files.keys());
   let removedMetadata = false;
+  let deletionStarted = false;
   try {
     for (const name of deletionOrder) {
       const expected = files.get(name);
       if (!expected) continue;
       await assertRun(root, id, identity);
-      if (!unchanged(expected, await regularFile(directory, name))) {
+      // Also reject a previously missing or deleted output that reappears at an allowed basename.
+      const current = await fs.readdir(directory);
+      if (current.some(file => !remaining.has(file))) throw new Error("unexpected files were added or reappeared during deletion");
+      if (!deletionStarted) {
+        for (const [file, info] of files) {
+          if (!unchanged(info, await regularFile(directory, file))) {
+            throw new Error(`"${file}" changed after the deletion preflight`);
+          }
+        }
+      }
+      const proof = integrity.get(name);
+      const info = proof ? await verifyExportIntegrity(directory, name, proof) : await regularFile(directory, name);
+      if (!info || !unchanged(expected, info)) {
         throw new Error(`"${name}" changed after the deletion preflight`);
       }
-      // Recheck additions before each unlink rather than deleting unexpected data.
-      const current = await fs.readdir(directory);
-      if (current.some(file => !allowed.has(file))) throw new Error("unexpected files were added during deletion");
       await fs.unlink(path.join(directory, name));
+      deletionStarted = true;
+      remaining.delete(name);
       if (name === "manifest.json" || name === BACKUP_OWNER_FILENAME || name === BACKUP_PENDING_FILENAME) removedMetadata = true;
     }
     await assertRun(root, id, identity);

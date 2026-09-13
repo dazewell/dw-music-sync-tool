@@ -61,16 +61,18 @@ Direction: seed895a4aee / candidate4, mixing-desk studio console.
         <div>
           <h2 id="connection-guide-title">Connect Google to get started</h2>
           <p id="connection-guide-copy">Authorize read-only access to the playlists your account owns. This tool cannot change your library.</p>
+          <div id="connection-error" class="inline-warning" role="alert" hidden></div>
         </div>
         <div id="setup-steps" hidden>
           <ol>
             <li>In Google Cloud, enable the <strong>YouTube Data API v3</strong> and create an OAuth client with application type <strong>Desktop app</strong>.</li>
             <li>Save the downloaded client JSON locally as <code>.local\client-secret.json</code>, or set <code>GOOGLE_CLIENT_SECRET_FILE</code> to its path.</li>
-            <li>Restart the local server with <code>npm start</code>, then reload this page. See <code>README.md</code> for the complete setup and test-user instructions.</li>
+            <li>After saving or replacing the file, use <strong>Recheck connection</strong> below. If you changed the configured file path, restart the local server with <code>npm start</code> first. See <code>README.md</code> for complete setup and test-user instructions.</li>
           </ol>
           <p class="fine-print">Keep the client secret on your machine. There is no secret-entry field in this interface.</p>
         </div>
         <p class="redirect-line">Current loopback callback: <code id="redirect-uri">Checking…</code></p>
+        <button id="recheck-connection" class="text-button" type="button">Recheck connection</button>
       </section>
 
       <div class="console">

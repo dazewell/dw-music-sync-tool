@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
-import { dirname } from "node:path";
+import { constants, type Stats } from "node:fs";
+import { chmod, lstat, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { CodeChallengeMethod, OAuth2Client, type Credentials } from "google-auth-library";
 import { z } from "zod";
 import { AppError } from "../core/errors.js";
@@ -20,6 +21,11 @@ const tokenSchema = z.object({
   scope: z.string().optional(),
 });
 type StoredTokens = z.infer<typeof tokenSchema>;
+interface PendingTokens {
+  filename: string;
+  tokens: StoredTokens;
+  identity: Stats;
+}
 
 export interface GoogleAuthOptions {
   credentialsFile: string;
@@ -31,6 +37,19 @@ function isMissing(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
+function unchanged(before: Stats, after: Stats): boolean {
+  return before.dev === after.dev && before.ino === after.ino && before.size === after.size
+    && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
+}
+
+function pendingError(): AppError {
+  return new AppError(
+    "GOOGLE_PENDING_CLEANUP_FAILED",
+    "An unfinished Google credential save could not be recovered safely. Stop other app instances and inspect pending token files in the private token directory. Preserve unrecognized files and retry after resolving them.",
+    500,
+  );
+}
+
 export class GoogleAuth {
   private queue: Promise<void> = Promise.resolve();
 
@@ -38,6 +57,7 @@ export class GoogleAuth {
 
   async status(): Promise<{ configured: boolean; connected: boolean }> {
     return this.serial(async () => {
+      await this.recoverPendingTokens();
       const client = await this.client(false);
       if (client === null) return { configured: false, connected: false };
       const tokens = await this.readTokens();
@@ -46,6 +66,7 @@ export class GoogleAuth {
   }
 
   async begin(): Promise<{ url: string; state: string; codeVerifier: string }> {
+    await this.serial(() => this.recoverPendingTokens());
     const client = await this.requiredClient();
     try {
       const { codeVerifier, codeChallenge } = await client.generateCodeVerifierAsync();
@@ -71,6 +92,7 @@ export class GoogleAuth {
       if (!code || !/^[A-Za-z0-9._~-]{43,128}$/.test(codeVerifier)) {
         throw new AppError("GOOGLE_AUTH_INVALID", "The Google authorization response is invalid. Start the connection again.", 400);
       }
+      await this.recoverPendingTokens();
       const client = await this.requiredClient();
       let credentials: Credentials;
       try {
@@ -89,6 +111,7 @@ export class GoogleAuth {
 
   async getAccessToken(): Promise<string> {
     return this.serial(async () => {
+      await this.recoverPendingTokens();
       const client = await this.requiredClient();
       const tokens = await this.readTokens();
       if (tokens === null) {
@@ -121,27 +144,42 @@ export class GoogleAuth {
 
   async disconnect(): Promise<void> {
     return this.serial(async () => {
+      const pending = await this.pendingTokens();
       const tokens = await this.readTokens();
-      if (tokens === null) return;
+      const refreshTokens = new Set([
+        ...(tokens ? [tokens.refresh_token] : []),
+        ...pending.map(item => item.tokens.refresh_token),
+      ]);
+      if (refreshTokens.size === 0) return;
       let remoteFailed = false;
-      try {
-        const client = await this.requiredClient();
-        await client.revokeToken(tokens.refresh_token);
-      } catch {
-        remoteFailed = true;
+      for (const refreshToken of refreshTokens) {
+        try {
+          const client = await this.requiredClient();
+          await client.revokeToken(refreshToken);
+        } catch {
+          remoteFailed = true;
+        }
       }
       try {
-        await unlink(this.options.tokenFile);
-      } catch (error) {
-        if (!isMissing(error)) {
-          throw new AppError(
-            "GOOGLE_DISCONNECT_LOCAL_FAILED",
-            remoteFailed
-              ? "Google revocation failed and local credentials could not be removed. Revoke this app in your Google Account permissions and remove the local token file."
-              : "Google access was revoked, but local credentials could not be removed. Remove the local token file.",
-            500,
-          );
+        for (const item of pending) {
+          await this.assertPendingUnchanged(item);
+          await unlink(item.filename);
         }
+        if (tokens) {
+          try {
+            await unlink(this.options.tokenFile);
+          } catch (error) {
+            if (!isMissing(error)) throw error;
+          }
+        }
+      } catch {
+        throw new AppError(
+          "GOOGLE_DISCONNECT_LOCAL_FAILED",
+          remoteFailed
+            ? "Google revocation failed and local credentials could not be removed. Revoke this app in your Google Account permissions and inspect the token file and pending credential files."
+            : "Google access was revoked, but local credentials could not be removed. Inspect the token file and pending credential files.",
+          500,
+        );
       }
       if (remoteFailed) {
         throw new AppError("GOOGLE_REVOKE_FAILED", "Local credentials were removed, but Google revocation failed. Remove this app's access in your Google Account permissions to finish disconnecting.", 502);
@@ -153,6 +191,69 @@ export class GoogleAuth {
     const next = this.queue.then(operation);
     this.queue = next.then(() => undefined, () => undefined);
     return next;
+  }
+
+  private async pendingTokens(): Promise<PendingTokens[]> {
+    const directory = dirname(this.options.tokenFile);
+    let names: string[];
+    try {
+      names = await readdir(directory);
+    } catch (error) {
+      if (isMissing(error)) return [];
+      throw pendingError();
+    }
+    const prefix = `${basename(this.options.tokenFile)}.`;
+    const pending: PendingTokens[] = [];
+    for (const name of names.filter(name => name.startsWith(prefix)
+      && /^[a-f0-9]{24}\.pending$/.test(name.slice(prefix.length)))) {
+      const filename = join(directory, name);
+      try {
+        const identity = await lstat(filename);
+        if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1 || identity.size > 1_048_576) {
+          throw pendingError();
+        }
+        const handle = await open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+        let source: string;
+        try {
+          if (!unchanged(identity, await handle.stat())) throw pendingError();
+          source = await handle.readFile("utf8");
+          if (!unchanged(identity, await handle.stat())) throw pendingError();
+        } finally {
+          await handle.close();
+        }
+        const parsed = tokenSchema.strict().parse(JSON.parse(source) as unknown);
+        pending.push({ filename, identity, tokens: this.validateTokens(parsed) });
+      } catch {
+        throw pendingError();
+      }
+    }
+    return pending;
+  }
+
+  private async assertPendingUnchanged(item: PendingTokens): Promise<void> {
+    const current = await lstat(item.filename);
+    if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1
+      || !unchanged(item.identity, current)) throw pendingError();
+  }
+
+  private async recoverPendingTokens(): Promise<void> {
+    const pending = await this.pendingTokens();
+    if (pending.length === 0) return;
+    // More than one intent has no trustworthy ordering; disconnect can revoke all.
+    if (pending.length !== 1) throw pendingError();
+    const item = pending[0]!;
+    try {
+      try {
+        const target = await lstat(this.options.tokenFile);
+        if (!target.isFile() || target.isSymbolicLink() || target.nlink !== 1) throw pendingError();
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+      }
+      await this.assertPendingUnchanged(item);
+      await rename(item.filename, this.options.tokenFile);
+    } catch {
+      throw pendingError();
+    }
   }
 
   private async requiredClient(): Promise<OAuth2Client> {

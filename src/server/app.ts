@@ -114,11 +114,24 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
   app.get("/api/status", async (req, res) => {
     const current = session(req, res, true);
     await retention.check();
-    const connection = config.demo ? { configured: true, connected: true } : await auth.status();
+    let connection = { configured: true, connected: true };
+    let connectionError: StatusResponse["connectionError"] = null;
+    if (!config.demo) {
+      try {
+        connection = await auth.status();
+      } catch (error) {
+        if (!(error instanceof AppError) || (error.code !== "GOOGLE_TOKEN_INVALID" && error.code !== "GOOGLE_CONFIG_INVALID")) {
+          throw error;
+        }
+        connection = { configured: error.code === "GOOGLE_TOKEN_INVALID", connected: false };
+        connectionError = { code: error.code, message: error.message };
+      }
+    }
     const status: StatusResponse = {
       appName: "Music library",
       demo: config.demo,
       ...connection,
+      connectionError,
       csrfToken: current.csrfToken,
       backupDirectory: config.backupDirectory,
       redirectUri: config.redirectUri,

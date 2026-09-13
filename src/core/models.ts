@@ -44,6 +44,11 @@ export interface PlaylistArchive extends PlaylistContents {
   fingerprint: string;
 }
 
+export interface ExportIntegrity {
+  size: number;
+  sha256: string;
+}
+
 export interface BackupPlaylistResult {
   playlistId: string;
   title: string;
@@ -53,6 +58,8 @@ export interface BackupPlaylistResult {
   fingerprint: string | null;
   warnings: string[];
   error: string | null;
+  /** Original export bytes; omitted for failed or legacy results, never inferred from disk. */
+  integrity?: { json: ExportIntegrity; csv: ExportIntegrity; m3u: ExportIntegrity } | undefined;
 }
 
 export interface BackupManifest {

@@ -21,6 +21,8 @@ const ui = {
   guide: element("connection-guide"),
   guideTitle: element("connection-guide-title"),
   guideCopy: element("connection-guide-copy"),
+  connectionError: element("connection-error"),
+  recheckConnection: element<HTMLButtonElement>("recheck-connection"),
   setup: element("setup-steps"),
   redirect: element("redirect-uri"),
   coverage: element("coverage-copy"),
@@ -56,6 +58,7 @@ const ui = {
 };
 
 let status: StatusResponse | null = null;
+let connectionCheckError: string | null = null;
 let playlists: Playlist[] = [];
 let backups: BackupManifest[] = [];
 let inventoryLoaded = false;
@@ -155,6 +158,23 @@ function notify(content: string, tone: "info" | "success" | "error" = "info", re
   ui.retryStatus.hidden = !retryStatus;
 }
 
+async function requestStatus(): Promise<StatusResponse> {
+  try {
+    const response = await request<StatusResponse>("/api/status");
+    if (!disposed) connectionCheckError = null;
+    return response;
+  } catch (error) {
+    if (!disposed) {
+      status = null;
+      connectionCheckError = message(error);
+      clearInventory();
+      renderStatus();
+      renderInventory();
+    }
+    throw error;
+  }
+}
+
 function running(): boolean {
   return job?.state === "running";
 }
@@ -175,7 +195,9 @@ function renderControls(): void {
   ui.refreshHistory.disabled = historyLoading || booting || retentionLoading;
   ui.refreshHistory.textContent = historyLoading ? "Refreshing…" : "Refresh history";
   ui.retryJob.disabled = polling || jobLoading || booting;
-  ui.retryStatus.disabled = booting;
+  ui.retryStatus.disabled = locked || inventoryLoading || retentionPolling;
+  ui.recheckConnection.disabled = locked || inventoryLoading || retentionPolling;
+  ui.recheckConnection.textContent = booting ? "Checking connection…" : "Recheck connection";
   ui.recheckRetention.disabled = locked || retentionPolling || historyLoading || !status;
   ui.recheckRetention.textContent = retentionLoading || retentionPolling ? "Checking cleanup…" : "Recheck cleanup";
   ui.backupNote.textContent = booting
@@ -201,13 +223,22 @@ function renderStatus(): void {
         : status.configured ? "YouTube not connected" : "Local setup needed";
   ui.connection.dataset.connected = String(Boolean(status?.connected));
   ui.demo.hidden = !status?.demo;
-  ui.guide.hidden = !status || status.connected;
+  ui.guide.hidden = Boolean(status?.connected) && !connectionCheckError;
+  const connectionError = connectionCheckError ?? status?.connectionError?.message ?? null;
+  ui.connectionError.hidden = !connectionError;
+  ui.connectionError.textContent = connectionError;
+  ui.setup.hidden = !status || status.configured;
+  if (!status) {
+    ui.guideTitle.textContent = "Connection check failed";
+    ui.guideCopy.textContent = "Check that the local server is running and resolve the reported setup or credential-file problem, then use Recheck connection. No playlists will be read until authorization is confirmed.";
+  }
   if (status) {
-    ui.setup.hidden = status.configured;
-    ui.guideTitle.textContent = status.configured ? "Connect Google to get started" : "Set up your local YouTube connection";
+    ui.guideTitle.textContent = status.connectionError?.code === "GOOGLE_TOKEN_INVALID"
+      ? "Reconnect Google to restore access"
+      : status.configured ? "Connect Google to get started" : "Set up your local YouTube connection";
     ui.guideCopy.textContent = status.configured
       ? "Use Connect Google above to authorize read-only access to your account-owned playlists. This tool cannot change your library."
-      : "Your Google OAuth client file is not configured. Complete these steps on the machine running this server, then connect your account.";
+      : "Your Google OAuth client file is missing or invalid. Complete these steps on the machine running this server, then use Recheck connection before connecting your account.";
     ui.redirect.textContent = status.redirectUri;
     ui.coverage.textContent = status.coverage;
     ui.directory.textContent = status.backupDirectory;
@@ -238,7 +269,7 @@ function renderInventory(): void {
   ui.libraryFeedback.hidden = false;
   ui.rows.replaceChildren();
   if (!status?.connected) {
-    ui.inventorySummary.textContent = status ? "No account inventory loaded" : "Local server unavailable";
+    ui.inventorySummary.textContent = status ? "No account inventory loaded" : "Connection unavailable";
     ui.libraryFeedback.textContent = status
       ? "Connect your YouTube account to see the playlists available for backup."
       : "Retry the connection check to load your playlist inventory.";
@@ -517,7 +548,7 @@ async function recheckRetention(): Promise<void> {
   renderControls();
   try {
     await request<{ retention: StatusResponse["retention"] }>("/api/retention/check", "POST");
-    const response = await request<StatusResponse>("/api/status");
+    const response = await requestStatus();
     if (disposed) return;
     status = response;
     retentionCheckError = null;
@@ -547,7 +578,7 @@ function stopRetentionPolling(): void {
 
 function scheduleRetentionPoll(delay = retentionPollInterval): void {
   stopRetentionPolling();
-  if (disposed || document.hidden || !status || retentionFailures >= maxRetentionFailures) return;
+  if (disposed || document.hidden || (!status && !retention) || retentionFailures >= maxRetentionFailures) return;
   retentionTimer = window.setTimeout(() => {
     retentionTimer = null;
     if (disposed || document.hidden) return;
@@ -571,7 +602,7 @@ function refreshRetentionStatus(forceFresh = false): Promise<void> {
   renderControls();
   retentionRefreshPromise = (async () => {
     try {
-      const response = await request<StatusResponse>("/api/status");
+      const response = await requestStatus();
       if (disposed) return;
       status = response;
       retention = response.retention;
@@ -586,7 +617,7 @@ function refreshRetentionStatus(forceFresh = false): Promise<void> {
       if (disposed) return;
       retentionFailures += 1;
       retentionCheckError = retentionFailures >= maxRetentionFailures
-        ? `Cleanup status updates paused after ${maxRetentionFailures} unsuccessful checks. ${message(error)} Use Recheck cleanup to resume.`
+        ? `Cleanup status updates paused after ${maxRetentionFailures} unsuccessful checks. ${message(error)} Use Recheck connection to resume.`
         : `Cleanup status could not be updated; retrying in one minute (${retentionFailures}/${maxRetentionFailures}). ${message(error)}`;
     } finally {
       retentionPolling = false;
@@ -669,32 +700,32 @@ async function loadCurrentJob(): Promise<void> {
   }
 }
 
-async function boot(): Promise<void> {
+async function boot(loadPlaylists = true): Promise<void> {
   if (booting || disposed) return;
   booting = true;
   renderControls();
   try {
-    status = await request<StatusResponse>("/api/status");
+    status = await requestStatus();
     if (disposed) return;
     retentionCheckError = null;
     retentionFailures = 0;
+    if (!status.connected) clearInventory();
     renderStatus();
     renderInventory();
     await loadCurrentJob();
     if (disposed) return;
-    await Promise.all([loadHistory(), jobKnown && !running() ? loadInventory() : Promise.resolve()]);
+    await Promise.all([loadHistory(), loadPlaylists && jobKnown && !running() ? loadInventory() : Promise.resolve()]);
     if (disposed) return;
     renderInventory();
-    if (!ui.retryStatus.hidden) ui.notice.hidden = true;
-  } catch (error) {
+    ui.retryStatus.hidden = true;
+  } catch {
     if (disposed) return;
-    notify(message(error), "error", true);
     renderStatus();
     renderInventory();
-    ui.historyFeedback.textContent = "Backup history is unavailable until the local server responds.";
-    ui.jobTitle.textContent = "Local server unavailable";
-    ui.jobDescription.textContent = "Retry the connection check to recover your workspace.";
-    ui.jobBadge.textContent = "Offline";
+    ui.historyFeedback.textContent = "Backup history was not refreshed because the connection check failed.";
+    ui.jobTitle.textContent = "Workspace check failed";
+    ui.jobDescription.textContent = "Resolve the connection error above, then use Recheck connection to recover your workspace.";
+    ui.jobBadge.textContent = "Unavailable";
   } finally {
     booting = false;
     if (!disposed) {
@@ -745,7 +776,7 @@ async function disconnect(): Promise<void> {
     if (disposed) return;
     const disconnectError = message(error);
     try {
-      status = await request<StatusResponse>("/api/status");
+      status = await requestStatus();
       if (disposed) return;
       if (!status.connected) clearInventory();
       notify(status.connected
@@ -803,7 +834,8 @@ ui.refreshHistory.addEventListener("click", () => { void loadHistory(); });
 ui.recheckRetention.addEventListener("click", () => { void recheckRetention(); });
 ui.search.addEventListener("input", renderInventory);
 ui.retryJob.addEventListener("click", () => { void loadCurrentJob(); });
-ui.retryStatus.addEventListener("click", () => { void boot(); });
+ui.retryStatus.addEventListener("click", () => { void boot(false); });
+ui.recheckConnection.addEventListener("click", () => { void boot(false); });
 ui.dismissNotice.addEventListener("click", () => { ui.notice.hidden = true; });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {

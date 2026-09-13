@@ -119,8 +119,7 @@ async function writePlaylist(
     warnings: [...contents.warnings],
     error: null,
   };
-  await publishPlaylistExports(directory, manifest, result, writes);
-  return result;
+  return publishPlaylistExports(directory, manifest, result, writes);
 }
 
 export async function runBackup(

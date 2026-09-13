@@ -9,6 +9,7 @@ import { acquireRuntimeLock } from "../src/runtime-lock.js";
 import type { BackupManifest } from "../src/core/models.js";
 import { runBackup } from "../src/core/backup.js";
 import { RetentionController } from "../src/services/retention.js";
+import { AppError } from "../src/core/errors.js";
 
 const directories: string[] = [];
 const stopControllers: (() => Promise<void>)[] = [];
@@ -61,6 +62,75 @@ async function setup(demo = true, backupRunner?: Parameters<typeof createApp>[0]
 }
 
 describe("loopback server", () => {
+  it.each([
+    ["GOOGLE_TOKEN_INVALID", true, 401, "The local Google token file is malformed. Reconnect Google."],
+    ["GOOGLE_CONFIG_INVALID", false, 400, "Replace the invalid OAuth client file with a Desktop app JSON."],
+  ] as const)("returns usable disconnected status for %s and recovers without replacing the session", async (code, configured, httpStatus, detail) => {
+    const runner = vi.fn(async () => completedManifest());
+    const { app, host, auth, provider, isBusy } = await setup(false, runner);
+    auth.status.mockRejectedValue(new AppError(code, detail, httpStatus));
+    const inventory = vi.spyOn(provider, "listPlaylists");
+    const browser = request.agent(app);
+    const unavailable = await browser.get("/api/status").set("Host", host).expect(200);
+    expect(unavailable.body).toMatchObject({
+      configured, connected: false, connectionError: { code, message: detail },
+      csrfToken: expect.any(String), retention: { automatic: true }, coverage: provider.coverage,
+    });
+    expect(unavailable.headers["set-cookie"][0]).toContain("HttpOnly");
+    const csrf = unavailable.body.csrfToken as string;
+    expect(csrf).not.toBe("");
+    await browser.get("/api/playlists").set("Host", host).expect(httpStatus);
+    await browser.post("/api/backups").set("Host", host).set("X-CSRF-Token", csrf).expect(httpStatus);
+    expect(inventory).not.toHaveBeenCalled();
+    expect(runner).not.toHaveBeenCalled();
+    expect(isBusy()).toBe(false);
+    if (configured) {
+      await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+      expect(auth.begin).toHaveBeenCalledTimes(1);
+    } else {
+      auth.status.mockResolvedValue({ configured: true, connected: false });
+      const repaired = await browser.get("/api/status").set("Host", host).expect(200);
+      expect(repaired.body).toMatchObject({ configured: true, connected: false, connectionError: null, csrfToken: csrf });
+      expect(inventory).not.toHaveBeenCalled();
+      await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    }
+    auth.complete.mockImplementationOnce(async () => {
+      auth.status.mockResolvedValue({ configured: true, connected: true });
+    });
+    await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host)
+      .expect(302).expect("Location", "/?connected=1");
+    const recovered = await browser.get("/api/status").set("Host", host).expect(200);
+    expect(recovered.body).toMatchObject({ configured: true, connected: true, connectionError: null, csrfToken: csrf });
+    await browser.get("/api/playlists").set("Host", host).expect(200);
+    expect(auth.complete).toHaveBeenCalledExactlyOnceWith("code", "test-verifier");
+  });
+
+  it("reports missing setup without an error and rechecks a repaired configuration", async () => {
+    const { browser, host, csrf, auth } = await setup(false);
+    auth.status.mockResolvedValue({ configured: false, connected: false });
+    const missing = await browser.get("/api/status").set("Host", host).expect(200);
+    expect(missing.body).toMatchObject({ configured: false, connected: false, connectionError: null, csrfToken: csrf });
+    auth.status.mockResolvedValue({ configured: true, connected: false });
+    const repaired = await browser.get("/api/status").set("Host", host).expect(200);
+    expect(repaired.body).toMatchObject({ configured: true, connected: false, connectionError: null, csrfToken: csrf });
+    await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+  });
+
+  it.each([
+    ["GOOGLE_TOKEN_READ_FAILED", new AppError("GOOGLE_TOKEN_READ_FAILED", "Check local token file permissions.", 500)],
+    ["GOOGLE_PENDING_CLEANUP_FAILED", new AppError("GOOGLE_PENDING_CLEANUP_FAILED", "Inspect unsafe pending credential files before retrying.", 500)],
+    ["INTERNAL_ERROR", new Error("Synthetic unexpected status failure")],
+  ] as const)("does not turn %s into a successful status response", async (code, failure) => {
+    const { browser, host, auth } = await setup(false);
+    auth.status.mockRejectedValueOnce(failure);
+    const failed = await browser.get("/api/status").set("Host", host).expect(500);
+    expect(failed.body.error.code).toBe(code);
+    expect(failed.body).not.toHaveProperty("connected");
+    expect(failed.body).not.toHaveProperty("csrfToken");
+    const recovered = await browser.get("/api/status").set("Host", host).expect(200);
+    expect(recovered.body).toMatchObject({ connected: true, connectionError: null });
+  });
+
   it("rejects rebinding hosts, foreign origins, missing session and missing CSRF", async () => {
     const { app, browser, host } = await setup();
     await request(app).get("/api/status").set("Host", "evil.example:8787").expect(403);

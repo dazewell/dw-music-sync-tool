@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { AppError, errorMessage } from "./errors.js";
-import type { BackupManifest, BackupPlaylistResult } from "./models.js";
+import type { BackupManifest, BackupPlaylistResult, ExportIntegrity } from "./models.js";
 
 const runIdPattern = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const fingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/);
@@ -42,6 +42,10 @@ const filesSchema = z.strictObject({
   && files.json.slice(0, -5) === files.m3u.slice(0, -5)
   && files.json !== "manifest.json", "Export basenames must match");
 
+const exportIntegritySchema = z.strictObject({
+  size: countSchema,
+  sha256: fingerprintSchema,
+});
 const resultSchema = z.strictObject({
   playlistId: z.string(),
   title: z.string(),
@@ -51,10 +55,16 @@ const resultSchema = z.strictObject({
   fingerprint: fingerprintSchema.nullable(),
   warnings: z.array(z.string()),
   error: z.string().nullable(),
+  integrity: z.strictObject({
+    json: exportIntegritySchema,
+    csv: exportIntegritySchema,
+    m3u: exportIntegritySchema,
+  }).optional(),
 }).superRefine((result, context) => {
   if (result.status === "complete"
     ? result.files === null || result.fingerprint === null || result.error !== null
-    : result.files !== null || result.fingerprint !== null || result.error === null || result.entries !== 0) {
+    : result.files !== null || result.fingerprint !== null || result.error === null || result.entries !== 0
+      || result.integrity !== undefined) {
     context.addIssue({ code: "custom", message: "Inconsistent playlist result" });
   }
 });
@@ -94,11 +104,9 @@ const manifestSchema = z.strictObject({
   }
 });
 
-const pendingFileSchema = z.strictObject({
+const pendingFileSchema = exportIntegritySchema.extend({
   file: z.string().refine(isBasename),
   temporary: z.string().regex(/^\.write-[0-9a-f-]{36}\.tmp$/),
-  size: countSchema,
-  sha256: fingerprintSchema,
 });
 const pendingSchema = z.strictObject({
   app: z.literal(BACKUP_OWNER_APP),
@@ -123,7 +131,7 @@ function recoveryError(message: string): AppError {
 
 function sameFile(before: Stats, after: Stats): boolean {
   return before.dev === after.dev && before.ino === after.ino && before.size === after.size
-    && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
+    && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs && before.nlink === after.nlink;
 }
 
 async function ordinaryFile(directory: string, name: string): Promise<Stats> {
@@ -158,6 +166,36 @@ export interface PendingExports {
   text: string;
   files: string[];
   present: Map<string, Stats>;
+  integrity: Map<string, ExportIntegrity>;
+}
+
+/** Verify original bytes, rejecting replacement content and links; missing files permit safe deletion retries. */
+export async function verifyExportIntegrity(
+  directory: string, name: string, expected: ExportIntegrity,
+): Promise<Stats | null> {
+  let before: Stats;
+  try {
+    before = await ordinaryFile(directory, name);
+  } catch (error) {
+    if (error instanceof AppError && error.code === "BACKUP_NOT_FOUND") return null;
+    throw error;
+  }
+  if (before.size !== expected.size) throw recoveryError(`Export "${name}" has changed from its recorded size`);
+  const handle = await fs.open(path.join(directory, name), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    if (!sameFile(before, await handle.stat())) throw recoveryError(`Export "${name}" changed while being read`);
+    const hash = createHash("sha256");
+    for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk);
+    if (hash.digest("hex") !== expected.sha256 || !sameFile(before, await handle.stat())) {
+      throw recoveryError(`Export "${name}" does not match its recorded contents`);
+    }
+  } finally {
+    await handle.close();
+  }
+  if (!sameFile(before, await ordinaryFile(directory, name))) {
+    throw recoveryError(`Export "${name}" was replaced while its contents were being verified`);
+  }
+  return before;
 }
 
 /** An intent names exact bytes and paths, never a filename pattern to delete. */
@@ -180,6 +218,7 @@ export async function readPendingExports(directory: string, manifest: BackupMani
   const intent = parsed.data;
   const result = manifest.playlists[intent.index];
   const expectedFiles = Object.values(intent.result.files ?? {});
+  const expectedIntegrity = intent.result.integrity ? Object.values(intent.result.integrity) : undefined;
   const names = [...intent.outputs.flatMap(output => [output.file, output.temporary]), intent.manifestWrite.temporary];
   const protectedNames = [
     BACKUP_OWNER_FILENAME, BACKUP_PENDING_FILENAME, "manifest.json", ".active.json",
@@ -195,39 +234,26 @@ export async function readPendingExports(directory: string, manifest: BackupMani
       : result.playlistId !== intent.result.playlistId || result.title !== intent.result.title))
     || new Set(names.map(name => name.toLowerCase())).size !== names.length
     || names.some(name => protectedNames.includes(name.toLowerCase()))
-    || intent.outputs.some((output, index) => output.file !== expectedFiles[index])) {
+    || intent.outputs.some((output, index) => output.file !== expectedFiles[index]
+      || (expectedIntegrity && !isDeepStrictEqual(
+        expectedIntegrity[index], { size: output.size, sha256: output.sha256 },
+      )))) {
     throw recoveryError("The pending export intent does not match its manifest");
   }
   const present = new Map<string, Stats>();
+  const integrity = new Map<string, ExportIntegrity>();
   for (const output of [...intent.outputs, intent.manifestWrite]) {
     const candidates = output.file === "manifest.json" ? [output.temporary] : [output.file, output.temporary];
     for (const name of candidates) {
-      let before: Stats;
-      try {
-        before = await ordinaryFile(directory, name);
-      } catch (error) {
-        if (error instanceof AppError && error.code === "BACKUP_NOT_FOUND") continue;
-        throw error;
-      }
-      if (before.size !== output.size) throw recoveryError(`Pending export "${name}" has changed`);
-      const handle = await fs.open(path.join(directory, name), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-      try {
-        if (!sameFile(before, await handle.stat())) throw recoveryError(`Pending export "${name}" changed`);
-        const hash = createHash("sha256");
-        for await (const chunk of handle.createReadStream({ autoClose: false })) hash.update(chunk);
-        if (hash.digest("hex") !== output.sha256 || !sameFile(before, await handle.stat())) {
-          throw recoveryError(`Pending export "${name}" does not match its recorded contents`);
-        }
-      } finally {
-        await handle.close();
-      }
-      present.set(name, before);
+      integrity.set(name, { size: output.size, sha256: output.sha256 });
+      const info = await verifyExportIntegrity(directory, name, output);
+      if (info) present.set(name, info);
     }
     if (output.file !== "manifest.json" && present.has(output.file) && present.has(output.temporary)) {
       throw recoveryError("Both a pending export and its staging file exist");
     }
   }
-  return { text, files: names, present };
+  return { text, files: names, present, integrity };
 }
 
 async function assertPendingUnchanged(directory: string, pending: PendingExports): Promise<void> {
@@ -256,13 +282,20 @@ export async function publishPlaylistExports(
   manifest: BackupManifest,
   result: BackupPlaylistResult,
   writes: [string, string][],
-): Promise<void> {
+): Promise<BackupPlaylistResult> {
   const outputs = writes.map(([file, text]) => ({
     file, temporary: `.write-${randomUUID()}.tmp`, size: Buffer.byteLength(text), sha256: digest(text),
   }));
+  const proof = (index: number): ExportIntegrity => ({
+    size: outputs[index]!.size, sha256: outputs[index]!.sha256,
+  });
+  const completed: BackupPlaylistResult = {
+    ...result,
+    integrity: { json: proof(0), csv: proof(1), m3u: proof(2) },
+  };
   const checkpoint = manifestText({
     ...manifest,
-    playlists: [...manifest.playlists, result],
+    playlists: [...manifest.playlists, completed],
     totals: {
       ...manifest.totals,
       completed: manifest.totals.completed + 1,
@@ -276,7 +309,7 @@ export async function publishPlaylistExports(
   const intent = pendingSchema.parse({
     app: BACKUP_OWNER_APP, schemaVersion: 1, id: manifest.id, createdAt: manifest.startedAt,
     index: manifest.playlists.length, totalPlaylists: manifest.totals.playlists,
-    checkpoint: checkpointDigest(manifest, manifest.playlists.length), result, outputs, manifestWrite,
+    checkpoint: checkpointDigest(manifest, manifest.playlists.length), result: completed, outputs, manifestWrite,
   });
   const existing = new Set((await fs.readdir(directory)).map(name => name.toLowerCase()));
   if ([BACKUP_PENDING_FILENAME, ...outputs.flatMap(output => [output.file, output.temporary]), manifestWrite.temporary]
@@ -292,6 +325,7 @@ export async function publishPlaylistExports(
     await finishPlaylistExport(directory, manifest, true);
     throw error;
   }
+  return completed;
 }
 
 function hasCode(error: unknown, code: string): boolean {
