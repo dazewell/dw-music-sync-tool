@@ -167,6 +167,15 @@ OS credential-vault integration is not implemented. Client files, tokens, `.env`
 local state and the default backup directory are Git-ignored. Custom paths are
 your responsibility; do not commit credentials or private library exports.
 
+Main and pending token files must be ordinary files without symbolic or hard
+links. Reads verify file identity before and after reading, and disconnect
+rechecks identity before cleanup so detected replacements are preserved.
+Persisted tokens must explicitly record the exact read-only YouTube scope;
+older files without scope need reconnection, not an assumed permission. If
+Google omits scope during a new authorization exchange, the app verifies it
+through Google's token-info endpoint before saving. Refresh responses may retain
+the already-verified stored scope when they omit it.
+
 An interrupted credential save is recovered from a single intact pending file
 before authorization is used. Pending files are checked for the exact generated
 name, token shape, read-only scope, ordinary-file ownership and changes during

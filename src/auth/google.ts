@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { constants, type Stats } from "node:fs";
+import { constants, type BigIntStats } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { CodeChallengeMethod, OAuth2Client, type Credentials } from "google-auth-library";
@@ -18,13 +18,17 @@ const tokenSchema = z.object({
   access_token: z.string().min(1).optional(),
   expiry_date: z.number().finite().nonnegative().optional(),
   token_type: z.literal("Bearer").optional(),
-  scope: z.string().optional(),
+  scope: z.literal(READONLY_SCOPE),
 });
 type StoredTokens = z.infer<typeof tokenSchema>;
-interface PendingTokens {
+interface TokenText {
+  source: string;
+  identity: BigIntStats;
+}
+interface StoredTokenFile {
   filename: string;
   tokens: StoredTokens;
-  identity: Stats;
+  identity: BigIntStats;
 }
 
 export interface GoogleAuthOptions {
@@ -37,9 +41,13 @@ function isMissing(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
-function unchanged(before: Stats, after: Stats): boolean {
+function unchanged(before: BigIntStats, after: BigIntStats): boolean {
   return before.dev === after.dev && before.ino === after.ino && before.size === after.size
-    && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
+    && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs && before.nlink === after.nlink;
+}
+
+function ordinaryToken(info: BigIntStats): boolean {
+  return info.isFile() && !info.isSymbolicLink() && info.nlink === 1n && info.size <= 1_048_576n;
 }
 
 function pendingError(): AppError {
@@ -101,6 +109,14 @@ export class GoogleAuth {
       } catch {
         throw new AppError("GOOGLE_AUTH_EXCHANGE_FAILED", "Google authorization could not be completed. Start the connection again and grant read-only YouTube access.", 401);
       }
+      if (credentials.scope === undefined && typeof credentials.access_token === "string" && credentials.access_token) {
+        try {
+          const info = await client.getTokenInfo(credentials.access_token);
+          credentials = { ...credentials, scope: info.scopes.join(" ") };
+        } catch {
+          throw new AppError("GOOGLE_AUTH_SCOPE_UNVERIFIED", "Google did not report token scopes and their granted access could not be verified. No credentials were saved. Retry connecting with read-only YouTube access.", 401);
+        }
+      }
       const tokens = this.validateTokens(credentials, "GOOGLE_AUTH_TOKEN_INVALID");
       if (!tokens.access_token) {
         throw new AppError("GOOGLE_AUTH_TOKEN_INVALID", "Google did not return usable offline credentials. Reconnect and grant read-only YouTube access.", 401);
@@ -113,10 +129,11 @@ export class GoogleAuth {
     return this.serial(async () => {
       await this.recoverPendingTokens();
       const client = await this.requiredClient();
-      const tokens = await this.readTokens();
-      if (tokens === null) {
+      const saved = await this.readTokens();
+      if (saved === null) {
         throw new AppError("GOOGLE_NOT_CONNECTED", "Connect your Google account before backing up YouTube playlists.", 401);
       }
+      const tokens = saved.tokens;
       if (tokens.access_token && tokens.expiry_date !== undefined && tokens.expiry_date > Date.now() + 60_000) {
         return tokens.access_token;
       }
@@ -132,7 +149,7 @@ export class GoogleAuth {
       const refreshed = this.validateTokens({
         ...credentials,
         refresh_token: credentials.refresh_token ?? tokens.refresh_token,
-        scope: credentials.scope ?? tokens.scope,
+        scope: credentials.scope === undefined ? tokens.scope : credentials.scope,
       }, "GOOGLE_REFRESH_INVALID");
       if (!refreshed.access_token || refreshed.expiry_date === undefined || refreshed.expiry_date <= Date.now()) {
         throw new AppError("GOOGLE_REFRESH_INVALID", "Google returned unusable refreshed credentials. Reconnect your Google account.", 401);
@@ -145,7 +162,8 @@ export class GoogleAuth {
   async disconnect(): Promise<void> {
     return this.serial(async () => {
       const pending = await this.pendingTokens();
-      const tokens = await this.readTokens();
+      const saved = await this.readTokens();
+      const tokens = saved?.tokens;
       const refreshTokens = new Set([
         ...(tokens ? [tokens.refresh_token] : []),
         ...pending.map(item => item.tokens.refresh_token),
@@ -162,15 +180,12 @@ export class GoogleAuth {
       }
       try {
         for (const item of pending) {
-          await this.assertPendingUnchanged(item);
+          await this.assertTokenUnchanged(item);
           await unlink(item.filename);
         }
-        if (tokens) {
-          try {
-            await unlink(this.options.tokenFile);
-          } catch (error) {
-            if (!isMissing(error)) throw error;
-          }
+        if (saved) {
+          await this.assertTokenUnchanged(saved);
+          await unlink(saved.filename);
         }
       } catch {
         throw new AppError(
@@ -193,7 +208,30 @@ export class GoogleAuth {
     return next;
   }
 
-  private async pendingTokens(): Promise<PendingTokens[]> {
+  private async readTokenText(filename: string): Promise<TokenText | null> {
+    let identity: BigIntStats;
+    try {
+      identity = await lstat(filename, { bigint: true });
+    } catch (error) {
+      if (isMissing(error)) return null;
+      throw error;
+    }
+    if (!ordinaryToken(identity)) throw new Error("The credential path is not an ordinary, unlinked file.");
+    const handle = await open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    try {
+      if (!unchanged(identity, await handle.stat({ bigint: true }))) throw new Error("Credentials changed before reading.");
+      const source = await handle.readFile("utf8");
+      if (!unchanged(identity, await handle.stat({ bigint: true }))
+        || !unchanged(identity, await lstat(filename, { bigint: true }))) {
+        throw new Error("Credentials changed while reading.");
+      }
+      return { source, identity };
+    } finally {
+      await handle.close();
+    }
+  }
+
+  private async pendingTokens(): Promise<StoredTokenFile[]> {
     const directory = dirname(this.options.tokenFile);
     let names: string[];
     try {
@@ -203,26 +241,15 @@ export class GoogleAuth {
       throw pendingError();
     }
     const prefix = `${basename(this.options.tokenFile)}.`;
-    const pending: PendingTokens[] = [];
+    const pending: StoredTokenFile[] = [];
     for (const name of names.filter(name => name.startsWith(prefix)
       && /^[a-f0-9]{24}\.pending$/.test(name.slice(prefix.length)))) {
       const filename = join(directory, name);
       try {
-        const identity = await lstat(filename);
-        if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1 || identity.size > 1_048_576) {
-          throw pendingError();
-        }
-        const handle = await open(filename, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-        let source: string;
-        try {
-          if (!unchanged(identity, await handle.stat())) throw pendingError();
-          source = await handle.readFile("utf8");
-          if (!unchanged(identity, await handle.stat())) throw pendingError();
-        } finally {
-          await handle.close();
-        }
-        const parsed = tokenSchema.strict().parse(JSON.parse(source) as unknown);
-        pending.push({ filename, identity, tokens: this.validateTokens(parsed) });
+        const record = await this.readTokenText(filename);
+        if (!record) throw pendingError();
+        const parsed = tokenSchema.strict().parse(JSON.parse(record.source) as unknown);
+        pending.push({ filename, identity: record.identity, tokens: this.validateTokens(parsed) });
       } catch {
         throw pendingError();
       }
@@ -230,10 +257,9 @@ export class GoogleAuth {
     return pending;
   }
 
-  private async assertPendingUnchanged(item: PendingTokens): Promise<void> {
-    const current = await lstat(item.filename);
-    if (!current.isFile() || current.isSymbolicLink() || current.nlink !== 1
-      || !unchanged(item.identity, current)) throw pendingError();
+  private async assertTokenUnchanged(item: StoredTokenFile): Promise<void> {
+    const current = await lstat(item.filename, { bigint: true });
+    if (!ordinaryToken(current) || !unchanged(item.identity, current)) throw new Error("The credential file changed.");
   }
 
   private async recoverPendingTokens(): Promise<void> {
@@ -249,7 +275,7 @@ export class GoogleAuth {
       } catch (error) {
         if (!isMissing(error)) throw error;
       }
-      await this.assertPendingUnchanged(item);
+      await this.assertTokenUnchanged(item);
       await rename(item.filename, this.options.tokenFile);
     } catch {
       throw pendingError();
@@ -289,27 +315,27 @@ export class GoogleAuth {
 
   private validateTokens(value: unknown, code = "GOOGLE_TOKEN_INVALID"): StoredTokens {
     const parsed = tokenSchema.safeParse(value);
-    if (!parsed.success || (parsed.data.scope !== undefined && parsed.data.scope !== READONLY_SCOPE)) {
+    if (!parsed.success) {
       throw new AppError(code, "Google credentials are malformed, lack an offline refresh token, or do not grant exactly read-only YouTube access. Reconnect your Google account; inspect or remove an invalid local token file if necessary.", 401);
     }
     return parsed.data;
   }
 
-  private async readTokens(): Promise<StoredTokens | null> {
-    let source: string;
+  private async readTokens(): Promise<StoredTokenFile | null> {
+    let record: TokenText | null;
     try {
-      source = await readFile(this.options.tokenFile, "utf8");
-    } catch (error) {
-      if (isMissing(error)) return null;
-      throw new AppError("GOOGLE_TOKEN_READ_FAILED", "The local Google token file could not be read. Check its permissions.", 500);
+      record = await this.readTokenText(this.options.tokenFile);
+    } catch {
+      throw new AppError("GOOGLE_TOKEN_READ_FAILED", "The local Google token file could not be read safely. It must be an unchanged, regular file without links. Check its path and permissions before retrying.", 500);
     }
+    if (!record) return null;
     let value: unknown;
     try {
-      value = JSON.parse(source) as unknown;
+      value = JSON.parse(record.source) as unknown;
     } catch {
       throw new AppError("GOOGLE_TOKEN_INVALID", "The local Google token file is malformed. Remove it and reconnect your Google account.", 401);
     }
-    return this.validateTokens(value);
+    return { filename: this.options.tokenFile, identity: record.identity, tokens: this.validateTokens(value) };
   }
 
   private async persist(tokens: StoredTokens): Promise<void> {

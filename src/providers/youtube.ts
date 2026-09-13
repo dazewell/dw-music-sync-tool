@@ -129,10 +129,10 @@ export class YouTubeProvider implements PlaylistProvider {
     if ((playlist.itemCount !== null && playlist.itemCount !== entries.length) ||
         totals.some((total) => total !== entries.length) ||
         new Set(entries.map((entry) => entry.id)).size !== entries.length ||
-        new Set(entries.map((entry) => entry.position)).size !== entries.length) {
+        entries.some((entry, index) => entry.position !== index)) {
       throw new AppError(
         "YOUTUBE_PLAYLIST_CHANGED",
-        "The YouTube playlist changed or returned inconsistent item counts, repeated playlist-item IDs, or repeated positions. A complete snapshot could not be verified. Retry the backup.",
+        "The YouTube playlist changed or returned inconsistent item counts, repeated playlist-item IDs, or missing/repeated positions. A complete zero-based snapshot could not be verified. Retry the backup.",
         409,
       );
     }

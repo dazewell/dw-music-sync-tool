@@ -37,7 +37,9 @@ pair repository --> observe --> plan --> user approval --> executor --> verify
 IDs remain platform IDs; a YouTube video ID is never assumed to equal a Spotify
 track ID. Every occurrence has an item identity and position, so repeated tracks
 and unavailable entries survive export. Provider-specific data is retained
-without mixing credentials into domain records.
+without mixing credentials into domain records. YouTube snapshot positions must
+be contiguous and zero-based after sorting, even when API count hints agree;
+gaps fail explicitly rather than being renumbered into an incomplete archive.
 
 `src/providers/youtube.ts` owns endpoint details, pagination, response validation,
 quota/rate-limit handling and coverage statements. `src/auth/google.ts` owns
@@ -46,6 +48,11 @@ A single validated pending token save is completed before using authorization;
 multiple or unprovable intents require explicit inspection rather than guessing
 their order. Disconnect enumerates validated pending tokens independently of the
 main file and revokes/removes both, with explicit remote and local failure states.
+Both credential paths share descriptor-based, no-follow reads where supported,
+with single-link regular-file checks and bigint identity checks around the read
+and before cleanup. Persisted credentials require the exact read-only scope.
+An omitted code-exchange scope is verified through Google token info before
+persistence; an omitted refresh scope inherits only the validated stored scope.
 
 `src/core/backup.ts` and storage helpers own run lifecycle, portable filenames,
 atomic writes, export formats and history. JSON is the authoritative archive;

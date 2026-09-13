@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   verifier: vi.fn(),
   authUrl: vi.fn(),
   getToken: vi.fn(),
+  tokenInfo: vi.fn(),
   setCredentials: vi.fn(),
   refresh: vi.fn(),
   revoke: vi.fn(),
@@ -17,7 +18,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, unlink: vi.fn(actual.unlink) };
+  return { ...actual, unlink: vi.fn(actual.unlink), open: vi.fn(actual.open) };
 });
 
 vi.mock("google-auth-library", () => ({
@@ -27,6 +28,7 @@ vi.mock("google-auth-library", () => ({
     generateCodeVerifierAsync = mocks.verifier;
     generateAuthUrl = mocks.authUrl;
     getToken = mocks.getToken;
+    getTokenInfo = mocks.tokenInfo;
     setCredentials = mocks.setCredentials;
     refreshAccessToken = mocks.refresh;
     revokeToken = mocks.revoke;
@@ -71,6 +73,7 @@ beforeEach(async () => {
     return url.toString();
   });
   mocks.getToken.mockResolvedValue({ tokens: freshTokens() });
+  mocks.tokenInfo.mockResolvedValue({ scopes: [scope] });
   mocks.refresh.mockResolvedValue({ credentials: freshTokens() });
   mocks.revoke.mockResolvedValue({});
 });
@@ -290,6 +293,7 @@ describe("GoogleAuth offline credentials and refresh", () => {
     expect(await auth.status()).toEqual({ configured: true, connected: true });
     expect(await auth.getAccessToken()).toBe("secret-access-token");
     expect(mocks.refresh).not.toHaveBeenCalled();
+    expect(mocks.tokenInfo).not.toHaveBeenCalled();
   });
 
   it("never writes credentials when code exchange fails and does not expose Google error details", async () => {
@@ -298,6 +302,68 @@ describe("GoogleAuth offline credentials and refresh", () => {
     expect(error).toMatchObject({ code: "GOOGLE_AUTH_EXCHANGE_FAILED" });
     expect(String(error)).not.toContain("secret");
     await expect(readFile(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("verifies omitted exchange scopes with Google before persisting them", async () => {
+    const { scope: _scope, ...credentials } = freshTokens();
+    mocks.getToken.mockResolvedValue({ tokens: credentials });
+    await auth.complete("authorization-code", verifier);
+    expect(mocks.tokenInfo).toHaveBeenCalledWith("secret-access-token");
+    expect(JSON.parse(await readFile(tokenFile, "utf8")).scope).toBe(scope);
+    expect(await auth.status()).toEqual({ configured: true, connected: true });
+  });
+
+  it.each([
+    { scopes: [] },
+    { scopes: ["https://www.googleapis.com/auth/youtube"] },
+    { scopes: [scope, "another-scope"] },
+  ])(
+    "does not infer read-only access when Google reports $scopes",
+    async ({ scopes }) => {
+      const { scope: _scope, ...credentials } = freshTokens();
+      const original = freshTokens();
+      await saveTokens(original);
+      mocks.getToken.mockResolvedValue({ tokens: credentials });
+      mocks.tokenInfo.mockResolvedValue({ scopes });
+      await expect(auth.complete("authorization-code", verifier)).rejects.toMatchObject({ code: "GOOGLE_AUTH_TOKEN_INVALID" });
+      expect(JSON.parse(await readFile(tokenFile, "utf8"))).toEqual(original);
+    },
+  );
+
+  it("redacts token-info failures without replacing existing authorization", async () => {
+    const { scope: _scope, ...credentials } = freshTokens();
+    const original = freshTokens();
+    await saveTokens(original);
+    mocks.getToken.mockResolvedValue({ tokens: credentials });
+    mocks.tokenInfo.mockRejectedValue(new Error("secret-access-token network details"));
+    const error = await auth.complete("authorization-code", verifier).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "GOOGLE_AUTH_SCOPE_UNVERIFIED" });
+    expect(String(error)).not.toContain("secret-access-token");
+    expect(JSON.parse(await readFile(tokenFile, "utf8"))).toEqual(original);
+  });
+
+  it("rejects a persisted token with absent scope without asking Google or revoking it", async () => {
+    const { scope: _scope, ...credentials } = freshTokens();
+    await saveTokens(credentials);
+    for (const operation of [() => auth.status(), () => auth.getAccessToken(), () => auth.disconnect()]) {
+      await expect(operation()).rejects.toMatchObject({ code: "GOOGLE_TOKEN_INVALID" });
+    }
+    expect(mocks.refresh).not.toHaveBeenCalled();
+    expect(mocks.tokenInfo).not.toHaveBeenCalled();
+    expect(mocks.revoke).not.toHaveBeenCalled();
+    expect(JSON.parse(await readFile(tokenFile, "utf8"))).toEqual(credentials);
+  });
+
+  it("preserves a pending token with absent scope instead of trusting it", async () => {
+    const { scope: _scope, ...credentials } = freshTokens();
+    const pending = `${tokenFile}.${"a".repeat(24)}.pending`;
+    await mkdir(join(directory, "private"));
+    await writeFile(pending, JSON.stringify(credentials));
+    await expect(auth.status()).rejects.toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    expect(JSON.parse(await readFile(pending, "utf8"))).toEqual(credentials);
+    expect(mocks.revoke).not.toHaveBeenCalled();
+    expect(mocks.tokenInfo).not.toHaveBeenCalled();
   });
 
   it("preserves existing credentials when reconnect returns no refresh token", async () => {
@@ -366,6 +432,15 @@ describe("GoogleAuth offline credentials and refresh", () => {
     expect(JSON.parse(await readFile(tokenFile, "utf8"))).toEqual(original);
   });
 
+  it.each([null, "", `${scope} another-scope`])("rejects an explicitly invalid refresh scope %j", async refreshScope => {
+    const original = { ...freshTokens(), expiry_date: 0 };
+    await saveTokens(original);
+    mocks.refresh.mockResolvedValue({ credentials: { ...freshTokens(), scope: refreshScope } });
+    await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "GOOGLE_REFRESH_INVALID" });
+    expect(JSON.parse(await readFile(tokenFile, "utf8"))).toEqual(original);
+    expect(mocks.tokenInfo).not.toHaveBeenCalled();
+  });
+
   it.each([
     "not JSON secret-refresh-token",
     JSON.stringify({}),
@@ -390,6 +465,135 @@ describe("GoogleAuth offline credentials and refresh", () => {
     expect(error).toMatchObject({ code: "GOOGLE_TOKEN_WRITE_FAILED" });
     expect(String(error)).not.toContain("secret");
     expect(await readdir(join(directory, "private"))).toEqual(["token.json"]);
+  });
+});
+
+describe("main credential file ownership", () => {
+  beforeEach(async () => {
+    await writeFile(credentialsFile, JSON.stringify(config));
+    await mkdir(join(directory, "private"));
+  });
+
+  it("does not accept or revoke a hard-linked main token", async () => {
+    const external = join(directory, "external.json");
+    const source = JSON.stringify(freshTokens());
+    await writeFile(external, source);
+    await fs.link(external, tokenFile);
+    for (const operation of [() => auth.status(), () => auth.getAccessToken(), () => auth.disconnect()]) {
+      await expect(operation()).rejects.toMatchObject({ code: "GOOGLE_TOKEN_READ_FAILED" });
+    }
+    expect(await readFile(external, "utf8")).toBe(source);
+    expect(await readFile(tokenFile, "utf8")).toBe(source);
+    expect(mocks.refresh).not.toHaveBeenCalled();
+    expect(mocks.revoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects a symbolic main token path without touching its target", async context => {
+    const external = join(directory, "external.json");
+    const source = JSON.stringify(freshTokens());
+    await writeFile(external, source);
+    try {
+      await fs.symlink(external, tokenFile, "file");
+    } catch (error) {
+      if (process.platform === "win32" && error instanceof Error && "code" in error && error.code === "EPERM") {
+        context.skip();
+        return;
+      }
+      throw error;
+    }
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_TOKEN_READ_FAILED" });
+    expect(await readFile(external, "utf8")).toBe(source);
+    expect((await fs.lstat(tokenFile)).isSymbolicLink()).toBe(true);
+    expect(mocks.revoke).not.toHaveBeenCalled();
+  });
+
+  it.each(["directory", "oversized"] as const)("rejects a %s token before parsing it", async kind => {
+    if (kind === "directory") await mkdir(tokenFile);
+    else await writeFile(tokenFile, "x".repeat(1_048_577));
+    await expect(auth.status()).rejects.toMatchObject({ code: "GOOGLE_TOKEN_READ_FAILED" });
+    expect(mocks.refresh).not.toHaveBeenCalled();
+    expect(mocks.revoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects an in-place mutation during a main-token read", async () => {
+    await writeFile(tokenFile, JSON.stringify(freshTokens()));
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(fs.open).mockImplementationOnce(async (...args) => {
+      const handle = await actual.open(...args);
+      const read = handle.readFile.bind(handle);
+      vi.spyOn(handle, "readFile").mockImplementationOnce(async (...options) => {
+        const result = await read(...options);
+        await fs.appendFile(tokenFile, " ");
+        return result;
+      });
+      return handle;
+    });
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_TOKEN_READ_FAILED" });
+    expect(mocks.revoke).not.toHaveBeenCalled();
+  });
+
+  it("checks the opened identity before reading a path replaced during open", async () => {
+    await writeFile(tokenFile, JSON.stringify(freshTokens()));
+    const external = join(directory, "external.json");
+    await writeFile(external, JSON.stringify({ ...freshTokens(), refresh_token: "unrelated-token" }));
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    const read = vi.fn();
+    vi.mocked(fs.open).mockImplementationOnce(async (...args) => {
+      await fs.rename(tokenFile, join(directory, "original.json"));
+      await fs.link(external, tokenFile);
+      const handle = await actual.open(...args);
+      const originalRead = handle.readFile.bind(handle);
+      vi.spyOn(handle, "readFile").mockImplementationOnce(async (...options) => {
+        read();
+        return originalRead(...options);
+      });
+      return handle;
+    });
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_TOKEN_READ_FAILED" });
+    expect(read).not.toHaveBeenCalled();
+    expect(mocks.revoke).not.toHaveBeenCalled();
+    expect(await readFile(external, "utf8")).toContain("unrelated-token");
+  });
+
+  it("does not treat disappearance during open as an initially missing token", async () => {
+    await writeFile(tokenFile, JSON.stringify(freshTokens()));
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(fs.open).mockImplementationOnce(async (...args) => {
+      await fs.rename(tokenFile, join(directory, "original.json"));
+      return actual.open(...args);
+    });
+    await expect(auth.status()).rejects.toMatchObject({ code: "GOOGLE_TOKEN_READ_FAILED" });
+    expect(mocks.revoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects a pathname replacement during descriptor reading", async () => {
+    await writeFile(tokenFile, JSON.stringify(freshTokens()));
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(fs.open).mockImplementationOnce(async (...args) => {
+      const handle = await actual.open(...args);
+      const read = handle.readFile.bind(handle);
+      vi.spyOn(handle, "readFile").mockImplementationOnce(async (...options) => {
+        const result = await read(...options);
+        await fs.rename(tokenFile, join(directory, "original.json"));
+        await writeFile(tokenFile, "replacement user content");
+        return result;
+      });
+      return handle;
+    });
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_TOKEN_READ_FAILED" });
+    expect(await readFile(tokenFile, "utf8")).toBe("replacement user content");
+    expect(mocks.revoke).not.toHaveBeenCalled();
+  });
+
+  it("preserves a main token replaced while revocation is pending", async () => {
+    await writeFile(tokenFile, JSON.stringify(freshTokens()));
+    mocks.revoke.mockImplementation(async () => {
+      await fs.rename(tokenFile, join(directory, "original.json"));
+      await writeFile(tokenFile, "replacement user content");
+    });
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_DISCONNECT_LOCAL_FAILED" });
+    expect(await readFile(tokenFile, "utf8")).toBe("replacement user content");
+    expect(mocks.revoke).toHaveBeenCalledWith("secret-refresh-token");
   });
 });
 

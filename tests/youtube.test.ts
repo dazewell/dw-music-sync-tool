@@ -181,6 +181,36 @@ describe("YouTubeProvider official read-only coverage", () => {
     expect(result.warnings).toEqual([]);
   });
 
+  it.each([
+    { positions: [0, 2], itemCount: 2 },
+    { positions: [1, 2], itemCount: 2 },
+    { positions: [2], itemCount: 1 },
+    { positions: [0, 3, 2], itemCount: null },
+  ])("rejects position gaps or a missing zero position despite matching totals: $positions", async ({ positions, itemCount }) => {
+    const { provider } = fixture([json({
+      items: positions.map(position => apiItem(position)),
+      pageInfo: { totalResults: positions.length },
+    })]);
+    await expect(provider.getPlaylist({ ...playlist, itemCount })).rejects.toMatchObject({
+      code: "YOUTUBE_PLAYLIST_CHANGED", status: 409, message: expect.stringContaining("positions"),
+    });
+  });
+
+  it("checks contiguity across pages rather than renumbering missing occurrences", async () => {
+    const { provider } = fixture([
+      json({ items: [apiItem(0)], nextPageToken: "second", pageInfo: { totalResults: 2 } }),
+      json({ items: [apiItem(2)], pageInfo: { totalResults: 2 } }),
+    ]);
+    await expect(provider.getPlaylist({ ...playlist, itemCount: 2 })).rejects.toMatchObject({
+      code: "YOUTUBE_PLAYLIST_CHANGED", status: 409,
+    });
+  });
+
+  it("accepts an empty playlist with no positions", async () => {
+    const { provider } = fixture([json({ items: [], pageInfo: { totalResults: 0 } })]);
+    expect((await provider.getPlaylist({ ...playlist, itemCount: 0 })).entries).toEqual([]);
+  });
+
   it("accepts genuinely empty pages only when items is an array", async () => {
     const { provider } = fixture([json({ items: [], pageInfo: { totalResults: 0 } })]);
     expect(await provider.listPlaylists()).toEqual([]);
