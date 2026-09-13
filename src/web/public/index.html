@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Soundiiz Local Archive</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<!--
+THESIS: A playlist backup should feel like operating a dependable archive desk, not a generic dashboard of cards.
+OWN-WORLD: Paper-white workspace, ink-blue structure, amber active state, ruled lists, compact squared controls.
+STORY: Connect the account, choose source playlists, watch each transfer, then retrieve durable local files.
+FIRST VIEWPORT: Narrow masthead above a two-column workbench; playlist selection dominates left while connection and run controls anchor right.
+FORM: Archival index/workbench, ranked first for an operate surface; direct staging from the explicit task brief.
+-->
+<header class="masthead">
+  <a class="brand" href="/" aria-label="Soundiiz Local Archive home"><span class="brand-mark">S</span><span>Soundiiz <b>Local Archive</b></span></a>
+  <div id="connectionBadge" class="connection" aria-live="polite"><span></span> Not connected</div>
+</header>
+<main>
+  <section class="intro">
+    <h1>Keep your playlists<br>within reach.</h1>
+    <p>Choose what matters, export it in an open format, and keep every file on this machine.</p>
+  </section>
+
+  <section class="workbench" aria-label="Backup workspace">
+    <div class="catalog">
+      <div class="section-head">
+        <div><h2>Your playlists</h2><p id="playlistSummary">Connect to load your library.</p></div>
+        <button id="selectAll" class="text-button" type="button" disabled>Select all</button>
+      </div>
+      <div id="playlistList" class="playlist-list" aria-live="polite">
+        <div class="empty"><strong>No library loaded</strong><span>Add your API key, then test the connection.</span></div>
+      </div>
+    </div>
+
+    <aside class="controls">
+      <form id="connectionForm">
+        <h2>Connection</h2>
+        <label for="apiKey">Soundiiz API key</label>
+        <div class="inline-field"><input id="apiKey" type="password" autocomplete="off" placeholder="Paste your key" required><button type="submit">Connect</button></div>
+        <p class="hint">Stored only in this browser session.</p>
+      </form>
+      <div class="rule"></div>
+      <form id="backupForm">
+        <h2>Backup settings</h2>
+        <div class="field-grid">
+          <label>Platform<select id="platform"><option value="youtubeMusic">YouTube Music</option><option value="spotify">Spotify</option><option value="all">All platforms</option></select></label>
+          <label>Format<select id="format"><option value="json">JSON</option><option value="m3u">M3U</option><option value="csv">CSV</option></select></label>
+        </div>
+        <label for="outputDir">Output directory</label>
+        <input id="outputDir" value="./backups">
+        <button id="backupButton" class="primary" type="submit" disabled>Back up selected</button>
+      </form>
+      <div id="progressPanel" class="progress-panel" hidden aria-live="polite">
+        <div class="progress-copy"><strong id="progressTitle">Preparing backup</strong><span id="progressPercent">0%</span></div>
+        <progress id="progress" max="100" value="0">0%</progress>
+        <p id="progressMessage">Loading playlists…</p>
+      </div>
+      <p id="notice" class="notice" role="alert" hidden></p>
+    </aside>
+  </section>
+
+  <section class="history">
+    <div class="section-head"><div><h2>Local archive</h2><p>Manifests and exports found on this machine.</p></div><button id="refreshHistory" class="text-button" type="button">Refresh</button></div>
+    <div id="historyList" class="history-list"><div class="empty"><strong>No backups yet</strong><span>Your completed runs will appear here.</span></div></div>
+  </section>
+</main>
+<footer>Local-first playlist backup · Your key is never written to disk</footer>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

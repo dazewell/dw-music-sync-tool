@@ -1,0 +1,43 @@
+{
+  "name": "soundiiz-client",
+  "version": "1.0.0",
+  "description": "Soundiiz API Client & Web/CLI Interface",
+  "main": "dist/index.js",
+  "type": "module",
+  "bin": {
+    "soundiiz": "dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "cli": "tsx src/cli/index.ts",
+    "test": "vitest run",
+    "web": "tsx src/index.ts"
+  },
+  "keywords": [
+    "soundiiz",
+    "music",
+    "playlist",
+    "api",
+    "client"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "commander": "^13.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.4",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vitest": "^3.0.6"
+  }
+}
