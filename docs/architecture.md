@@ -90,6 +90,14 @@ manually remove a live lock.
   Manifest v1 adds optional `playlists[].integrity.{json,csv,m3u}` records containing
   original `{size, sha256}` values. New completed exports retain these values
   before their pending intent is removed; failed and legacy results omit them.
+  New files use atomic hard-link publication from flushed staging files; rename
+  is reserved for explicit checkpoint replacement. Filesystems without hard-link
+  support fail explicitly. A journaled output/stage pair is recoverable only with
+  matching original bytes, exact device/inode identity and exactly two links;
+  recovery removes only the redundant stage after a complete ownership preflight.
+  Unjournaled metadata stages are preserved for inspection. Failed ownership
+  initialization attempts only empty-directory removal and reports cleanup
+  failures alongside the original error.
 - Keep existing run contents unchanged until their 30-day expiry; don't turn a
   failed fetch into an empty playlist or overwrite a previously good export.
 - Fingerprint ordered provider-native identities, not display names, added dates

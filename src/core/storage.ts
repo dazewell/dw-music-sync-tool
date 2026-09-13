@@ -134,10 +134,19 @@ function sameFile(before: Stats, after: Stats): boolean {
     && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs && before.nlink === after.nlink;
 }
 
-async function ordinaryFile(directory: string, name: string): Promise<Stats> {
+async function ordinaryFile(directory: string, name: string, pairedName?: string): Promise<Stats> {
   const filename = await safeChild(directory, name);
   const info = await fs.lstat(filename);
-  if (info.nlink !== 1) throw recoveryError(`"${name}" is not an ordinary, unlinked file`);
+  if (pairedName !== undefined) {
+    const identity = await fs.lstat(filename, { bigint: true });
+    const paired = await fs.lstat(await safeChild(directory, pairedName), { bigint: true });
+    if (info.nlink !== 2 || identity.nlink !== 2n || paired.nlink !== 2n || identity.ino === 0n
+      || identity.dev !== paired.dev || identity.ino !== paired.ino) {
+      throw recoveryError(`"${name}" is not an exclusive journaled hard-link pair`);
+    }
+  } else if (info.nlink !== 1) {
+    throw recoveryError(`"${name}" is not an ordinary, unlinked file`);
+  }
   return info;
 }
 
@@ -167,15 +176,22 @@ export interface PendingExports {
   files: string[];
   present: Map<string, Stats>;
   integrity: Map<string, ExportIntegrity>;
+  linkedStages: Map<string, string>;
 }
 
 /** Verify original bytes, rejecting replacement content and links; missing files permit safe deletion retries. */
 export async function verifyExportIntegrity(
   directory: string, name: string, expected: ExportIntegrity,
 ): Promise<Stats | null> {
+  return verifyExport(directory, name, expected);
+}
+
+async function verifyExport(
+  directory: string, name: string, expected: ExportIntegrity, pairedName?: string,
+): Promise<Stats | null> {
   let before: Stats;
   try {
-    before = await ordinaryFile(directory, name);
+    before = await ordinaryFile(directory, name, pairedName);
   } catch (error) {
     if (error instanceof AppError && error.code === "BACKUP_NOT_FOUND") return null;
     throw error;
@@ -192,7 +208,7 @@ export async function verifyExportIntegrity(
   } finally {
     await handle.close();
   }
-  if (!sameFile(before, await ordinaryFile(directory, name))) {
+  if (!sameFile(before, await ordinaryFile(directory, name, pairedName))) {
     throw recoveryError(`Export "${name}" was replaced while its contents were being verified`);
   }
   return before;
@@ -242,18 +258,38 @@ export async function readPendingExports(directory: string, manifest: BackupMani
   }
   const present = new Map<string, Stats>();
   const integrity = new Map<string, ExportIntegrity>();
+  const linkedStages = new Map<string, string>();
   for (const output of [...intent.outputs, intent.manifestWrite]) {
     const candidates = output.file === "manifest.json" ? [output.temporary] : [output.file, output.temporary];
+    let paired = false;
+    if (candidates.length === 2) {
+      const exists = await Promise.all(candidates.map(async name => {
+        try {
+          await safeChild(directory, name);
+          return true;
+        } catch (error) {
+          if (error instanceof AppError && error.code === "BACKUP_NOT_FOUND") return false;
+          throw error;
+        }
+      }));
+      paired = exists.every(Boolean);
+      if (paired) linkedStages.set(output.temporary, output.file);
+    }
     for (const name of candidates) {
       integrity.set(name, { size: output.size, sha256: output.sha256 });
-      const info = await verifyExportIntegrity(directory, name, output);
+      const partner = paired ? name === output.file ? output.temporary : output.file : undefined;
+      const info = await verifyExport(directory, name, output, partner);
       if (info) present.set(name, info);
     }
-    if (output.file !== "manifest.json" && present.has(output.file) && present.has(output.temporary)) {
-      throw recoveryError("Both a pending export and its staging file exist");
-    }
   }
-  return { text, files: names, present, integrity };
+  return { text, files: names, present, integrity, linkedStages };
+}
+
+/** Link exceptions are restricted to pairs already validated against a durable export intent. */
+export async function inspectPendingFile(directory: string, name: string, pending: PendingExports): Promise<Stats> {
+  const partner = pending.linkedStages.get(name)
+    ?? [...pending.linkedStages].find(([, file]) => file === name)?.[0];
+  return ordinaryFile(directory, name, partner);
 }
 
 async function assertPendingUnchanged(directory: string, pending: PendingExports): Promise<void> {
@@ -262,9 +298,48 @@ async function assertPendingUnchanged(directory: string, pending: PendingExports
   }
 }
 
+/** Remove only the redundant staging name, never the published data, after a complete ownership preflight. */
+export async function settlePendingExportLinks(
+  directory: string, manifest: BackupManifest, pending: PendingExports,
+): Promise<void> {
+  const ownerText = await checkedText(directory, BACKUP_OWNER_FILENAME, 4_096);
+  validateOwner(ownerText, manifest.id, manifest.startedAt);
+  const checkpoint = await checkedText(directory, "manifest.json", 16 * 1_024 * 1_024);
+  const allowed = new Set([
+    BACKUP_OWNER_FILENAME, BACKUP_PENDING_FILENAME, "manifest.json", ".active.json", ...pending.files,
+    ...manifest.playlists.flatMap(item => Object.values(item.files ?? {})),
+  ]);
+  for (const [stage] of pending.linkedStages) {
+    const current = await readPendingExports(directory, manifest);
+    if (!current || current.text !== pending.text || !current.linkedStages.has(stage)) {
+      throw recoveryError("The journaled hard-link pair changed before staging cleanup");
+    }
+    for (const name of await fs.readdir(directory)) {
+      if (!allowed.has(name)) throw recoveryError(`Unexpected entry "${name}" before staging cleanup`);
+      await inspectPendingFile(directory, name, current);
+    }
+    await assertPendingUnchanged(directory, pending);
+    if (await checkedText(directory, BACKUP_OWNER_FILENAME, 4_096) !== ownerText
+      || await checkedText(directory, "manifest.json", 16 * 1_024 * 1_024) !== checkpoint
+      || !sameFile(pending.present.get(stage)!, await inspectPendingFile(directory, stage, current))) {
+      throw recoveryError("Run metadata or a staging file changed before cleanup");
+    }
+    try {
+      await fs.unlink(path.join(directory, stage));
+    } catch (error) {
+      throw storageError(error, "Cannot remove a journaled publication staging file");
+    }
+  }
+}
+
 export async function finishPlaylistExport(directory: string, manifest: BackupManifest, discard = false): Promise<void> {
-  const pending = await readPendingExports(directory, manifest);
+  let pending = await readPendingExports(directory, manifest);
   if (!pending) return;
+  if (pending.linkedStages.size > 0) {
+    await settlePendingExportLinks(directory, manifest, pending);
+    pending = await readPendingExports(directory, manifest);
+    if (!pending) throw recoveryError("The pending export intent disappeared during staging cleanup");
+  }
   if (discard) {
     for (const [name, info] of pending.present) {
       await assertPendingUnchanged(directory, pending);
@@ -322,7 +397,12 @@ export async function publishPlaylistExports(
       await atomicWrite(directory, file, text, outputs[index]!.temporary);
     }
   } catch (error) {
-    await finishPlaylistExport(directory, manifest, true);
+    try {
+      await finishPlaylistExport(directory, manifest, true);
+    } catch (cleanupError) {
+      throw new AppError("BACKUP_STORAGE_ERROR",
+        `${errorMessage(error)} Incomplete exports were preserved: ${errorMessage(cleanupError)}`, 500);
+    }
     throw error;
   }
   return completed;
@@ -470,6 +550,7 @@ export async function recoverInterruptedBackups(backupDirectory: string): Promis
     directories.push(directory);
   }
   const pending: { directory: string; manifest: BackupManifest; text: string }[] = [];
+  const linked: { directory: string; manifest: BackupManifest; intent: PendingExports }[] = [];
   const emptyRuns: { directory: string; ownerText: string; identity: Stats }[] = [];
   for (const directory of directories) {
     const id = path.basename(directory);
@@ -503,9 +584,14 @@ export async function recoverInterruptedBackups(backupDirectory: string): Promis
     ]);
     for (const name of entries) {
       if (!allowed.has(name)) throw recoveryError(`Backup "${id}" contains unexpected entry "${name}"`);
-      await ordinaryFile(directory, name);
+      if (intent) await inspectPendingFile(directory, name, intent);
+      else await ordinaryFile(directory, name);
     }
+    if (intent && intent.linkedStages.size > 0) linked.push({ directory, manifest, intent });
     if (manifest.status === "running") pending.push({ directory, manifest, text });
+  }
+  for (const { directory, manifest, intent } of linked) {
+    await settlePendingExportLinks(directory, manifest, intent);
   }
   // Owner-only runs contain no playlist data and cannot truthfully invent a provider.
   for (const { directory, ownerText, identity } of emptyRuns) {
@@ -574,18 +660,20 @@ export async function resolveBackupFile(backupDirectory: string, id: string, fil
   return safeChild(await runDirectory(backupDirectory, id), file);
 }
 
-/** Publish only fully flushed files. Temporary files belong exclusively to this write. */
+/** New files require atomic hard-link publication; only explicit replacements may use rename. */
 export async function atomicWrite(
   directory: string, file: string, contents: string, stagingName?: string, replace = false,
 ): Promise<void> {
   if (!isBasename(file)) {
     throw new AppError("INVALID_BACKUP_FILE", "Invalid backup output basename.", 400);
   }
-  if (stagingName !== undefined && !/^\.write-[0-9a-f-]{36}\.tmp$/.test(stagingName)) {
+  if (stagingName !== undefined && (!/^\.write-[0-9a-f-]{36}\.tmp$/.test(stagingName)
+    || stagingName.toLowerCase() === file.toLowerCase())) {
     throw new AppError("INVALID_BACKUP_FILE", "Invalid backup staging basename.", 400);
   }
   const temporary = path.join(directory, stagingName ?? `.write-${randomUUID()}.tmp`);
   let owned = false;
+  let preserveStage = false;
   try {
     const handle = await fs.open(temporary, "wx", 0o600);
     owned = true;
@@ -595,21 +683,36 @@ export async function atomicWrite(
     } finally {
       await handle.close();
     }
-    if (stagingName && !replace && (await fs.readdir(directory)).some(name => name.toLowerCase() === file.toLowerCase())) {
-      throw recoveryError(`Playlist output "${file}" appeared after its intent was saved`);
+    if (replace) {
+      await fs.rename(temporary, path.join(directory, file));
+    } else {
+      // On failure, a journaled stage must remain: a racing destination is not ours.
+      preserveStage = stagingName !== undefined;
+      try {
+        await fs.link(temporary, path.join(directory, file));
+      } catch (error) {
+        if (["ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV"].some(code => hasCode(error, code))) {
+          throw new AppError("BACKUP_STORAGE_ERROR",
+            `Cannot publish ${file}: atomic no-replace writes require filesystem hard-link support (${errorMessage(error)}). No rename fallback is used.`, 500);
+        }
+        throw error;
+      }
+      preserveStage = true;
+      await fs.unlink(temporary);
     }
-    await fs.rename(temporary, path.join(directory, file));
     owned = false;
   } catch (error) {
-    throw storageError(error, `Cannot write ${file}`);
-  } finally {
-    if (owned) {
+    if (owned && !preserveStage) {
       try {
         await fs.unlink(temporary);
-      } catch (error) {
-        if (!hasCode(error, "ENOENT")) throw storageError(error, "Cannot clean up an incomplete backup write");
+      } catch (cleanupError) {
+        if (!hasCode(cleanupError, "ENOENT")) {
+          throw new AppError("BACKUP_STORAGE_ERROR",
+            `${errorMessage(error)} Cleaning up the incomplete write also failed: ${errorMessage(cleanupError)}`, 500);
+        }
       }
     }
+    throw storageError(error, `Cannot write ${file}`);
   }
 }
 
@@ -628,6 +731,7 @@ export async function createBackupRun(backupDirectory: string): Promise<BackupRu
     const id = `${startedAt.replace(/[:.]/g, "-")}_${randomUUID()}`;
     const directory = path.join(root, id);
     await fs.mkdir(directory, { mode: 0o700 });
+    const identity = await fs.lstat(directory, { bigint: true });
     activeRuns.add(directory);
     try {
       await atomicWrite(directory, BACKUP_OWNER_FILENAME, `${JSON.stringify({
@@ -638,6 +742,17 @@ export async function createBackupRun(backupDirectory: string): Promise<BackupRu
       }, null, 2)}\n`);
     } catch (error) {
       activeRuns.delete(directory);
+      try {
+        const current = await fs.lstat(directory, { bigint: true });
+        if (!current.isDirectory() || current.isSymbolicLink()
+          || current.dev !== identity.dev || current.ino !== identity.ino) {
+          throw new Error("the failed run directory was replaced");
+        }
+        await fs.rmdir(directory);
+      } catch (cleanupError) {
+        throw new AppError("BACKUP_STORAGE_ERROR",
+          `${errorMessage(error)} Empty-directory cleanup also failed: ${errorMessage(cleanupError)}; preserving the run directory.`, 500);
+      }
       throw error;
     }
     return {

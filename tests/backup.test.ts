@@ -314,8 +314,10 @@ describe("failures and recoverable checkpoints", () => {
 
   it("publishes atomic complete files and never leaves temporary files", async () => {
     const originalRename = fs.rename;
+    const originalLink = fs.link;
     let renames = 0;
-    vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+    let links = 0;
+    const inspect = async (source: Parameters<typeof fs.rename>[0], destination: Parameters<typeof fs.rename>[1]) => {
       const sourceName = String(source);
       const destinationName = String(destination);
       expect(path.basename(sourceName)).toMatch(/^\.write-[0-9a-f-]+\.tmp$/);
@@ -323,21 +325,32 @@ describe("failures and recoverable checkpoints", () => {
       const contents = await fs.readFile(sourceName, "utf8");
       expect(contents.length).toBeGreaterThan(0);
       if (destinationName.endsWith(".json")) expect(() => JSON.parse(contents)).not.toThrow();
+    };
+    vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+      await inspect(source, destination);
+      expect(path.basename(String(destination))).toBe("manifest.json");
       await originalRename(source, destination);
       renames++;
     });
+    vi.spyOn(fs, "link").mockImplementation(async (source, destination) => {
+      await inspect(source, destination);
+      expect(path.basename(String(destination))).not.toBe("manifest.json");
+      await originalLink(source, destination);
+      links++;
+    });
     const manifest = await successfulBackup();
-    expect(renames).toBeGreaterThanOrEqual(7);
+    expect(renames).toBeGreaterThanOrEqual(4);
+    expect(links).toBe(5);
     expect(await fs.readdir(path.join(root, manifest.id))).not.toEqual(expect.arrayContaining([expect.stringMatching(/\.tmp$/)]));
   });
 
   it("fails loudly on disk writes, removes only its partial exports, and saves failure metadata", async () => {
-    const originalRename = fs.rename;
-    vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+    const originalLink = fs.link;
+    vi.spyOn(fs, "link").mockImplementation(async (source, destination) => {
       if (String(destination).endsWith(".csv")) {
         throw Object.assign(new Error("Disk full"), { code: "ENOSPC" });
       }
-      return originalRename(source, destination);
+      return originalLink(source, destination);
     });
     await expect(successfulBackup()).rejects.toMatchObject({ code: "BACKUP_STORAGE_ERROR", status: 500 });
     const [manifest] = await listBackups(root);

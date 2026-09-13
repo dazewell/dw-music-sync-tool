@@ -43,30 +43,50 @@ function provider(): PlaylistProvider {
   };
 }
 
-type Boundary = "owner" | "initial-manifest-stage" | "intent-stage" | "intent"
-  | "json-stage" | "json" | "csv-stage" | "csv" | "m3u-stage" | "full"
+type Boundary = "owner" | "owner-linked" | "initial-manifest-stage" | "intent-stage" | "intent" | "intent-linked"
+  | "json-stage" | "json" | "json-linked" | "csv-stage" | "csv" | "csv-linked" | "m3u-stage" | "full" | "m3u-linked"
   | "checkpoint-stage" | "checkpoint" | "cleanup";
 
 /** Copy the actual durable bytes at a write boundary, without a real process crash. */
 async function snapshot(boundary: Boundary, playlistCount = 1): Promise<string> {
   let id: string | undefined;
   let captures = 0;
+  const link = fs.link;
   const capture = async (directory: string) => {
     if (id || ++captures !== playlistCount) return;
     id = path.basename(directory);
-    await fs.cp(directory, path.join(root, id), { recursive: true });
+    const destination = path.join(root, id);
+    await fs.mkdir(destination);
+    const identities = new Map<string, string>();
+    for (const name of await fs.readdir(directory)) {
+      const source = path.join(directory, name);
+      const target = path.join(destination, name);
+      const info = await fs.lstat(source, { bigint: true });
+      const key = `${info.dev}:${info.ino}`;
+      const prior = identities.get(key);
+      if (prior) await link(prior, target);
+      else {
+        await fs.copyFile(source, target);
+        identities.set(key, target);
+      }
+    }
   };
   const rename = fs.rename;
-  const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+  const stages = new Map<string, { directory: string; boundary: Boundary | undefined }>();
+  const publish = async (
+    source: Parameters<typeof fs.rename>[0], destination: Parameters<typeof fs.rename>[1], replace: boolean,
+  ) => {
     const directory = path.dirname(String(destination));
     const file = path.basename(String(destination));
     const isExport = file.startsWith("Fixture-");
     let before: Boundary | undefined;
     let after: Boundary | undefined;
-    if (file === BACKUP_OWNER_FILENAME) after = "owner";
+    let linked: Boundary | undefined;
+    if (file === BACKUP_OWNER_FILENAME) { after = "owner"; linked = "owner-linked"; }
     if (file === BACKUP_PENDING_FILENAME) {
       before = "intent-stage";
       after = "intent";
+      linked = "intent-linked";
     }
     if (isExport) {
       const intent = JSON.parse(await fs.readFile(path.join(directory, BACKUP_PENDING_FILENAME), "utf8"));
@@ -77,9 +97,9 @@ async function snapshot(boundary: Boundary, playlistCount = 1): Promise<string> 
       expect(output.sha256).toBe(createHash("sha256").update(text).digest("hex"));
       const format = file.endsWith(".json") ? "json" : file.endsWith(".csv") ? "csv" : "m3u";
       expect(intent.result.integrity[format]).toEqual({ size: output.size, sha256: output.sha256 });
-      if (file.endsWith(".json")) { before = "json-stage"; after = "json"; }
-      if (file.endsWith(".csv")) { before = "csv-stage"; after = "csv"; }
-      if (file.endsWith(".m3u8")) { before = "m3u-stage"; after = "full"; }
+      if (file.endsWith(".json")) { before = "json-stage"; after = "json"; linked = "json-linked"; }
+      if (file.endsWith(".csv")) { before = "csv-stage"; after = "csv"; linked = "csv-linked"; }
+      if (file.endsWith(".m3u8")) { before = "m3u-stage"; after = "full"; linked = "m3u-linked"; }
     }
     if (file === "manifest.json") {
       const manifest = JSON.parse(await fs.readFile(source, "utf8"));
@@ -90,12 +110,25 @@ async function snapshot(boundary: Boundary, playlistCount = 1): Promise<string> 
       }
     }
     if (before === boundary) await capture(directory);
-    await rename(source, destination);
-    if (after === boundary) await capture(directory);
-  });
+    if (replace) {
+      await rename(source, destination);
+      if (after === boundary) await capture(directory);
+    } else {
+      await link(source, destination);
+      stages.set(String(source), { directory, boundary: after });
+      if (linked === boundary) await capture(directory);
+    }
+  };
+  const renameSpy = vi.spyOn(fs, "rename").mockImplementation((source, destination) => publish(source, destination, true));
+  const linkSpy = vi.spyOn(fs, "link").mockImplementation((source, destination) => publish(source, destination, false));
   const unlink = fs.unlink;
   const unlinkSpy = vi.spyOn(fs, "unlink").mockImplementation(async filename => {
     await unlink(filename);
+    const stage = stages.get(String(filename));
+    if (stage) {
+      stages.delete(String(filename));
+      if (stage.boundary === boundary) await capture(stage.directory);
+    }
     if (boundary === "cleanup" && path.basename(String(filename)) === BACKUP_PENDING_FILENAME) {
       await capture(path.dirname(String(filename)));
     }
@@ -114,6 +147,7 @@ async function snapshot(boundary: Boundary, playlistCount = 1): Promise<string> 
   } finally {
     vi.useRealTimers();
     renameSpy.mockRestore();
+    linkSpy.mockRestore();
     unlinkSpy.mockRestore();
   }
   expect(id).toBeDefined();
@@ -145,10 +179,13 @@ describe("durable interruption boundaries", () => {
 
   it.each([
     "intent", "json-stage", "json", "csv-stage", "csv", "m3u-stage", "full",
-    "checkpoint-stage", "checkpoint", "cleanup",
+    "checkpoint-stage", "checkpoint", "cleanup", "json-linked", "csv-linked", "m3u-linked",
   ] as const)("recovers %s and expires only explicitly journaled artifacts", async boundary => {
     const id = await snapshot(boundary);
     const before = await contents(id);
+    const removedStages: string[] = boundary.endsWith("-linked")
+      ? (await pending(id)).outputs.filter((output: { file: string; temporary: string }) => before[output.file] && before[output.temporary])
+        .map((output: { temporary: string }) => output.temporary) : [];
     const [recovered] = await recoverInterruptedBackups(root);
     const checkpointed = boundary === "checkpoint" || boundary === "cleanup";
     expect(recovered).toMatchObject({
@@ -165,7 +202,8 @@ describe("durable interruption boundaries", () => {
       }
     }
     for (const [name, bytes] of Object.entries(before)) {
-      if (name !== "manifest.json") expect(await fs.readFile(path.join(root, id, name))).toEqual(bytes);
+      if (removedStages.includes(name)) await expect(fs.stat(path.join(root, id, name))).rejects.toMatchObject({ code: "ENOENT" });
+      else if (name !== "manifest.json") expect(await fs.readFile(path.join(root, id, name))).toEqual(bytes);
     }
     if (!checkpointed) {
       const intent = await pending(id);
@@ -213,6 +251,183 @@ describe("durable interruption boundaries", () => {
     expect(recovered!.playlists).toHaveLength(1);
     expect(recovered!.status).toBe("interrupted");
     expect(await pruneExpiredBackups(root, expiry)).toEqual({ deleted: [], warnings: [] });
+  });
+});
+
+describe("journaled hard-link publication boundaries", () => {
+  it.each(["owner-linked", "intent-linked"] as const)(
+    "preserves the unproven %s metadata stage and reports the ambiguity",
+    async boundary => {
+      const id = await snapshot(boundary);
+      const before = await contents(id);
+      const unlink = vi.spyOn(fs, "unlink");
+      await expect(recoverInterruptedBackups(root)).rejects.toMatchObject({ code: "BACKUP_RECOVERY_ERROR" });
+      expect(unlink).not.toHaveBeenCalled();
+      expect(await contents(id)).toEqual(before);
+      expect((await pruneExpiredBackups(root, expiry)).deleted).toEqual([]);
+      expect(unlink).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([1, 2])("safely expires an interrupted dual-name export after %i playlist publications", async count => {
+    const id = await snapshot("json-linked", count);
+    const intent = await pending(id);
+    const output = intent.outputs[0];
+    const directory = path.join(root, id);
+    const file = await fs.stat(path.join(directory, output.file));
+    const stage = await fs.stat(path.join(directory, output.temporary));
+    expect(file.nlink).toBe(2);
+    expect(stage.nlink).toBe(2);
+    expect(file.ino).toBe(stage.ino);
+    const manifest = await readManifest(root, id);
+    await fs.writeFile(path.join(directory, "manifest.json"), JSON.stringify({ ...manifest, status: "interrupted" }));
+    expect(await pruneExpiredBackups(root, expiry)).toEqual({ deleted: [id], warnings: [] });
+    await expect(fs.stat(directory)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["external-link", "distinct-pairs", "changed", "duplicate", "unknown-file"] as const)(
+    "preserves a dual-name run with %s rather than broadly allowing hard links",
+    async corruption => {
+      const id = await snapshot("json-linked");
+      const intent = await pending(id);
+      const output = intent.outputs[0];
+      const directory = path.join(root, id);
+      const filename = path.join(directory, output.file);
+      if (corruption === "external-link") await fs.link(filename, path.join(scratch, "external-copy"));
+      if (corruption === "distinct-pairs") {
+        const stage = path.join(directory, output.temporary);
+        await fs.unlink(stage);
+        await fs.copyFile(filename, stage);
+        await fs.link(filename, path.join(scratch, "external-output"));
+        await fs.link(stage, path.join(scratch, "external-stage"));
+      }
+      if (corruption === "changed") await fs.writeFile(filename, "Unrelated replacement");
+      if (corruption === "duplicate") {
+        await fs.unlink(path.join(directory, output.temporary));
+        await fs.copyFile(filename, path.join(directory, output.temporary));
+      }
+      if (corruption === "unknown-file") await fs.writeFile(path.join(directory, "user.csv"), "Keep me");
+      const before = await contents(id);
+      const unlink = vi.spyOn(fs, "unlink");
+      await expect(recoverInterruptedBackups(root)).rejects.toMatchObject({ code: "BACKUP_RECOVERY_ERROR" });
+      expect(unlink).not.toHaveBeenCalled();
+      expect(await contents(id)).toEqual(before);
+      const manifest = await readManifest(root, id);
+      await fs.writeFile(path.join(directory, "manifest.json"), JSON.stringify({ ...manifest, status: "interrupted" }));
+      const beforeRetention = await contents(id);
+      const result = await pruneExpiredBackups(root, expiry);
+      expect(result.deleted).toEqual([]);
+      expect(result.warnings).toHaveLength(1);
+      expect(unlink).not.toHaveBeenCalled();
+      expect(await contents(id)).toEqual(beforeRetention);
+    },
+  );
+
+  it("retries a failed redundant-stage unlink without losing the published data or journal", async () => {
+    const id = await snapshot("json-linked");
+    const before = await contents(id);
+    vi.spyOn(fs, "unlink").mockRejectedValueOnce(new Error("Staging locked"));
+    await expect(recoverInterruptedBackups(root)).rejects.toMatchObject({
+      code: "BACKUP_STORAGE_ERROR", message: expect.stringContaining("Staging locked"),
+    });
+    expect(await contents(id)).toEqual(before);
+    expect((await recoverInterruptedBackups(root))[0]!.status).toBe("interrupted");
+    expect(await pruneExpiredBackups(root, expiry)).toEqual({ deleted: [id], warnings: [] });
+  });
+
+  it("retries a recovery checkpoint failure after the redundant link was already removed", async () => {
+    const id = await snapshot("json-linked");
+    const intent = await pending(id);
+    const output = intent.outputs[0];
+    const original = await fs.readFile(path.join(root, id, output.file));
+    vi.spyOn(fs, "rename").mockRejectedValueOnce(new Error("Checkpoint locked"));
+    await expect(recoverInterruptedBackups(root)).rejects.toMatchObject({ code: "BACKUP_STORAGE_ERROR" });
+    await expect(fs.stat(path.join(root, id, output.temporary))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await fs.stat(path.join(root, id, output.file))).nlink).toBe(1);
+    expect(await fs.readFile(path.join(root, id, output.file))).toEqual(original);
+    expect((await readManifest(root, id)).status).toBe("running");
+    expect((await recoverInterruptedBackups(root))[0]!.status).toBe("interrupted");
+    expect(await pruneExpiredBackups(root, expiry)).toEqual({ deleted: [id], warnings: [] });
+  });
+
+  it("reports a failed retention staging cleanup and safely retries the intact pair", async () => {
+    const id = await snapshot("json-linked");
+    const manifest = await readManifest(root, id);
+    await fs.writeFile(path.join(root, id, "manifest.json"), JSON.stringify({ ...manifest, status: "interrupted" }));
+    const before = await contents(id);
+    vi.spyOn(fs, "unlink").mockRejectedValueOnce(new Error("Stage locked"));
+    const first = await pruneExpiredBackups(root, expiry);
+    expect(first.deleted).toEqual([]);
+    expect(first.warnings.join(" ")).toContain("Stage locked");
+    expect(await contents(id)).toEqual(before);
+    expect(await pruneExpiredBackups(root, expiry)).toEqual({ deleted: [id], warnings: [] });
+  });
+
+  it.each([false, true])(
+    "never deletes a racing destination, even when its bytes match the intent (identical: %s)",
+    async identical => {
+      const link = fs.link;
+      let destination: string | undefined;
+      let stage: string | undefined;
+      let userBytes: Buffer | undefined;
+      vi.spyOn(fs, "link").mockImplementation(async (source, target) => {
+        if (String(target).endsWith(".csv")) {
+          destination = String(target);
+          stage = String(source);
+          userBytes = identical ? await fs.readFile(source) : Buffer.from("User-created data");
+          await fs.writeFile(target, userBytes);
+        }
+        await link(source, target);
+      });
+      const unlink = vi.spyOn(fs, "unlink");
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(startedAt));
+      await expect(runBackup(provider(), root)).rejects.toMatchObject({ code: "BACKUP_STORAGE_ERROR" });
+      vi.useRealTimers();
+      expect(destination).toBeDefined();
+      expect(await fs.readFile(destination!)).toEqual(userBytes);
+      expect((await fs.stat(destination!, { bigint: true })).ino)
+        .not.toBe((await fs.stat(stage!, { bigint: true })).ino);
+      expect(unlink).not.toHaveBeenCalledWith(destination);
+      expect(unlink).not.toHaveBeenCalledWith(stage);
+      const [manifest] = await listBackups(root);
+      expect(manifest!.status).toBe("failed");
+      const before = await contents(manifest!.id);
+      await expect(recoverInterruptedBackups(root)).rejects.toMatchObject({ code: "BACKUP_RECOVERY_ERROR" });
+      expect((await pruneExpiredBackups(root, expiry)).deleted).toEqual([]);
+      expect(await contents(manifest!.id)).toEqual(before);
+      expect(await fs.readFile(destination!)).toEqual(userBytes);
+    },
+  );
+
+  it.each([false, true])("never reports success after staging unlink failure (persistent: %s)", async persistent => {
+    const link = fs.link;
+    const unlink = fs.unlink;
+    let stage: string | undefined;
+    let failed = false;
+    vi.spyOn(fs, "link").mockImplementation(async (source, destination) => {
+      await link(source, destination);
+      if (String(destination).endsWith(".csv")) stage = String(source);
+    });
+    vi.spyOn(fs, "unlink").mockImplementation(async filename => {
+      if (String(filename) === stage && (persistent || !failed)) {
+        failed = true;
+        throw new Error("Published stage locked");
+      }
+      await unlink(filename);
+    });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(startedAt));
+    await expect(runBackup(provider(), root)).rejects.toMatchObject({
+      code: "BACKUP_STORAGE_ERROR", message: expect.stringContaining("Published stage locked"),
+    });
+    vi.useRealTimers();
+    const [manifest] = await listBackups(root);
+    expect(manifest!.status).toBe("failed");
+    expect(manifest!.playlists[0]!.status).toBe("failed");
+    vi.restoreAllMocks();
+    expect(await recoverInterruptedBackups(root)).toEqual([]);
+    expect(await pruneExpiredBackups(root, expiry)).toEqual({ deleted: [manifest!.id], warnings: [] });
   });
 });
 
@@ -391,11 +606,11 @@ describe("recovery and journal retention retries", () => {
     "retains a usable intent after a caught %s failure, not just an abrupt stop",
     async boundary => {
       const rename = fs.rename;
+      const link = fs.link;
       const unlink = fs.unlink;
       let failed = false;
       vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
         const name = path.basename(String(destination));
-        if (boundary === "export-cleanup" && name.endsWith(".csv")) throw new Error("Disk full");
         if (boundary === "checkpoint" && !failed && name === "manifest.json") {
           const manifest = JSON.parse(await fs.readFile(source, "utf8"));
           if (manifest.status === "running" && manifest.playlists.length === 1) {
@@ -404,6 +619,10 @@ describe("recovery and journal retention retries", () => {
           }
         }
         await rename(source, destination);
+      });
+      vi.spyOn(fs, "link").mockImplementation(async (source, destination) => {
+        if (boundary === "export-cleanup" && String(destination).endsWith(".csv")) throw new Error("Disk full");
+        await link(source, destination);
       });
       vi.spyOn(fs, "unlink").mockImplementation(async filename => {
         const name = path.basename(String(filename));

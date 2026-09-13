@@ -96,6 +96,12 @@ Previous runs are not overwritten. **App-managed runs expire after 30 days and
 are automatically removed while the app is running.** This is a rolling backup
 history, not a permanent archive.
 
+The backup filesystem must support regular-file hard links (for example, NTFS).
+New files are published from flushed staging files with an atomic no-overwrite
+operation. Unsupported filesystems produce an explicit error, not a fallback
+that could replace existing files; some removable-drive and network filesystems
+may not provide the required operation.
+
 | Format | Purpose |
 | --- | --- |
 | JSON | Authoritative versioned metadata, ordered entries, duplicate occurrences, IDs, available provider data and missing-data indicators. |
@@ -114,6 +120,9 @@ without being advertised as completed exports. Unrecognized or changed leftovers
 are preserved with an inspection error rather than guessed to be safe to delete.
 Completed results retain each export's original byte count and SHA-256 hash in
 the manifest, allowing cleanup to detect replacement files even at a known name.
+After an interrupted publication, a journaled export and its staging name are
+reconciled only when they are the same file with exactly two links and matching
+recorded bytes. Unknown metadata staging files remain protected for inspection.
 The CLI prints the final manifest as JSON to stdout and progress to stderr; it exits
 nonzero for partial or failed runs.
 

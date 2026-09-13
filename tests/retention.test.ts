@@ -356,6 +356,42 @@ describe("original integrity evidence for completed exports", () => {
     expect(await runContents(manifest)).toEqual(before);
   });
 
+  it.each([BACKUP_OWNER_FILENAME, "manifest.json"])(
+    "rejects an in-place change while reading %s before using the metadata",
+    async name => {
+      const manifest = await backup();
+      const filename = runPath(manifest, name);
+      const original = await fs.readFile(filename, "utf8");
+      const open = fs.open;
+      let reads = 0;
+      const targetRead = name === "manifest.json" ? 2 : 1;
+      let mutated = false;
+      vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+        const handle = await open(...args);
+        if (String(args[0]) === filename && ++reads === targetRead) {
+          const readFile = handle.readFile.bind(handle);
+          vi.spyOn(handle, "readFile").mockImplementationOnce(async (...options) => {
+            const text = await readFile(...options);
+            await fs.appendFile(filename, " ");
+            mutated = true;
+            return text;
+          });
+        }
+        return handle;
+      });
+      const unlink = vi.spyOn(fs, "unlink");
+      const result = await pruneExpiredBackups(root, expiry);
+      expect(mutated).toBe(true);
+      expect(result.deleted).toEqual([]);
+      expect(result.warnings.join(" ")).toContain(`"${name}" changed while being read`);
+      expect(unlink).not.toHaveBeenCalled();
+      expect(await fs.readFile(filename, "utf8")).toBe(`${original} `);
+      for (const file of Object.values(manifest.playlists[0]!.files!)) {
+        expect((await fs.stat(runPath(manifest, file))).isFile()).toBe(true);
+      }
+    },
+  );
+
   it.each(["size", "sha256"] as const)("preserves a run when persisted %s evidence is changed", async field => {
     const manifest = await backup();
     const proof = manifest.playlists[0]!.integrity!.m3u;

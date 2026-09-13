@@ -6,7 +6,7 @@ import { z } from "zod";
 import { AppError, errorMessage } from "./errors.js";
 import {
   BACKUP_OWNER_APP, BACKUP_OWNER_FILENAME, BACKUP_PENDING_FILENAME, readManifest, readPendingExports,
-  verifyExportIntegrity,
+  inspectPendingFile, settlePendingExportLinks, verifyExportIntegrity,
 } from "./storage.js";
 
 export const RETENTION_DAYS = 30;
@@ -72,7 +72,9 @@ async function readMetadata(directory: string, name: string, limit: number): Pro
   const handle = await fs.open(path.join(directory, name), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     if (!unchanged(before, await handle.stat())) throw new Error(`"${name}" changed while being read`);
-    return await handle.readFile("utf8");
+    const text = await handle.readFile("utf8");
+    if (!unchanged(before, await handle.stat())) throw new Error(`"${name}" changed while being read`);
+    return text;
   } finally {
     await handle.close();
   }
@@ -112,7 +114,9 @@ async function restoreMetadata(directory: string, name: string, contents: string
   }
 }
 
-async function pruneRun(root: string, id: string, now: number): Promise<"deleted" | "recent" | "unmanaged"> {
+async function pruneRun(
+  root: string, id: string, now: number, settleLinks = true,
+): Promise<"deleted" | "recent" | "unmanaged"> {
   const directory = await assertRun(root, id);
   const identity = await fs.lstat(directory);
   let ownerText: string;
@@ -153,7 +157,8 @@ async function pruneRun(root: string, id: string, now: number): Promise<"deleted
   const files = new Map<string, Stats>();
   for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
     if (!allowed.has(entry.name)) throw new Error(`unexpected entry "${entry.name}"; preserving the entire run`);
-    files.set(entry.name, await regularFile(directory, entry.name));
+    files.set(entry.name, pending?.linkedStages.size
+      ? await inspectPendingFile(directory, entry.name, pending) : await regularFile(directory, entry.name));
   }
   if (files.has(".active.json")) await staleActiveMarker(directory);
   if (!files.has(BACKUP_OWNER_FILENAME) || !files.has("manifest.json")) {
@@ -188,6 +193,13 @@ async function pruneRun(root: string, id: string, now: number): Promise<"deleted
     if (before ? !after || !unchanged(before, after) : after) {
       throw new Error("exports changed after content verification");
     }
+  }
+  if (pending && pending.linkedStages.size > 0) {
+    if (!settleLinks) throw new Error("journaled hard links reappeared during retention");
+    await assertRun(root, id, identity);
+    await settlePendingExportLinks(directory, manifest, pending);
+    // Link count and ctime legitimately changed; repeat the complete preflight with fresh identities.
+    return pruneRun(root, id, now, false);
   }
   // Missing declared exports are allowed so interrupted deletions can be retried.
   const deletionOrder = [

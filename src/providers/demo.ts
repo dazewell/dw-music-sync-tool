@@ -26,6 +26,9 @@ export class DemoProvider implements PlaylistProvider {
   }
 
   async getPlaylist(playlist: Playlist): Promise<PlaylistContents> {
+    if (playlist.provider !== this.id || !playlist.id) {
+      throw new AppError("YOUTUBE_PLAYLIST_INVALID", "A YouTube playlist is required.", 400);
+    }
     const example = examples.find((item) => item.id === playlist.id);
     if (!example) throw new AppError("PLAYLIST_NOT_FOUND", "The demo playlist does not exist.", 404);
     const entries: PlaylistEntry[] = Array.from({ length: example.count }, (_, position) => {
