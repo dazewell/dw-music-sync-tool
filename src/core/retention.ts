@@ -4,7 +4,9 @@ import * as path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { AppError, errorMessage } from "./errors.js";
-import { BACKUP_OWNER_APP, BACKUP_OWNER_FILENAME, readManifest } from "./storage.js";
+import {
+  BACKUP_OWNER_APP, BACKUP_OWNER_FILENAME, BACKUP_PENDING_FILENAME, readManifest, readPendingExports,
+} from "./storage.js";
 
 export const RETENTION_DAYS = 30;
 const retentionMilliseconds = RETENTION_DAYS * 24 * 60 * 60 * 1_000;
@@ -38,7 +40,7 @@ function hasCode(error: unknown, code: string): boolean {
 
 function unchanged(before: Stats, after: Stats): boolean {
   return before.dev === after.dev && before.ino === after.ino
-    && before.size === after.size && before.mtimeMs === after.mtimeMs;
+    && before.size === after.size && before.mtimeMs === after.mtimeMs && before.ctimeMs === after.ctimeMs;
 }
 
 async function assertRun(root: string, id: string, identity?: Stats): Promise<string> {
@@ -136,10 +138,16 @@ async function pruneRun(root: string, id: string, now: number): Promise<"deleted
     throw new Error("manifest changed during retention inspection");
   }
   const exports = manifest.playlists.flatMap(item => item.files ? Object.values(item.files) : []);
-  if (exports.some(file => [BACKUP_OWNER_FILENAME, "manifest.json", ".active.json"].includes(file))) {
+  if (exports.some(file => [BACKUP_OWNER_FILENAME, BACKUP_PENDING_FILENAME, "manifest.json", ".active.json"]
+    .includes(file.toLowerCase()))) {
     throw new Error("an export filename collides with protected run metadata");
   }
-  const allowed = new Set([...exports, BACKUP_OWNER_FILENAME, "manifest.json", ".active.json"]);
+  const pending = await readPendingExports(directory, manifest);
+  const outputs = [...new Set([...exports, ...(pending?.files ?? [])])];
+  const allowed = new Set([
+    ...outputs, BACKUP_OWNER_FILENAME, "manifest.json", ".active.json",
+    ...(pending ? [BACKUP_PENDING_FILENAME] : []),
+  ]);
   const files = new Map<string, Stats>();
   for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
     if (!allowed.has(entry.name)) throw new Error(`unexpected entry "${entry.name}"; preserving the entire run`);
@@ -150,11 +158,24 @@ async function pruneRun(root: string, id: string, now: number): Promise<"deleted
     throw new Error("ownership marker or manifest disappeared during inspection");
   }
   if (await readMetadata(directory, BACKUP_OWNER_FILENAME, 4_096) !== ownerText
-    || await readMetadata(directory, "manifest.json", 16 * 1_024 * 1_024) !== manifestText) {
-    throw new Error("ownership marker or manifest changed during inspection");
+    || await readMetadata(directory, "manifest.json", 16 * 1_024 * 1_024) !== manifestText
+    || (pending && await readMetadata(directory, BACKUP_PENDING_FILENAME, 1_024 * 1_024) !== pending.text)) {
+    throw new Error("ownership marker, manifest, or pending intent changed during inspection");
+  }
+  if (pending) {
+    for (const name of pending.files) {
+      const before = pending.present.get(name);
+      const after = files.get(name);
+      if (before ? !after || !unchanged(before, after) : after) {
+        throw new Error("pending exports changed after content verification");
+      }
+    }
   }
   // Missing declared exports are allowed so interrupted deletions can be retried.
-  const deletionOrder = [...exports, ".active.json", "manifest.json", BACKUP_OWNER_FILENAME];
+  const deletionOrder = [
+    ...outputs, ".active.json", ...(pending ? [BACKUP_PENDING_FILENAME] : []),
+    "manifest.json", BACKUP_OWNER_FILENAME,
+  ];
   let removedMetadata = false;
   try {
     for (const name of deletionOrder) {
@@ -168,7 +189,7 @@ async function pruneRun(root: string, id: string, now: number): Promise<"deleted
       const current = await fs.readdir(directory);
       if (current.some(file => !allowed.has(file))) throw new Error("unexpected files were added during deletion");
       await fs.unlink(path.join(directory, name));
-      if (name === "manifest.json" || name === BACKUP_OWNER_FILENAME) removedMetadata = true;
+      if (name === "manifest.json" || name === BACKUP_OWNER_FILENAME || name === BACKUP_PENDING_FILENAME) removedMetadata = true;
     }
     await assertRun(root, id, identity);
     await fs.rmdir(directory);
@@ -179,6 +200,7 @@ async function pruneRun(root: string, id: string, now: number): Promise<"deleted
         await assertRun(root, id, identity);
         await restoreMetadata(directory, BACKUP_OWNER_FILENAME, ownerText);
         await restoreMetadata(directory, "manifest.json", manifestText);
+        if (pending) await restoreMetadata(directory, BACKUP_PENDING_FILENAME, pending.text);
       } catch (restoreError) {
         throw new Error(`deletion failed: ${errorMessage(error)}; restoring ownership/manifest also failed: ${errorMessage(restoreError)}`);
       }
@@ -188,8 +210,8 @@ async function pruneRun(root: string, id: string, now: number): Promise<"deleted
 }
 
 /**
- * Requires the caller's exclusive data-root runtime lock. Never follows links,
- * recursively removes directories, or infers ownership from a directory name.
+ * Requires both exclusive runtime locks and startup recovery first. Never follows
+ * links, recursively removes directories, or infers ownership from a filename.
  */
 export async function pruneExpiredBackups(backupDirectory: string, now = Date.now()): Promise<BackupPruneResult> {
   if (!Number.isFinite(now) || Math.abs(now) > 8.64e15) {

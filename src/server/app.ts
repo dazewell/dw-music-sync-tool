@@ -34,6 +34,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
   const sessions = new Map<string, BrowserSession>();
   const jobs = new Map<string, BackupJob>();
   let latestJob: BackupJob | null = null;
+  let operation: "backup" | "auth" | "inventory" | null = null;
   const expireJobs = () => {
     for (const [id, job] of jobs) {
       if (job.state !== "running" && Date.parse(backupExpiresAt(job.startedAt)) <= Date.now()) {
@@ -67,10 +68,19 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
     return current;
   }
 
-  function requireIdle(): void {
-    if (latestJob?.state === "running") {
+  function reserve(next: NonNullable<typeof operation>): () => void {
+    if (operation === "backup") {
       throw new AppError("BACKUP_RUNNING", "A backup is already running. Wait for it to finish.", 409);
     }
+    if (operation === "auth") {
+      throw new AppError("AUTH_BUSY", "Google authorization is changing. Wait for it to finish, then try again.", 409);
+    }
+    if (operation === "inventory") {
+      throw new AppError("INVENTORY_BUSY", "Playlists are being read. Wait for discovery to finish, then try again.", 409);
+    }
+    // Reserve before any await so credential changes cannot interleave with provider reads or backup preflight.
+    operation = next;
+    return () => { operation = null; };
   }
 
   async function requireConnected(): Promise<void> {
@@ -130,28 +140,49 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
   });
 
   app.post("/api/auth/connect", async (req, res) => {
-    requireIdle();
-    if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
-    const current = session(req, res);
-    const pending = await auth.begin();
-    current.oauth = { state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
-    res.json({ url: pending.url });
+    const release = reserve("auth");
+    try {
+      if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
+      const current = session(req, res);
+      const pending = await auth.begin();
+      current.oauth = { state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
+      res.json({ url: pending.url });
+    } finally {
+      release();
+    }
   });
 
   app.get("/auth/google/callback", async (req, res) => {
     try {
       const current = session(req, res);
       const pending = current.oauth;
-      current.oauth = null;
-      if (!pending || pending.expiresAt <= Date.now() || typeof req.query["state"] !== "string" || !sameSecret(req.query["state"], pending.state)) {
+      if (!pending || typeof req.query["state"] !== "string" || !sameSecret(req.query["state"], pending.state)) {
         throw new AppError("INVALID_OAUTH_STATE", "The sign-in link expired or belongs to another browser. Start Connect Google again.", 400);
       }
-      if (req.query["error"]) throw new AppError("AUTH_DENIED", "Google authorization was not granted. Try connecting again.", 400);
+      if (pending.expiresAt <= Date.now()) {
+        current.oauth = null;
+        throw new AppError("INVALID_OAUTH_STATE", "The sign-in link expired or belongs to another browser. Start Connect Google again.", 400);
+      }
       const code = req.query["code"];
-      if (typeof code !== "string" || !code || code.length > 8192) throw new AppError("INVALID_AUTH_CODE", "Google did not return a valid authorization code.", 400);
-      requireIdle();
-      await auth.complete(code, pending.codeVerifier);
-      res.redirect("/?connected=1");
+      const denied = req.query["error"];
+      if (denied !== undefined && (typeof denied !== "string" || !denied || code !== undefined)) {
+        throw new AppError("INVALID_AUTH_RESPONSE", "Google did not return a valid authorization response.", 400);
+      }
+      const release = reserve("auth");
+      try {
+        if (denied !== undefined) {
+          current.oauth = null;
+          throw new AppError("AUTH_DENIED", "Google authorization was not granted. Try connecting again.", 400);
+        }
+        if (typeof code !== "string" || !code || code.length > 8192) {
+          throw new AppError("INVALID_AUTH_CODE", "Google did not return a valid authorization code.", 400);
+        }
+        current.oauth = null;
+        await auth.complete(code, pending.codeVerifier);
+        res.redirect("/?connected=1");
+      } finally {
+        release();
+      }
     } catch (error) {
       const message = error instanceof AppError ? error.message : "Google sign-in failed. Check your OAuth setup and try again.";
       console.error(`Google connection: ${message}`);
@@ -160,11 +191,15 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
   });
 
   app.post("/api/auth/disconnect", async (_req, res) => {
-    requireIdle();
-    if (config.demo) throw new AppError("DEMO_MODE", "Demo mode has no Google connection to disconnect.", 400);
-    for (const current of sessions.values()) current.oauth = null;
-    await auth.disconnect();
-    res.json({ ok: true });
+    const release = reserve("auth");
+    try {
+      if (config.demo) throw new AppError("DEMO_MODE", "Demo mode has no Google connection to disconnect.", 400);
+      for (const current of sessions.values()) current.oauth = null;
+      await auth.disconnect();
+      res.json({ ok: true });
+    } finally {
+      release();
+    }
   });
 
   app.post("/api/retention/check", async (_req, res) => {
@@ -173,9 +208,13 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
   });
 
   app.get("/api/playlists", async (_req, res) => {
-    requireIdle();
-    await requireConnected();
-    res.json({ playlists: await provider.listPlaylists(), coverage: provider.coverage });
+    const release = reserve("inventory");
+    try {
+      await requireConnected();
+      res.json({ playlists: await provider.listPlaylists(), coverage: provider.coverage });
+    } finally {
+      release();
+    }
   });
 
   app.get("/api/backups", async (_req, res) => {
@@ -185,40 +224,44 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
   });
 
   app.post("/api/backups", async (_req, res) => {
-    requireIdle();
-    await retention.check(true);
-    if (retention.status().error) {
-      throw new AppError("RETENTION_CLEANUP_FAILED", "Expired backup cleanup needs attention. Check the retention notice and resolve it before starting another backup.", 503);
+    const release = reserve("backup");
+    let started = false;
+    try {
+      await retention.check(true);
+      if (retention.status().error) {
+        throw new AppError("RETENTION_CLEANUP_FAILED", "Expired backup cleanup needs attention. Check the retention notice and resolve it before starting another backup.", 503);
+      }
+      await requireConnected();
+      const job: BackupJob = {
+        id: randomUUID(),
+        state: "running",
+        startedAt: new Date().toISOString(),
+        progress: { total: 0, current: 0, playlistTitle: null },
+        manifest: null,
+        error: null,
+      };
+      latestJob = job;
+      jobs.set(job.id, job);
+      if (jobs.size > 50) {
+        const oldest = jobs.keys().next().value;
+        if (oldest) jobs.delete(oldest);
+      }
+      void Promise.resolve().then(() => backupRunner(provider, config.backupDirectory, (progress) => {
+        job.progress = progress;
+      })).then((manifest) => {
+        job.manifest = manifest;
+        job.state = manifest.status === "failed" ? "failed" : "finished";
+        job.error = manifest.error;
+      }).catch((error: unknown) => {
+        job.state = "failed";
+        job.error = errorMessage(error);
+        console.error(`Backup failed: ${job.error}`);
+      }).finally(release);
+      started = true;
+      res.status(202).json({ job });
+    } finally {
+      if (!started) release();
     }
-    await requireConnected();
-    // Recheck after awaiting authorization so simultaneous requests cannot start two jobs.
-    requireIdle();
-    const job: BackupJob = {
-      id: randomUUID(),
-      state: "running",
-      startedAt: new Date().toISOString(),
-      progress: { total: 0, current: 0, playlistTitle: null },
-      manifest: null,
-      error: null,
-    };
-    latestJob = job;
-    jobs.set(job.id, job);
-    if (jobs.size > 50) {
-      const oldest = jobs.keys().next().value;
-      if (oldest) jobs.delete(oldest);
-    }
-    void backupRunner(provider, config.backupDirectory, (progress) => {
-      job.progress = progress;
-    }).then((manifest) => {
-      job.manifest = manifest;
-      job.state = manifest.status === "failed" ? "failed" : "finished";
-      job.error = manifest.error;
-    }).catch((error: unknown) => {
-      job.state = "failed";
-      job.error = errorMessage(error);
-      console.error(`Backup failed: ${job.error}`);
-    });
-    res.status(202).json({ job });
   });
 
   app.get("/api/jobs/current", (_req, res) => res.json({ job: latestJob }));
@@ -256,5 +299,5 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
     });
   });
 
-  return { app, isBusy: () => latestJob?.state === "running", stopRetention: () => retention.stop() };
+  return { app, isBusy: () => operation !== null, stopRetention: () => retention.stop() };
 }

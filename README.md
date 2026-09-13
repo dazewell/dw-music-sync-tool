@@ -94,6 +94,11 @@ A failed playlist does not prevent other playlists from being exported. A failed
 inventory request is not treated as an empty account. An empty playlist is a valid
 export. Interrupted runs remain distinguishable from completed runs. Files are
 written atomically; an unwritable destination is reported rather than hidden.
+Startup removes positively owned empty runs that crashed before their first
+manifest. Export intent journals record exact output and staging paths, sizes and
+hashes before publication, so validated uncheckpointed files can expire safely
+without being advertised as completed exports. Unrecognized or changed leftovers
+are preserved with an inspection error rather than guessed to be safe to delete.
 The CLI prints the final manifest as JSON to stdout and progress to stderr; it exits
 nonzero for partial or failed runs.
 

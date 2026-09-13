@@ -1,5 +1,4 @@
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -9,17 +8,37 @@ import { DemoProvider } from "../src/providers/demo.js";
 import { acquireRuntimeLock } from "../src/runtime-lock.js";
 import type { BackupManifest } from "../src/core/models.js";
 import { runBackup } from "../src/core/backup.js";
+import { RetentionController } from "../src/services/retention.js";
 
 const directories: string[] = [];
 const stopControllers: (() => Promise<void>)[] = [];
 afterEach(async () => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   await Promise.all(stopControllers.splice(0).map((stop) => stop()));
   await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function completedManifest(): BackupManifest {
+  return {
+    schemaVersion: 1, id: "test", provider: "youtube", startedAt: new Date().toISOString(),
+    completedAt: new Date().toISOString(), status: "complete", coverage: "test", warnings: [],
+    playlists: [], totals: { playlists: 0, completed: 0, failed: 0, entries: 0 }, error: null,
+  };
+}
+
 async function setup(demo = true, backupRunner?: Parameters<typeof createApp>[0]["backupRunner"]) {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "music-server-test-"));
+  const directory = await mkdtemp(path.join(process.cwd(), "music-server-test-"));
   directories.push(directory);
   const config = loadConfig({ demo }, {
     MUSIC_DATA_DIR: path.join(directory, "data"),
@@ -31,13 +50,14 @@ async function setup(demo = true, backupRunner?: Parameters<typeof createApp>[0]
     complete: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
   };
-  const { app, stopRetention } = createApp({ config, auth, provider: new DemoProvider(), ...(backupRunner ? { backupRunner } : {}) });
+  const provider = new DemoProvider();
+  const { app, stopRetention, isBusy } = createApp({ config, auth, provider, ...(backupRunner ? { backupRunner } : {}) });
   stopControllers.push(stopRetention);
   const browser = request.agent(app);
   const host = new URL(config.baseUrl).host;
   const status = await browser.get("/api/status").set("Host", host).expect(200);
   const csrf = status.body.csrfToken as string;
-  return { app, browser, config, auth, host, csrf, directory };
+  return { app, browser, config, auth, host, csrf, directory, provider, isBusy };
 }
 
 describe("loopback server", () => {
@@ -54,12 +74,261 @@ describe("loopback server", () => {
     await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
     const stranger = request.agent(app);
     await stranger.get("/api/status").set("Host", host);
-    await stranger.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+    const foreign = await stranger.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+    expect(foreign.headers.location).toContain("authError=");
     expect(auth.complete).not.toHaveBeenCalled();
-    await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+    await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302).expect("Location", "/?connected=1");
     expect(auth.complete).toHaveBeenCalledExactlyOnceWith("code", "test-verifier");
     await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
     expect(auth.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    "state=wrong-state&code=code",
+    "code=code",
+    "state=test-state&state=wrong-state&code=code",
+    "state=test-state",
+    "state=test-state&code=",
+    "state=test-state&code=one&code=two",
+    "state=test-state&code=code&error=access_denied",
+    "state=test-state&error=one&error=two",
+  ])("preserves pending OAuth state after a malformed or mismatched callback: %s", async (query) => {
+    const { browser, host, csrf, auth } = await setup(false);
+    await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    const invalid = await browser.get(`/auth/google/callback?${query}`).set("Host", host).expect(302);
+    expect(invalid.headers.location).toContain("authError=");
+    expect(auth.complete).not.toHaveBeenCalled();
+    await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host)
+      .expect(302).expect("Location", "/?connected=1");
+    expect(auth.complete).toHaveBeenCalledExactlyOnceWith("code", "test-verifier");
+    const replay = await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+    expect(replay.headers.location).toContain("authError=");
+    expect(auth.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("consumes a matching denied OAuth response without exchanging credentials", async () => {
+    const { browser, host, csrf, auth, isBusy } = await setup(false);
+    await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    const denied = await browser.get("/auth/google/callback?state=test-state&error=access_denied").set("Host", host).expect(302);
+    expect(decodeURIComponent(denied.headers.location)).toContain("authorization was not granted");
+    const replay = await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+    expect(replay.headers.location).toContain("authError=");
+    expect(auth.complete).not.toHaveBeenCalled();
+    expect(isBusy()).toBe(false);
+  });
+
+  it("expires and consumes matching OAuth state at the ten-minute deadline", async () => {
+    const { browser, host, csrf, auth } = await setup(false);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const now = Date.now();
+    await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    vi.setSystemTime(now + 600_000);
+    const expired = await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+    expect(expired.headers.location).toContain("authError=");
+    vi.setSystemTime(now);
+    const replay = await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+    expect(replay.headers.location).toContain("authError=");
+    expect(auth.complete).not.toHaveBeenCalled();
+  });
+
+  it("reserves backup preflight across retention and authorization awaits without changing credentials", async () => {
+    const cleanupEntered = deferred();
+    const cleanup = deferred();
+    const statusEntered = deferred();
+    const connection = deferred<{ configured: boolean; connected: boolean }>();
+    const finish = deferred<BackupManifest>();
+    const runner = vi.fn(() => finish.promise);
+    const { browser, host, csrf, auth, provider, isBusy } = await setup(false, runner);
+    await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    const inventory = vi.spyOn(provider, "listPlaylists");
+    vi.spyOn(RetentionController.prototype, "check").mockImplementationOnce(() => {
+      cleanupEntered.resolve();
+      return cleanup.promise;
+    });
+    auth.status.mockImplementationOnce(() => {
+      statusEntered.resolve();
+      return connection.promise;
+    });
+    const starting = browser.post("/api/backups").set("Host", host).set("X-CSRF-Token", csrf).then((response) => response);
+    try {
+      await cleanupEntered.promise;
+      expect(isBusy()).toBe(true);
+      for (const url of ["/api/auth/disconnect", "/api/auth/connect", "/api/backups"]) {
+        const conflict = await browser.post(url).set("Host", host).set("X-CSRF-Token", csrf).expect(409);
+        expect(conflict.body.error.code).toBe("BACKUP_RUNNING");
+      }
+      await browser.get("/api/playlists").set("Host", host).expect(409);
+      const callback = await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+      expect(decodeURIComponent(callback.headers.location)).toContain("authError=A backup is already running. Wait");
+      expect(auth.status).toHaveBeenCalledTimes(1);
+      expect(runner).not.toHaveBeenCalled();
+      cleanup.resolve();
+      await statusEntered.promise;
+      await browser.post("/api/auth/disconnect").set("Host", host).set("X-CSRF-Token", csrf).expect(409);
+      expect(auth.disconnect).not.toHaveBeenCalled();
+      expect(auth.complete).not.toHaveBeenCalled();
+      expect(auth.begin).toHaveBeenCalledTimes(1);
+      expect(inventory).not.toHaveBeenCalled();
+      expect(runner).not.toHaveBeenCalled();
+    } finally {
+      cleanup.resolve();
+      connection.resolve({ configured: true, connected: true });
+      expect((await starting).status).toBe(202);
+      finish.resolve(completedManifest());
+    }
+    await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host)
+      .expect(302).expect("Location", "/?connected=1");
+    expect(auth.complete).toHaveBeenCalledExactlyOnceWith("code", "test-verifier");
+    expect(runner).toHaveBeenCalledTimes(1);
+    expect(isBusy()).toBe(false);
+  });
+
+  it.each(["begin", "disconnect", "complete"] as const)("rejects backup and inventory while auth.%s is pending", async (operation) => {
+    const entered = deferred();
+    const pending = deferred();
+    const runner = vi.fn(async () => completedManifest());
+    const { browser, host, csrf, auth, provider, isBusy } = await setup(false, runner);
+    if (operation === "complete") {
+      await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    }
+    const inventory = vi.spyOn(provider, "listPlaylists");
+    let credentials = "original";
+    const wait = async () => {
+      entered.resolve();
+      await pending.promise;
+      credentials = "changed";
+    };
+    if (operation === "begin") {
+      auth.begin.mockImplementationOnce(async () => {
+        await wait();
+        return { url: "https://accounts.google.com/example", state: "test-state", codeVerifier: "test-verifier" };
+      });
+    } else {
+      auth[operation].mockImplementationOnce(wait);
+    }
+    const changing = (operation === "complete"
+      ? browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host)
+      : browser.post(`/api/auth/${operation === "begin" ? "connect" : "disconnect"}`).set("Host", host).set("X-CSRF-Token", csrf))
+      .then((response) => response);
+    try {
+      await entered.promise;
+      expect(isBusy()).toBe(true);
+      for (const url of ["/api/backups", "/api/auth/disconnect", "/api/auth/connect"]) {
+        const conflict = await browser.post(url).set("Host", host).set("X-CSRF-Token", csrf).expect(409);
+        expect(conflict.body.error.code).toBe("AUTH_BUSY");
+        expect(conflict.body.error.message).toContain("Wait");
+      }
+      await browser.get("/api/playlists").set("Host", host).expect(409);
+      expect(auth.status).toHaveBeenCalledTimes(1);
+      expect(inventory).not.toHaveBeenCalled();
+      expect(runner).not.toHaveBeenCalled();
+      expect(credentials).toBe("original");
+      if (operation === "complete") {
+        const replay = await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+        expect(replay.headers.location).toContain("authError=");
+        expect(auth.complete).toHaveBeenCalledTimes(1);
+      }
+    } finally {
+      pending.resolve();
+      expect((await changing).status).toBe(operation === "complete" ? 302 : 200);
+    }
+    expect(credentials).toBe("changed");
+    expect(isBusy()).toBe(false);
+    await browser.get("/api/playlists").set("Host", host).expect(200);
+    await browser.post("/api/backups").set("Host", host).set("X-CSRF-Token", csrf).expect(202);
+    expect(runner).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps credentials reserved through inventory preflight and the provider read", async () => {
+    const statusEntered = deferred();
+    const connection = deferred<{ configured: boolean; connected: boolean }>();
+    const readEntered = deferred();
+    const playlists = deferred<Awaited<ReturnType<DemoProvider["listPlaylists"]>>>();
+    const { browser, host, csrf, auth, provider, isBusy } = await setup(false);
+    auth.status.mockImplementationOnce(() => {
+      statusEntered.resolve();
+      return connection.promise;
+    });
+    vi.spyOn(provider, "listPlaylists").mockImplementationOnce(() => {
+      readEntered.resolve();
+      return playlists.promise;
+    });
+    const reading = browser.get("/api/playlists").set("Host", host).then((response) => response);
+    try {
+      await statusEntered.promise;
+      expect(isBusy()).toBe(true);
+      await browser.post("/api/auth/disconnect").set("Host", host).set("X-CSRF-Token", csrf).expect(409);
+      connection.resolve({ configured: true, connected: true });
+      await readEntered.promise;
+      for (const url of ["/api/auth/disconnect", "/api/auth/connect", "/api/backups"]) {
+        const conflict = await browser.post(url).set("Host", host).set("X-CSRF-Token", csrf).expect(409);
+        expect(conflict.body.error.code).toBe("INVENTORY_BUSY");
+      }
+      await browser.get("/api/playlists").set("Host", host).expect(409);
+      expect(auth.disconnect).not.toHaveBeenCalled();
+      expect(auth.begin).not.toHaveBeenCalled();
+    } finally {
+      connection.resolve({ configured: true, connected: true });
+      playlists.resolve([]);
+      expect((await reading).status).toBe(200);
+    }
+    expect(isBusy()).toBe(false);
+    await browser.post("/api/auth/disconnect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    expect(auth.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["begin", "disconnect", "complete"] as const)("releases the credential reservation when auth.%s fails", async (operation) => {
+    const { browser, host, csrf, auth, isBusy } = await setup(false);
+    if (operation === "complete") {
+      await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    }
+    auth[operation].mockRejectedValueOnce(new Error("Synthetic authorization failure"));
+    if (operation === "complete") {
+      const failed = await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+      expect(failed.headers.location).toContain("authError=");
+      await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+      expect(auth.complete).toHaveBeenCalledTimes(1);
+    } else {
+      await browser.post(`/api/auth/${operation === "begin" ? "connect" : "disconnect"}`)
+        .set("Host", host).set("X-CSRF-Token", csrf).expect(500);
+    }
+    expect(isBusy()).toBe(false);
+    await browser.get("/api/playlists").set("Host", host).expect(200);
+    await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+  });
+
+  it.each(["retention", "backup-status", "inventory-status", "inventory"] as const)("releases the reservation after a failed %s preflight or read", async (failure) => {
+    const entered = deferred();
+    const pending = deferred<never>();
+    const wait = () => {
+      entered.resolve();
+      return pending.promise;
+    };
+    const runner = vi.fn(async () => completedManifest());
+    const { browser, host, csrf, auth, provider, isBusy } = await setup(false, runner);
+    if (failure === "retention") {
+      vi.spyOn(RetentionController.prototype, "check").mockImplementationOnce(wait);
+    } else if (failure === "inventory") {
+      vi.spyOn(provider, "listPlaylists").mockImplementationOnce(wait);
+    } else {
+      auth.status.mockImplementationOnce(wait);
+    }
+    const failing = (failure === "retention" || failure === "backup-status"
+      ? browser.post("/api/backups").set("Host", host).set("X-CSRF-Token", csrf)
+      : browser.get("/api/playlists").set("Host", host)).then((response) => response);
+    try {
+      await entered.promise;
+      expect(isBusy()).toBe(true);
+      await browser.post("/api/auth/disconnect").set("Host", host).set("X-CSRF-Token", csrf).expect(409);
+      expect(auth.disconnect).not.toHaveBeenCalled();
+    } finally {
+      pending.reject(new Error("Synthetic preflight or read failure"));
+      expect((await failing).status).toBe(500);
+    }
+    expect(isBusy()).toBe(false);
+    await browser.post("/api/auth/disconnect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    await browser.post("/api/backups").set("Host", host).set("X-CSRF-Token", csrf).expect(202);
+    expect(runner).toHaveBeenCalledTimes(1);
   });
 
   it("rejects duplicate backup jobs and conflicting disconnects", async () => {
@@ -112,14 +381,17 @@ describe("loopback server", () => {
     expect(auth.begin).not.toHaveBeenCalled();
   });
 
-  it("makes total job errors observable instead of leaving progress running", async () => {
-    const { browser, host, csrf } = await setup(true, async () => { throw new Error("Disk is full"); });
+  it.each([false, true])("releases the reservation and reports job errors (async: %s)", async (asyncFailure) => {
+    const fail = () => { throw new Error("Disk is full"); };
+    const { browser, host, csrf, isBusy } = await setup(false, asyncFailure ? async () => fail() : fail);
     const start = await browser.post("/api/backups").set("Host", host).set("X-CSRF-Token", csrf).expect(202);
     await vi.waitFor(async () => {
       const result = await browser.get(`/api/jobs/${start.body.job.id}`).set("Host", host);
       expect(result.body.job.state).toBe("failed");
       expect(result.body.job.error).toBe("Disk is full");
     });
+    expect(isBusy()).toBe(false);
+    await browser.post("/api/auth/disconnect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
   });
 
   it("sets restrictive browser headers and a HttpOnly same-site cookie", async () => {
@@ -152,7 +424,7 @@ describe("loopback server", () => {
   });
 
   it("protects unexpected user files, reports failed cleanup and refuses expired downloads", async () => {
-    const { browser, host, csrf, config } = await setup();
+    const { browser, host, csrf, config, isBusy } = await setup();
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(Date.now() - 31 * 86_400_000);
     const old = await runBackup(new DemoProvider(), config.backupDirectory);
@@ -160,6 +432,7 @@ describe("loopback server", () => {
     const note = path.join(config.backupDirectory, old.id, "my-notes.txt");
     await writeFile(note, "User content must never be deleted by retention.");
     await browser.post("/api/backups").set("Host", host).set("X-CSRF-Token", csrf).expect(503);
+    expect(isBusy()).toBe(false);
     expect(await readFile(note, "utf8")).toContain("never be deleted");
     const status = await browser.get("/api/status").set("Host", host).expect(200);
     expect(status.body.retention.error).toBeTruthy();

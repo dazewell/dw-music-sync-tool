@@ -325,6 +325,44 @@ describe("YouTubeProvider failures and retry policy", () => {
     expect(fetcher).toHaveBeenCalledTimes(4);
   });
 
+  it.each(["rateLimitExceeded", "userRateLimitExceeded"])("retries transient 403 reason %s with Retry-After", async (reason) => {
+    const { provider, sleep, fetcher } = fixture([
+      json({ error: { message: "private response details", errors: [{ reason }] } }, 403, { "Retry-After": "2" }),
+      json({ items: [] }),
+    ]);
+    expect(await provider.listPlaylists()).toEqual([]);
+    expect(sleep.mock.calls).toEqual([[2000]]);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["rateLimitExceeded", "userRateLimitExceeded"])("bounds retries for repeated transient 403 reason %s", async (reason) => {
+    const { provider, sleep, fetcher } = fixture(Array.from({ length: 4 }, () =>
+      json({ error: { message: "private response details", errors: [{ reason }] } }, 403)));
+    const error = await provider.listPlaylists().catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "YOUTUBE_RETRY_EXHAUSTED" });
+    expect(String(error)).not.toContain("private response details");
+    expect(sleep.mock.calls).toEqual([[1000], [2000], [4000]]);
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not retry quota exhaustion even when transient rate-limit reasons are also present", async () => {
+    const { provider, sleep, fetcher } = fixture([json({
+      error: { errors: [{ reason: "userRateLimitExceeded" }, { reason: "quotaExceeded" }] },
+    }, 403)]);
+    await expect(provider.listPlaylists()).rejects.toMatchObject({ code: "YOUTUBE_QUOTA" });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("never retries a transient 403 earlier than an over-budget Retry-After", async () => {
+    const { provider, sleep, fetcher } = fixture([json({
+      error: { errors: [{ reason: "rateLimitExceeded" }] },
+    }, 403, { "Retry-After": "31" })]);
+    await expect(provider.listPlaylists()).rejects.toMatchObject({ code: "YOUTUBE_RETRY_LATER" });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
   it.each([
     ["0", 0],
     ["1", 1000],

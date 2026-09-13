@@ -39,8 +39,9 @@ export class GoogleAuth {
   async status(): Promise<{ configured: boolean; connected: boolean }> {
     return this.serial(async () => {
       const client = await this.client(false);
+      if (client === null) return { configured: false, connected: false };
       const tokens = await this.readTokens();
-      return { configured: client !== null, connected: client !== null && tokens !== null };
+      return { configured: true, connected: tokens !== null };
     });
   }
 

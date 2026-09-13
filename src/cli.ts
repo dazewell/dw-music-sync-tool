@@ -124,7 +124,7 @@ async function main(): Promise<void> {
   const stop = async () => {
     if (stopping) return;
     stopping = true;
-    if (isBusy()) console.log("Finishing the current backup before stopping...");
+    if (isBusy()) console.log("Finishing the active operation before stopping...");
     while (isBusy()) await setTimeout(250);
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await stopRetention();

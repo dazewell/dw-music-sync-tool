@@ -246,6 +246,7 @@ export class YouTubeProvider implements PlaylistProvider {
       if (response.status === 401) {
         throw new AppError("YOUTUBE_UNAUTHORIZED", "Google authorization was rejected. Reconnect your Google account, then retry.", 401);
       }
+      let rateLimited = response.status === 429;
       if (response.status === 403) {
         const quota = z.object({
           error: z.object({ errors: z.array(z.object({ reason: z.string() })) }),
@@ -254,12 +255,16 @@ export class YouTubeProvider implements PlaylistProvider {
           ["quotaExceeded", "dailyLimitExceeded", "dailyLimitExceededUnreg"].includes(reason))) {
           throw new AppError("YOUTUBE_QUOTA", "The YouTube API quota is exhausted. Wait for the quota to reset or review your Google Cloud quota before retrying.", 429);
         }
-        throw new AppError("YOUTUBE_FORBIDDEN", "YouTube denied access. Check that the YouTube Data API is enabled and that your account has read access to this playlist.", 403);
+        rateLimited = quota.success && quota.data.error.errors.some(({ reason }) =>
+          ["rateLimitExceeded", "userRateLimitExceeded"].includes(reason));
+        if (!rateLimited) {
+          throw new AppError("YOUTUBE_FORBIDDEN", "YouTube denied access. Check that the YouTube Data API is enabled and that your account has read access to this playlist.", 403);
+        }
       }
       if (response.status === 404) {
         throw new AppError("YOUTUBE_NOT_FOUND", "The YouTube playlist was not found or is no longer accessible.", 404);
       }
-      if (response.status === 429 || response.status >= 500) {
+      if (rateLimited || response.status >= 500) {
         if (attempt < MAX_RETRIES) {
           const retryAfter = response.headers.get("retry-after");
           const requested = retryAfter === null ? NaN

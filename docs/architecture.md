@@ -50,7 +50,12 @@ metadata is explicit. No remote deletion or mutation is a backup operation.
 
 `src/server/app.ts` translates HTTP into the same service used by `src/cli.ts`.
 It limits execution to one in-flight backup, keeps live progress in memory and
-serves only manifest-listed export files. The manifest, rather than browser
+serves only manifest-listed export files. Synchronous reservations span backup
+preflight and execution, inventory reads and credential-changing operations so
+disconnect or token replacement cannot interleave with a provider read. Conflicting
+API operations return explicit 409 responses; browser OAuth callbacks preserve
+the redirect-based error flow and do not consume pending state on a mismatch.
+The manifest, rather than browser
 memory, is the durable record. Process locks protect both the data directory and
 backup directory, including when different accounts choose a shared output path.
 After acquiring both, the CLI recovers interrupted manifests before starting
@@ -61,7 +66,12 @@ cleanup or accepting work. These are local locks, not distributed locks.
 - Discover the complete paginated owned-playlist inventory anew for each run.
 - Fetch one playlist at a time. Continue individual failures and record them.
 - Preserve duplicates, ordering and inaccessible-entry indicators.
-- Write files atomically, checkpoint per-playlist results, then finalize status.
+- Persist an export intent before publishing files, write atomically, checkpoint
+  per-playlist results, then finalize status. The intent binds the checkpoint,
+  output/staging paths, byte counts and content hashes. Recovery removes only
+  verified owner-only empty runs; uncheckpointed outputs with validated intents
+  remain unavailable for download but eligible for normal expiry. Unknown,
+  changed or unprovable leftovers remain protected and produce an explicit error.
 - Keep existing run contents unchanged until their 30-day expiry; don't turn a
   failed fetch into an empty playlist or overwrite a previously good export.
 - Fingerprint ordered provider-native identities, not display names, added dates

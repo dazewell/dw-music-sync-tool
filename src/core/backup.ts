@@ -1,6 +1,4 @@
 import { createHash } from "node:crypto";
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import { AppError, errorMessage } from "./errors.js";
 import type {
   BackupManifest,
@@ -11,7 +9,9 @@ import type {
   PlaylistContents,
   PlaylistProvider,
 } from "./models.js";
-import { atomicWrite, checkpointManifest, createBackupRun, storageError } from "./storage.js";
+import {
+  checkpointManifest, createBackupRun, finishPlaylistExport, publishPlaylistExports, storageError,
+} from "./storage.js";
 import { fingerprintPlaylist } from "./sync.js";
 
 export { listBackups, readManifest, recoverInterruptedBackups, resolveBackupFile } from "./storage.js";
@@ -91,6 +91,7 @@ async function writePlaylist(
   playlist: Playlist,
   contents: PlaylistContents,
   index: number,
+  manifest: BackupManifest,
 ): Promise<BackupPlaylistResult> {
   const base = exportBasename(playlist, index);
   const files = { json: `${base}.json`, csv: `${base}.csv`, m3u: `${base}.m3u8` };
@@ -108,23 +109,7 @@ async function writePlaylist(
     [files.csv, exportCsv(contents)],
     [files.m3u, exportM3u(contents)],
   ];
-  const published: string[] = [];
-  try {
-    for (const [filename, text] of writes) {
-      await atomicWrite(directory, filename, text);
-      published.push(filename);
-    }
-  } catch (error) {
-    for (const filename of published) {
-      try {
-        await fs.unlink(path.join(directory, filename));
-      } catch (cleanupError) {
-        throw storageError(cleanupError, `Cannot clean up an incomplete playlist export (${errorMessage(error)})`);
-      }
-    }
-    throw error;
-  }
-  return {
+  const result: BackupPlaylistResult = {
     playlistId: playlist.id,
     title: playlist.title,
     status: "complete",
@@ -134,6 +119,8 @@ async function writePlaylist(
     warnings: [...contents.warnings],
     error: null,
   };
+  await publishPlaylistExports(directory, manifest, result, writes);
+  return result;
 }
 
 export async function runBackup(
@@ -200,7 +187,7 @@ export async function runBackup(
       }
       if (contents) {
         try {
-          result = await writePlaylist(run.directory, playlist, contents, index);
+          result = await writePlaylist(run.directory, playlist, contents, index, manifest);
         } catch (error) {
           manifest.playlists.push(failedResult(playlist, error));
           manifest.totals.failed++;
@@ -217,6 +204,7 @@ export async function runBackup(
         manifest.totals.failed++;
       }
       await checkpointManifest(run.directory, manifest);
+      if (result.status === "complete") await finishPlaylistExport(run.directory, manifest);
       progress(index + 1, playlist.title);
     }
     manifest.status = manifest.totals.failed === 0

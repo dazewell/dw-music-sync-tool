@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -51,8 +52,7 @@ async function saveTokens(tokens: unknown): Promise<void> {
 
 beforeEach(async () => {
   vi.resetAllMocks();
-  // Test fixtures stay inside the repository, never in the operating system's temp directory.
-  directory = await mkdtemp(join(process.cwd(), ".google-test-"));
+  directory = await mkdtemp(join(tmpdir(), "music-google-test-"));
   credentialsFile = join(directory, "client.json");
   tokenFile = join(directory, "private", "token.json");
   auth = new GoogleAuth({ credentialsFile, tokenFile, redirectUri: "http://127.0.0.1:4242/oauth/callback" });
@@ -84,6 +84,19 @@ describe("GoogleAuth configuration and PKCE", () => {
     await writeFile(credentialsFile, JSON.stringify(config));
     expect(await auth.status()).toEqual({ configured: true, connected: false });
     expect(mocks.getToken).not.toHaveBeenCalled();
+    expect(mocks.refresh).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "malformed stale token data",
+    JSON.stringify({ refresh_token: 42 }),
+    JSON.stringify(freshTokens()),
+  ])("shows setup when client configuration is missing despite a leftover token file %#", async (source) => {
+    await mkdir(join(directory, "private"), { recursive: true });
+    await writeFile(tokenFile, source);
+    expect(await auth.status()).toEqual({ configured: false, connected: false });
+    expect(await readFile(tokenFile, "utf8")).toBe(source);
+    expect(mocks.constructor).not.toHaveBeenCalled();
     expect(mocks.refresh).not.toHaveBeenCalled();
   });
 
