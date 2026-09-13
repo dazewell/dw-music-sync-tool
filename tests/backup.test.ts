@@ -420,10 +420,11 @@ describe("failures and recoverable checkpoints", () => {
     const manifest = await successfulBackup();
     const abandoned = { ...manifest, status: "running" as const, completedAt: null };
     await writeManifest(abandoned);
-    vi.spyOn(fs, "rename").mockRejectedValueOnce(Object.assign(new Error("Read-only disk"), { code: "EACCES" }));
+    const rename = vi.spyOn(fs, "rename").mockRejectedValue(Object.assign(new Error("Read-only disk"), { code: "EACCES" }));
     await expect(recoverInterruptedBackups(root)).rejects.toMatchObject({ code: "BACKUP_STORAGE_ERROR" });
     expect(await readManifest(root, manifest.id)).toEqual(abandoned);
     expect((await fs.readdir(path.join(root, manifest.id))).filter(file => file.endsWith(".tmp"))).toEqual([]);
+    rename.mockRestore();
     expect((await recoverInterruptedBackups(root))[0]!.status).toBe("interrupted");
   });
 });

@@ -46,13 +46,22 @@ quota/rate-limit handling and coverage statements. `src/auth/google.ts` owns
 Google credentials and token refresh. Neither knows about HTML or filenames.
 A single validated pending token save is completed before using authorization;
 multiple or unprovable intents require explicit inspection rather than guessing
-their order. Disconnect enumerates validated pending tokens independently of the
-main file and revokes/removes both, with explicit remote and local failure states.
+their order. Token files carry the last save's versioned `_saveIntent` metadata,
+binding a pending save to its destination basename and original bigint file
+identity, including an explicitly missing destination. Publication and recovery
+recheck that evidence; a changed destination or legacy unbound intent cannot be
+silently adopted. Failed publication preserves the pending save for retry or
+inspection. Disconnect processes independently validated files even when another
+credential path is invalid or cleanup fails, then reports combined local/remote
+failures without claiming that unreadable credentials were revoked.
 Both credential paths share descriptor-based, no-follow reads where supported,
 with single-link regular-file checks and bigint identity checks around the read
 and before cleanup. Persisted credentials require the exact read-only scope.
 An omitted code-exchange scope is verified through Google token info before
 persistence; an omitted refresh scope inherits only the validated stored scope.
+Credential and manifest replacement share bounded Windows sharing-conflict
+retries (25/50/100 ms). Staging and destination identities are revalidated before
+every attempt. Permanent failures propagate without a delete-first fallback.
 
 `src/core/backup.ts` and storage helpers own run lifecycle, portable filenames,
 atomic writes, export formats and history. JSON is the authoritative archive;
@@ -76,6 +85,10 @@ memory, is the durable record. Process locks protect both the data directory and
 backup directory, including when different accounts choose a shared output path.
 After acquiring both, the CLI recovers interrupted manifests before starting
 cleanup or accepting work. These are local locks, not distributed locks.
+Shutdown first closes HTTP admission and drains requests, then waits for detached
+backup/reservation work before stopping retention and releasing the locks.
+Repeated signals share that shutdown; active work is not forcibly terminated,
+and cleanup failures are reported rather than releasing locks prematurely.
 Locks atomically publish a prepopulated directory with a nonce-specific marker.
 Release removes only that lease's unique marker and then attempts an atomic
 empty-directory removal, so a stale release cannot unlink a successor's marker.

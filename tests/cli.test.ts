@@ -1,6 +1,5 @@
 import { execFile } from "node:child_process";
 import { access, mkdtemp, rm } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, expect, it, vi } from "vitest";
@@ -18,7 +17,7 @@ afterEach(async () => {
 });
 
 it("CLI recovers an interrupted expired run, prunes it and keeps stdout valid JSON", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "music-cli-test-"));
+  const directory = await mkdtemp(path.join(process.cwd(), "music-cli-test-"));
   directories.push(directory);
   const env = {
     ...process.env,
@@ -49,7 +48,7 @@ it("CLI recovers an interrupted expired run, prunes it and keeps stdout valid JS
 }, 20_000);
 
 it("locks shared output across distinct data directories and releases partial acquisitions", async () => {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "music-lock-test-"));
+  const directory = await mkdtemp(path.join(process.cwd(), "music-lock-test-"));
   directories.push(directory);
   const firstData = path.join(directory, "a-data");
   const secondData = path.join(directory, "b-data");

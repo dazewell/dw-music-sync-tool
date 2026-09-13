@@ -1,16 +1,17 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, type Stats } from "node:fs";
+import { constants, type BigIntStats, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { AppError, errorMessage } from "./errors.js";
 import type { BackupManifest, BackupPlaylistResult, ExportIntegrity } from "./models.js";
+import { replaceFile } from "./replace-file.js";
 
 const runIdPattern = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const fingerprintSchema = z.string().regex(/^[a-f0-9]{64}$/);
 const countSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
-const activeRuns = new Set<string>();
+const activeRuns = new Map<string, string>();
 export const BACKUP_OWNER_FILENAME = ".backup-owner.json";
 export const BACKUP_OWNER_APP = "dw-music-sync-tool";
 export const BACKUP_PENDING_FILENAME = ".backup-pending.json";
@@ -660,6 +661,27 @@ export async function resolveBackupFile(backupDirectory: string, id: string, fil
   return safeChild(await runDirectory(backupDirectory, id), file);
 }
 
+async function replacementFile(directory: string, name: string): Promise<BigIntStats | null> {
+  let filename: string;
+  try {
+    filename = await safeChild(directory, name);
+  } catch (error) {
+    if (error instanceof AppError && error.code === "BACKUP_NOT_FOUND") return null;
+    throw error;
+  }
+  const info = await fs.lstat(filename, { bigint: true });
+  if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1n) {
+    throw recoveryError(`Replacement path "${name}" is not an ordinary, unlinked file`);
+  }
+  return info;
+}
+
+function sameReplacementFile(before: BigIntStats | null, after: BigIntStats | null): boolean {
+  if (before === null || after === null) return before === after;
+  return before.dev === after.dev && before.ino === after.ino && before.size === after.size
+    && before.mtimeNs === after.mtimeNs && before.ctimeNs === after.ctimeNs && before.nlink === after.nlink;
+}
+
 /** New files require atomic hard-link publication; only explicit replacements may use rename. */
 export async function atomicWrite(
   directory: string, file: string, contents: string, stagingName?: string, replace = false,
@@ -671,7 +693,10 @@ export async function atomicWrite(
     || stagingName.toLowerCase() === file.toLowerCase())) {
     throw new AppError("INVALID_BACKUP_FILE", "Invalid backup staging basename.", 400);
   }
-  const temporary = path.join(directory, stagingName ?? `.write-${randomUUID()}.tmp`);
+  const stage = stagingName ?? `.write-${randomUUID()}.tmp`;
+  const temporary = path.join(directory, stage);
+  const destination = replace ? await replacementFile(directory, file) : null;
+  let stagedIdentity: BigIntStats | undefined;
   let owned = false;
   let preserveStage = false;
   try {
@@ -680,11 +705,19 @@ export async function atomicWrite(
     try {
       await handle.writeFile(contents, "utf8");
       await handle.sync();
+      if (replace) stagedIdentity = await handle.stat({ bigint: true });
     } finally {
       await handle.close();
     }
     if (replace) {
-      await fs.rename(temporary, path.join(directory, file));
+      await replaceFile(temporary, path.join(directory, file), async () => {
+        if (!sameReplacementFile(stagedIdentity!, await replacementFile(directory, stage))) {
+          throw recoveryError("The replacement staging file changed before publication");
+        }
+        if (!sameReplacementFile(destination, await replacementFile(directory, file))) {
+          throw recoveryError("The replacement destination changed before publication");
+        }
+      });
     } else {
       // On failure, a journaled stage must remain: a racing destination is not ours.
       preserveStage = stagingName !== undefined;
@@ -704,6 +737,12 @@ export async function atomicWrite(
   } catch (error) {
     if (owned && !preserveStage) {
       try {
+        if (stagedIdentity) {
+          const current = await replacementFile(directory, stage);
+          if (current && !sameReplacementFile(stagedIdentity, current)) {
+            throw recoveryError("The replacement staging file changed; it will not be removed");
+          }
+        }
         await fs.unlink(temporary);
       } catch (cleanupError) {
         if (!hasCode(cleanupError, "ENOENT")) {
@@ -723,6 +762,11 @@ export interface BackupRun {
   release: () => Promise<void>;
 }
 
+/** In-process lifecycle only; callers still need both runtime locks and a validated run directory. */
+export function activeBackupStartedAt(directory: string): string | undefined {
+  return activeRuns.get(directory);
+}
+
 export async function createBackupRun(backupDirectory: string): Promise<BackupRun> {
   try {
     await fs.mkdir(path.resolve(backupDirectory), { recursive: true, mode: 0o700 });
@@ -730,18 +774,29 @@ export async function createBackupRun(backupDirectory: string): Promise<BackupRu
     const startedAt = new Date().toISOString();
     const id = `${startedAt.replace(/[:.]/g, "-")}_${randomUUID()}`;
     const directory = path.join(root, id);
-    await fs.mkdir(directory, { mode: 0o700 });
-    const identity = await fs.lstat(directory, { bigint: true });
-    activeRuns.add(directory);
+    // Reserve before mkdir makes the run visible to concurrent retention scans.
+    activeRuns.set(directory, startedAt);
+    let identity: BigIntStats | undefined;
     try {
+      await fs.mkdir(directory, { mode: 0o700 });
+      identity = await fs.lstat(directory, { bigint: true });
       await atomicWrite(directory, BACKUP_OWNER_FILENAME, `${JSON.stringify({
         app: BACKUP_OWNER_APP,
         schemaVersion: 1,
         id,
         createdAt: startedAt,
       }, null, 2)}\n`);
+      return {
+        id,
+        directory,
+        startedAt,
+        release: async () => {
+          activeRuns.delete(directory);
+        },
+      };
     } catch (error) {
       activeRuns.delete(directory);
+      if (!identity) throw error;
       try {
         const current = await fs.lstat(directory, { bigint: true });
         if (!current.isDirectory() || current.isSymbolicLink()
@@ -755,14 +810,6 @@ export async function createBackupRun(backupDirectory: string): Promise<BackupRu
       }
       throw error;
     }
-    return {
-      id,
-      directory,
-      startedAt,
-      release: async () => {
-        activeRuns.delete(directory);
-      },
-    };
   } catch (error) {
     throw storageError(error, "Cannot create a backup run");
   }

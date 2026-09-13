@@ -6,7 +6,7 @@ import { z } from "zod";
 import { AppError, errorMessage } from "./errors.js";
 import {
   BACKUP_OWNER_APP, BACKUP_OWNER_FILENAME, BACKUP_PENDING_FILENAME, readManifest, readPendingExports,
-  inspectPendingFile, settlePendingExportLinks, verifyExportIntegrity,
+  activeBackupStartedAt, inspectPendingFile, settlePendingExportLinks, verifyExportIntegrity,
 } from "./storage.js";
 
 export const RETENTION_DAYS = 30;
@@ -118,6 +118,13 @@ async function pruneRun(
   root: string, id: string, now: number, settleLinks = true,
 ): Promise<"deleted" | "recent" | "unmanaged"> {
   const directory = await assertRun(root, id);
+  const activeStartedAt = activeBackupStartedAt(directory);
+  if (activeStartedAt !== undefined) {
+    if (now >= Date.parse(backupExpiresAt(activeStartedAt))) {
+      throw new Error("backup is running; active runs are never removed");
+    }
+    return "recent";
+  }
   const identity = await fs.lstat(directory);
   let ownerText: string;
   try {

@@ -1,10 +1,11 @@
 import { randomBytes } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, unlink } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { CodeChallengeMethod, OAuth2Client, type Credentials } from "google-auth-library";
 import { z } from "zod";
 import { AppError } from "../core/errors.js";
+import { replaceFile } from "../core/replace-file.js";
 
 const READONLY_SCOPE = "https://www.googleapis.com/auth/youtube.readonly";
 const configSchema = z.object({
@@ -21,6 +22,21 @@ const tokenSchema = z.object({
   scope: z.literal(READONLY_SCOPE),
 });
 type StoredTokens = z.infer<typeof tokenSchema>;
+const destinationSchema = z.object({
+  dev: z.string().regex(/^\d+$/),
+  ino: z.string().regex(/^\d+$/),
+  size: z.string().regex(/^\d+$/),
+  mtimeNs: z.string().regex(/^-?\d+$/),
+  ctimeNs: z.string().regex(/^-?\d+$/),
+}).strict();
+type Destination = z.infer<typeof destinationSchema> | null;
+const pendingSchema = tokenSchema.extend({
+  _saveIntent: z.object({
+    version: z.literal(1),
+    tokenFile: z.string().min(1),
+    destination: destinationSchema.nullable(),
+  }).strict().optional(),
+}).strict();
 interface TokenText {
   source: string;
   identity: BigIntStats;
@@ -29,6 +45,9 @@ interface StoredTokenFile {
   filename: string;
   tokens: StoredTokens;
   identity: BigIntStats;
+}
+interface PendingTokenFile extends StoredTokenFile {
+  destination: Destination | undefined;
 }
 
 export interface GoogleAuthOptions {
@@ -48,6 +67,13 @@ function unchanged(before: BigIntStats, after: BigIntStats): boolean {
 
 function ordinaryToken(info: BigIntStats): boolean {
   return info.isFile() && !info.isSymbolicLink() && info.nlink === 1n && info.size <= 1_048_576n;
+}
+
+function destinationIdentity(info: BigIntStats): Exclude<Destination, null> {
+  return {
+    dev: String(info.dev), ino: String(info.ino), size: String(info.size),
+    mtimeNs: String(info.mtimeNs), ctimeNs: String(info.ctimeNs),
+  };
 }
 
 function pendingError(): AppError {
@@ -102,6 +128,12 @@ export class GoogleAuth {
       }
       await this.recoverPendingTokens();
       const client = await this.requiredClient();
+      let destination: Destination;
+      try {
+        destination = await this.tokenDestination();
+      } catch {
+        throw new AppError("GOOGLE_TOKEN_WRITE_FAILED", "The existing Google token path is not a safe regular file. Preserve it and inspect its links and permissions before reconnecting.", 500);
+      }
       let credentials: Credentials;
       try {
         const result = await client.getToken({ code, codeVerifier, redirect_uri: this.options.redirectUri });
@@ -121,7 +153,7 @@ export class GoogleAuth {
       if (!tokens.access_token) {
         throw new AppError("GOOGLE_AUTH_TOKEN_INVALID", "Google did not return usable offline credentials. Reconnect and grant read-only YouTube access.", 401);
       }
-      await this.persist(tokens);
+      await this.persist(tokens, destination);
     });
   }
 
@@ -154,7 +186,7 @@ export class GoogleAuth {
       if (!refreshed.access_token || refreshed.expiry_date === undefined || refreshed.expiry_date <= Date.now()) {
         throw new AppError("GOOGLE_REFRESH_INVALID", "Google returned unusable refreshed credentials. Reconnect your Google account.", 401);
       }
-      await this.persist(refreshed);
+      await this.persist(refreshed, destinationIdentity(saved.identity));
       return refreshed.access_token;
     });
   }
@@ -162,13 +194,27 @@ export class GoogleAuth {
   async disconnect(): Promise<void> {
     return this.serial(async () => {
       const pending = await this.pendingTokens();
-      const saved = await this.readTokens();
+      let saved: StoredTokenFile | null = null;
+      let mainError: AppError | null = null;
+      try {
+        saved = await this.readTokens();
+      } catch (error) {
+        mainError = error instanceof AppError ? error
+          : new AppError("GOOGLE_TOKEN_READ_FAILED", "The main Google token could not be inspected safely.", 500);
+      }
       const tokens = saved?.tokens;
       const refreshTokens = new Set([
         ...(tokens ? [tokens.refresh_token] : []),
-        ...pending.map(item => item.tokens.refresh_token),
+        ...pending.files.map(item => item.tokens.refresh_token),
       ]);
-      if (refreshTokens.size === 0) return;
+      if (refreshTokens.size === 0) {
+        if (mainError && pending.failed) {
+          throw new AppError("GOOGLE_DISCONNECT_LOCAL_FAILED", "The main and pending Google credentials could not be inspected safely and were preserved. Inspect the private token directory and revoke this app in your Google Account permissions to finish disconnecting.", 500);
+        }
+        if (mainError) throw mainError;
+        if (pending.failed) throw pendingError();
+        return;
+      }
       let remoteFailed = false;
       for (const refreshToken of refreshTokens) {
         try {
@@ -178,21 +224,21 @@ export class GoogleAuth {
           remoteFailed = true;
         }
       }
-      try {
-        for (const item of pending) {
+      let localFailed = pending.failed || mainError !== null;
+      for (const item of [...pending.files, ...(saved ? [saved] : [])]) {
+        try {
           await this.assertTokenUnchanged(item);
           await unlink(item.filename);
+        } catch {
+          localFailed = true;
         }
-        if (saved) {
-          await this.assertTokenUnchanged(saved);
-          await unlink(saved.filename);
-        }
-      } catch {
+      }
+      if (localFailed) {
         throw new AppError(
           "GOOGLE_DISCONNECT_LOCAL_FAILED",
           remoteFailed
-            ? "Google revocation failed and local credentials could not be removed. Revoke this app in your Google Account permissions and inspect the token file and pending credential files."
-            : "Google access was revoked, but local credentials could not be removed. Inspect the token file and pending credential files.",
+            ? "Google revocation failed for some validated credentials, and some local credentials could not be inspected or removed. Other validated files were processed. Revoke this app in your Google Account permissions and inspect the token file and pending credential files."
+            : "Revocation completed for validated credentials only; some local credentials could not be inspected or removed. Other validated files were processed. Inspect the token file and pending credential files, and revoke this app in your Google Account permissions to finish disconnecting.",
           500,
         );
       }
@@ -231,30 +277,34 @@ export class GoogleAuth {
     }
   }
 
-  private async pendingTokens(): Promise<StoredTokenFile[]> {
+  private async pendingTokens(): Promise<{ files: PendingTokenFile[]; failed: boolean }> {
     const directory = dirname(this.options.tokenFile);
     let names: string[];
     try {
       names = await readdir(directory);
     } catch (error) {
-      if (isMissing(error)) return [];
-      throw pendingError();
+      return { files: [], failed: !isMissing(error) };
     }
     const prefix = `${basename(this.options.tokenFile)}.`;
-    const pending: StoredTokenFile[] = [];
+    const pending: PendingTokenFile[] = [];
+    let failed = false;
     for (const name of names.filter(name => name.startsWith(prefix)
       && /^[a-f0-9]{24}\.pending$/.test(name.slice(prefix.length)))) {
       const filename = join(directory, name);
       try {
         const record = await this.readTokenText(filename);
         if (!record) throw pendingError();
-        const parsed = tokenSchema.strict().parse(JSON.parse(record.source) as unknown);
-        pending.push({ filename, identity: record.identity, tokens: this.validateTokens(parsed) });
+        const parsed = pendingSchema.parse(JSON.parse(record.source) as unknown);
+        if (parsed._saveIntent && parsed._saveIntent.tokenFile !== basename(this.options.tokenFile)) throw pendingError();
+        pending.push({
+          filename, identity: record.identity, tokens: this.validateTokens(parsed),
+          destination: parsed._saveIntent?.destination,
+        });
       } catch {
-        throw pendingError();
+        failed = true;
       }
     }
-    return pending;
+    return { files: pending, failed };
   }
 
   private async assertTokenUnchanged(item: StoredTokenFile): Promise<void> {
@@ -264,22 +314,38 @@ export class GoogleAuth {
 
   private async recoverPendingTokens(): Promise<void> {
     const pending = await this.pendingTokens();
-    if (pending.length === 0) return;
+    if (pending.failed) throw pendingError();
+    if (pending.files.length === 0) return;
     // More than one intent has no trustworthy ordering; disconnect can revoke all.
-    if (pending.length !== 1) throw pendingError();
-    const item = pending[0]!;
+    if (pending.files.length !== 1) throw pendingError();
+    const item = pending.files[0]!;
+    const destination = item.destination;
+    if (destination === undefined) throw pendingError();
     try {
-      try {
-        const target = await lstat(this.options.tokenFile);
-        if (!target.isFile() || target.isSymbolicLink() || target.nlink !== 1) throw pendingError();
-      } catch (error) {
-        if (!isMissing(error)) throw error;
-      }
-      await this.assertTokenUnchanged(item);
-      await rename(item.filename, this.options.tokenFile);
+      await replaceFile(item.filename, this.options.tokenFile, async () => {
+        await this.assertDestination(destination);
+        await this.assertTokenUnchanged(item);
+      });
     } catch {
       throw pendingError();
     }
+  }
+
+  private async tokenDestination(): Promise<Destination> {
+    let info: BigIntStats;
+    try {
+      info = await lstat(this.options.tokenFile, { bigint: true });
+    } catch (error) {
+      if (isMissing(error)) return null;
+      throw error;
+    }
+    if (!ordinaryToken(info)) throw new Error("Unsafe credential destination.");
+    return destinationIdentity(info);
+  }
+
+  private async assertDestination(expected: Destination): Promise<void> {
+    const actual = await this.tokenDestination();
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error("The credential destination changed.");
   }
 
   private async requiredClient(): Promise<OAuth2Client> {
@@ -338,7 +404,7 @@ export class GoogleAuth {
     return { filename: this.options.tokenFile, identity: record.identity, tokens: this.validateTokens(value) };
   }
 
-  private async persist(tokens: StoredTokens): Promise<void> {
+  private async persist(tokens: StoredTokens, destination: Destination): Promise<void> {
     const directory = dirname(this.options.tokenFile);
     const pending = `${this.options.tokenFile}.${randomBytes(12).toString("hex")}.pending`;
     let created = false;
@@ -347,21 +413,24 @@ export class GoogleAuth {
       await chmod(directory, 0o700);
       const file = await open(pending, "wx", 0o600);
       created = true;
+      let identity: BigIntStats;
       try {
-        await file.writeFile(`${JSON.stringify(tokens)}\n`, "utf8");
+        await file.writeFile(`${JSON.stringify({
+          ...tokens, _saveIntent: { version: 1, tokenFile: basename(this.options.tokenFile), destination },
+        })}\n`, "utf8");
         await file.sync();
+        identity = await file.stat({ bigint: true });
       } finally {
         await file.close();
       }
-      await rename(pending, this.options.tokenFile);
+      await replaceFile(pending, this.options.tokenFile, async () => {
+        await this.assertDestination(destination);
+        await this.assertTokenUnchanged({ filename: pending, tokens, identity });
+      });
       created = false;
     } catch {
       if (created) {
-        try {
-          await unlink(pending);
-        } catch {
-          throw new AppError("GOOGLE_TOKEN_WRITE_FAILED", "Google credentials could not be saved and a pending credential file could not be removed. Check permissions and remove leftover .pending files in the token directory.", 500);
-        }
+        throw new AppError("GOOGLE_TOKEN_WRITE_FAILED", "Google credentials could not be published. An unfinished credential save was preserved in the private token directory. Retry after resolving permissions, or inspect pending files and any changed destination before reconnecting.", 500);
       }
       throw new AppError("GOOGLE_TOKEN_WRITE_FAILED", "Google credentials could not be saved securely. Check the local token directory permissions and available disk space.", 500);
     }

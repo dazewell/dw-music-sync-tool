@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   atomicWrite, BACKUP_OWNER_FILENAME, createBackupRun, recoverInterruptedBackups,
 } from "../src/core/storage.js";
+import { replaceFile } from "../src/core/replace-file.js";
 
 vi.mock("node:fs/promises", async importOriginal => ({
   ...await importOriginal<typeof import("node:fs/promises")>(),
@@ -98,6 +99,117 @@ describe("atomic no-replace publication", () => {
     expect(link).not.toHaveBeenCalled();
     expect(rename).toHaveBeenCalledTimes(1);
     expect(await fs.readFile(path.join(root, "manifest.json"), "utf8")).toBe("New checkpoint");
+    expect(await fs.readdir(root)).toEqual(["manifest.json"]);
+  });
+
+  it.skipIf(process.platform !== "win32").each(
+    ["EPERM", "EACCES", "EBUSY"].flatMap(code => [false, true].map(persistent => ({ code, persistent }))),
+  )(
+    "bounds $code retries without unlinking the destination (persistent: $persistent)",
+    async ({ code, persistent }) => {
+      const target = path.join(root, "manifest.json");
+      await fs.writeFile(target, "Old checkpoint");
+      const rename = fs.rename;
+      let attempts = 0;
+      const spy = vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
+        attempts++;
+        if (persistent || attempts < 3) {
+          throw Object.assign(new Error("Synthetic sharing conflict"), { code });
+        }
+        await rename(source, destination);
+      });
+      const unlink = vi.spyOn(fs, "unlink");
+      const write = atomicWrite(root, "manifest.json", "New checkpoint", undefined, true);
+      if (persistent) {
+        await expect(write).rejects.toMatchObject({ code: "BACKUP_STORAGE_ERROR" });
+        expect(attempts).toBe(4);
+        expect(await fs.readFile(target, "utf8")).toBe("Old checkpoint");
+      } else {
+        await write;
+        expect(attempts).toBe(3);
+        expect(await fs.readFile(target, "utf8")).toBe("New checkpoint");
+      }
+      expect(new Set(spy.mock.calls.map(([source]) => String(source))).size).toBe(1);
+      expect(unlink).not.toHaveBeenCalledWith(target);
+      expect(await fs.readdir(root)).toEqual(["manifest.json"]);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")("propagates a permanent permissions error and leaves both helper paths intact", async () => {
+    const source = path.join(root, "pending.json");
+    const target = path.join(root, "manifest.json");
+    await fs.writeFile(source, "New checkpoint");
+    await fs.writeFile(target, "Old checkpoint");
+    const failure = Object.assign(new Error("Permission denied"), { code: "EACCES" });
+    const rename = vi.spyOn(fs, "rename").mockRejectedValue(failure);
+    const beforeAttempt = vi.fn(async () => {});
+    const unlink = vi.spyOn(fs, "unlink");
+    await expect(replaceFile(source, target, beforeAttempt)).rejects.toBe(failure);
+    expect(beforeAttempt).toHaveBeenCalledTimes(4);
+    expect(rename).toHaveBeenCalledTimes(4);
+    expect(unlink).not.toHaveBeenCalled();
+    expect(await fs.readFile(source, "utf8")).toBe("New checkpoint");
+    expect(await fs.readFile(target, "utf8")).toBe("Old checkpoint");
+  });
+
+  it.skipIf(process.platform !== "win32")("revalidates caller-owned state before each sharing-conflict retry", async () => {
+    const source = path.join(root, "pending.json");
+    const target = path.join(root, "manifest.json");
+    await fs.writeFile(source, "New checkpoint");
+    await fs.writeFile(target, "Old checkpoint");
+    const rename = vi.spyOn(fs, "rename")
+      .mockRejectedValue(Object.assign(new Error("Sharing conflict"), { code: "EPERM" }));
+    const beforeAttempt = vi.fn(async () => {
+      if (beforeAttempt.mock.calls.length === 2) throw new Error("Ownership changed");
+    });
+    const unlink = vi.spyOn(fs, "unlink");
+    await expect(replaceFile(source, target, beforeAttempt)).rejects.toThrow("Ownership changed");
+    expect(beforeAttempt).toHaveBeenCalledTimes(2);
+    expect(rename).toHaveBeenCalledTimes(1);
+    expect(unlink).not.toHaveBeenCalled();
+    expect(await fs.readFile(source, "utf8")).toBe("New checkpoint");
+    expect(await fs.readFile(target, "utf8")).toBe("Old checkpoint");
+  });
+
+  it.skipIf(process.platform !== "win32").each(["destination", "stage"] as const)(
+    "stops retrying when the %s is replaced, preserving the user's replacement",
+    async changed => {
+      const target = path.join(root, "manifest.json");
+      await fs.writeFile(target, "Old checkpoint");
+      const rename = fs.rename;
+      let stage: string | undefined;
+      let replacement: Buffer | undefined;
+      const spy = vi.spyOn(fs, "rename").mockImplementationOnce(async source => {
+        stage = String(source);
+        const changedPath = changed === "destination" ? target : stage;
+        const size = (await fs.stat(changedPath)).size;
+        replacement = Buffer.alloc(size, "u");
+        await rename(changedPath, path.join(root, "original-kept"));
+        await fs.writeFile(changedPath, replacement);
+        throw Object.assign(new Error("Sharing conflict"), { code: "EPERM" });
+      });
+      const unlink = vi.spyOn(fs, "unlink");
+      await expect(atomicWrite(root, "manifest.json", "New checkpoint", undefined, true))
+        .rejects.toThrow(`replacement ${changed === "stage" ? "staging file" : "destination"} changed`);
+      expect(spy).toHaveBeenCalledTimes(1);
+      const changedPath = changed === "destination" ? target : stage!;
+      expect(unlink).not.toHaveBeenCalledWith(changedPath);
+      expect(await fs.readFile(changedPath)).toEqual(replacement);
+      if (changed === "stage") expect(await fs.readFile(target, "utf8")).toBe("Old checkpoint");
+    },
+  );
+
+  it("does not retry unrelated replacement filesystem errors or unlink the destination", async () => {
+    const target = path.join(root, "manifest.json");
+    await fs.writeFile(target, "Old checkpoint");
+    const rename = vi.spyOn(fs, "rename")
+      .mockRejectedValue(Object.assign(new Error("Read-only filesystem"), { code: "EROFS" }));
+    const unlink = vi.spyOn(fs, "unlink");
+    await expect(atomicWrite(root, "manifest.json", "New checkpoint", undefined, true))
+      .rejects.toMatchObject({ code: "BACKUP_STORAGE_ERROR" });
+    expect(rename).toHaveBeenCalledTimes(1);
+    expect(unlink).not.toHaveBeenCalledWith(target);
+    expect(await fs.readFile(target, "utf8")).toBe("Old checkpoint");
     expect(await fs.readdir(root)).toEqual(["manifest.json"]);
   });
 

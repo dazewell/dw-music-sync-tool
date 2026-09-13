@@ -179,15 +179,26 @@ the already-verified stored scope when they omit it.
 An interrupted credential save is recovered from a single intact pending file
 before authorization is used. Pending files are checked for the exact generated
 name, token shape, read-only scope, ordinary-file ownership and changes during
-inspection. Ambiguous, partial or unsafe leftovers produce an explicit error
-instead of silently being accepted or deleted; inspect them in the private token
-directory before retrying.
+inspection. New saves record the original destination identity (or its absence);
+publication and recovery refuse a destination that no longer matches. Failed
+publication preserves the pending credentials rather than discarding a rotated
+refresh token. Ambiguous, partial, legacy unbound or unsafe leftovers require
+inspection instead of being silently accepted or deleted. A legacy pending file
+with valid credentials can still be revoked/removed through Disconnect, but
+cannot be automatically published without destination evidence.
+
+On Windows, token and manifest replacement retry brief sharing conflicts up to
+three times (25/50/100 ms), rechecking file identities before each attempt.
+Persistent sharing or permission failures remain errors; the app never deletes
+the destination first as a replacement workaround.
 
 Disconnect revokes/removes authorization. Review any reported revocation failure
 and revoke access in your [Google account](https://myaccount.google.com/permissions)
 if necessary. Disconnect also revokes/removes validated pending credentials,
-even when the main token file was never published; a failed local cleanup is
-not reported as success. Disconnect does not itself remove exports. Google's revocation and
+even when the main token file was never published or cannot be safely read.
+An invalid or undeletable file does not prevent processing other validated
+credentials. Unreadable/replaced files are preserved, and all partial cleanup or
+revocation failures remain explicit. Disconnect does not itself remove exports. Google's revocation and
 user-deletion requirements are separate from routine 30-day retention: remove
 app-managed exports and any user-created copies when those requirements apply.
 Do not treat routine expiry as satisfying every revocation/deletion obligation.
@@ -213,6 +224,9 @@ There is no express local-personal-export exception. In this application:
   produce a cleanup warning and require inspection/removal before another backup.
 - Cleanup errors are visible, expired exports are not offered for download, and
   starting another backup is blocked until cleanup problems are resolved.
+- An active run's initialization is tracked before its directory is published,
+  so cleanup does not mistake an owner marker awaiting its first manifest for a
+  damaged archive. Inactive missing/corrupt archives still report errors.
 - **A stopped or sleeping local app cannot enforce the deadline.** Leave it
   running when required, or remove expired outputs yourself. Cleanup happens on
   the next launch, but that does not retroactively satisfy a missed deadline.

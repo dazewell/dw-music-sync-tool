@@ -18,7 +18,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, unlink: vi.fn(actual.unlink), open: vi.fn(actual.open) };
+  return { ...actual, unlink: vi.fn(actual.unlink), open: vi.fn(actual.open), rename: vi.fn(actual.rename) };
 });
 
 vi.mock("google-auth-library", () => ({
@@ -58,6 +58,26 @@ async function saveTokens(tokens: unknown): Promise<void> {
   await writeFile(tokenFile, JSON.stringify(tokens));
 }
 
+async function savePending(filename: string, tokens = freshTokens()) {
+  const info = await fs.lstat(tokenFile, { bigint: true }).catch(error => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  const value = {
+    ...tokens,
+    _saveIntent: {
+      version: 1,
+      tokenFile: "token.json",
+      destination: info === null ? null : {
+        dev: String(info.dev), ino: String(info.ino), size: String(info.size),
+        mtimeNs: String(info.mtimeNs), ctimeNs: String(info.ctimeNs),
+      },
+    },
+  };
+  await writeFile(filename, JSON.stringify(value));
+  return value;
+}
+
 beforeEach(async () => {
   vi.resetAllMocks();
   directory = await mkdtemp(join(tmpdir(), "music-google-test-"));
@@ -92,8 +112,7 @@ describe("interrupted Google credential saves", () => {
   });
 
   it("recovers a fully flushed pending token before reporting connection status", async () => {
-    const tokens = freshTokens();
-    await writeFile(pendingPath(), JSON.stringify(tokens));
+    const tokens = await savePending(pendingPath());
     expect(await auth.status()).toEqual({ configured: true, connected: true });
     expect(JSON.parse(await readFile(tokenFile, "utf8"))).toEqual(tokens);
     expect(await readdir(join(directory, "private"))).toEqual(["token.json"]);
@@ -103,7 +122,7 @@ describe("interrupted Google credential saves", () => {
 
   it("finishes a pending refresh-token rotation before using the previous token", async () => {
     await saveTokens(freshTokens());
-    await writeFile(pendingPath(), JSON.stringify({ ...freshTokens(), access_token: "new-access", refresh_token: "rotated" }));
+    await savePending(pendingPath(), { ...freshTokens(), access_token: "new-access", refresh_token: "rotated" });
     expect(await auth.getAccessToken()).toBe("new-access");
     expect(JSON.parse(await readFile(tokenFile, "utf8")).refresh_token).toBe("rotated");
   });
@@ -180,7 +199,7 @@ describe("interrupted Google credential saves", () => {
     mocks.revoke.mockImplementation(async () => { await writeFile(pendingPath(), "replacement user content"); });
     await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_DISCONNECT_LOCAL_FAILED" });
     expect(await readFile(pendingPath(), "utf8")).toBe("replacement user content");
-    expect(JSON.parse(await readFile(tokenFile, "utf8"))).toMatchObject({ refresh_token: "secret-refresh-token" });
+    await expect(readFile(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("does not report success if local pending cleanup fails", async () => {
@@ -195,7 +214,107 @@ describe("interrupted Google credential saves", () => {
     await writeFile(pendingPath(), JSON.stringify(freshTokens()));
     mocks.revoke.mockImplementation(async () => { await fs.unlink(pendingPath()); });
     await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_DISCONNECT_LOCAL_FAILED" });
-    expect(JSON.parse(await readFile(tokenFile, "utf8"))).toMatchObject({ refresh_token: "secret-refresh-token" });
+    await expect(readFile(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["replaced", "modified", "removed"] as const)("preserves pending and destination when the original target was %s", async change => {
+    await saveTokens(freshTokens());
+    const pending = await savePending(pendingPath());
+    if (change === "replaced") {
+      await fs.rename(tokenFile, join(directory, "old.json"));
+      await saveTokens({ ...freshTokens(), refresh_token: "newer-account" });
+    } else if (change === "modified") {
+      await fs.appendFile(tokenFile, " ");
+    } else {
+      await fs.unlink(tokenFile);
+    }
+    const target = change === "removed" ? null : await readFile(tokenFile, "utf8");
+    await expect(auth.status()).rejects.toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    expect(JSON.parse(await readFile(pendingPath(), "utf8"))).toEqual(pending);
+    if (target === null) await expect(readFile(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
+    else expect(await readFile(tokenFile, "utf8")).toBe(target);
+    expect(mocks.revoke).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite a destination created after an originally missing target", async () => {
+    const pending = await savePending(pendingPath());
+    await saveTokens({ ...freshTokens(), refresh_token: "newer-account" });
+    const target = await readFile(tokenFile, "utf8");
+    await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    expect(await readFile(tokenFile, "utf8")).toBe(target);
+    expect(JSON.parse(await readFile(pendingPath(), "utf8"))).toEqual(pending);
+  });
+
+  it("requires inspection for legacy unbound intents but can disconnect them", async () => {
+    const source = JSON.stringify(freshTokens());
+    await writeFile(pendingPath(), source);
+    await expect(auth.status()).rejects.toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    expect(await readFile(pendingPath(), "utf8")).toBe(source);
+    await expect(readFile(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
+    await auth.disconnect();
+    expect(mocks.revoke).toHaveBeenCalledWith("secret-refresh-token");
+    await expect(readFile(pendingPath())).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it.each(["malformed", "hard-linked", "directory", "unreadable"] as const)(
+    "cleans validated pending tokens while preserving/reporting a %s main file",
+    async kind => {
+      await writeFile(pendingPath(), JSON.stringify(freshTokens()));
+      if (kind === "directory") await mkdir(tokenFile);
+      else {
+        await writeFile(tokenFile, kind === "malformed" ? "user content" : JSON.stringify(freshTokens()));
+        if (kind === "hard-linked") await fs.link(tokenFile, join(directory, "external.json"));
+        if (kind === "unreadable") vi.mocked(fs.open).mockImplementationOnce(async (...args) => {
+          const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+          const handle = await actual.open(...args);
+          vi.mocked(fs.open).mockRejectedValueOnce(new Error("synthetic main permission error"));
+          return handle;
+        });
+      }
+      const original = kind === "directory" ? null : await readFile(tokenFile, "utf8");
+      await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_DISCONNECT_LOCAL_FAILED" });
+      expect(mocks.revoke).toHaveBeenCalledExactlyOnceWith("secret-refresh-token");
+      await expect(readFile(pendingPath())).rejects.toMatchObject({ code: "ENOENT" });
+      if (kind === "directory") expect((await fs.lstat(tokenFile)).isDirectory()).toBe(true);
+      else expect(await readFile(tokenFile, "utf8")).toBe(original);
+    },
+  );
+
+  it("reports both an unreadable main token and remote failure after cleaning validated pending data", async () => {
+    await writeFile(tokenFile, "malformed main secret");
+    await writeFile(pendingPath(), JSON.stringify(freshTokens()));
+    mocks.revoke.mockRejectedValue(new Error("remote secret-refresh-token"));
+    const error = await auth.disconnect().catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "GOOGLE_DISCONNECT_LOCAL_FAILED" });
+    expect(String(error)).toContain("revocation failed");
+    expect(String(error)).toContain("could not be inspected");
+    expect(String(error)).not.toContain("secret");
+    await expect(readFile(pendingPath())).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(tokenFile, "utf8")).toBe("malformed main secret");
+  });
+
+  it("reports both invalid credential sources when nothing can be safely revoked", async () => {
+    await writeFile(tokenFile, "malformed main");
+    await writeFile(pendingPath(), "malformed pending");
+    await expect(auth.disconnect()).rejects.toMatchObject({
+      code: "GOOGLE_DISCONNECT_LOCAL_FAILED", message: expect.stringContaining("main and pending"),
+    });
+    expect(mocks.revoke).not.toHaveBeenCalled();
+    expect(await readFile(tokenFile, "utf8")).toBe("malformed main");
+    expect(await readFile(pendingPath(), "utf8")).toBe("malformed pending");
+  });
+
+  it("continues independent cleanup after an invalid or undeletable pending file", async () => {
+    await saveTokens(freshTokens());
+    await writeFile(pendingPath(), "unprovable user data");
+    await writeFile(pendingPath("b"), JSON.stringify({ ...freshTokens(), refresh_token: "second" }));
+    await writeFile(pendingPath("c"), JSON.stringify({ ...freshTokens(), refresh_token: "third" }));
+    vi.mocked(fs.unlink).mockRejectedValueOnce(new Error("synthetic cleanup failure"));
+    await expect(auth.disconnect()).rejects.toMatchObject({ code: "GOOGLE_DISCONNECT_LOCAL_FAILED" });
+    expect(mocks.revoke.mock.calls.map(call => call[0]).sort()).toEqual(["second", "secret-refresh-token", "third"]);
+    expect(await readFile(pendingPath(), "utf8")).toBe("unprovable user data");
+    expect(await readdir(join(directory, "private"))).toHaveLength(2);
+    await expect(readFile(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
@@ -632,5 +751,126 @@ describe("GoogleAuth disconnect", () => {
     expect(mocks.refresh).toHaveBeenCalledTimes(1);
     await expect(readFile(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "GOOGLE_NOT_CONNECTED" });
+  });
+});
+
+describe("credential publication safety", () => {
+  beforeEach(async () => {
+    await writeFile(credentialsFile, JSON.stringify(config));
+    await mkdir(join(directory, "private"));
+  });
+
+  it.each(["hard-link", "junction"] as const)("refuses an existing %s before exchanging authorization", async kind => {
+    const external = join(directory, "external");
+    if (kind === "hard-link") {
+      await writeFile(external, JSON.stringify(freshTokens()));
+      await fs.link(external, tokenFile);
+    } else {
+      await mkdir(external);
+      await fs.symlink(external, tokenFile, "junction");
+    }
+    await expect(auth.complete("code", verifier)).rejects.toMatchObject({ code: "GOOGLE_TOKEN_WRITE_FAILED" });
+    expect(mocks.getToken).not.toHaveBeenCalled();
+    expect(await readdir(join(directory, "private"))).toEqual(["token.json"]);
+    if (kind === "hard-link") {
+      expect(await readFile(external, "utf8")).toBe(await readFile(tokenFile, "utf8"));
+      expect((await fs.lstat(tokenFile)).nlink).toBe(2);
+    } else expect((await fs.lstat(tokenFile)).isSymbolicLink()).toBe(true);
+  });
+
+  it("allows explicit reconnection to replace an unchanged malformed ordinary token", async () => {
+    await writeFile(tokenFile, "malformed old authorization");
+    await auth.complete("code", verifier);
+    expect(await auth.getAccessToken()).toBe("secret-access-token");
+    expect(await readdir(join(directory, "private"))).toEqual(["token.json"]);
+  });
+
+  it("retries replacement after an overlapping reader closes without unlinking the old token", async () => {
+    await saveTokens({ ...freshTokens(), expiry_date: 0, refresh_token: "old-token" });
+    mocks.refresh.mockResolvedValue({ credentials: { ...freshTokens(), refresh_token: "rotated-token" } });
+    const reader = await fs.open(tokenFile, "r");
+    let closed = false;
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(fs.rename).mockImplementationOnce(async (...args) => {
+      try {
+        await actual.rename(...args);
+      } catch (error) {
+        expect(error).toMatchObject({ code: "EPERM" });
+        expect(JSON.parse(await reader.readFile("utf8")).refresh_token).toBe("old-token");
+        await reader.close();
+        closed = true;
+        throw error;
+      }
+    });
+    try {
+      expect(await auth.getAccessToken()).toBe("secret-access-token");
+      expect(JSON.parse(await readFile(tokenFile, "utf8")).refresh_token).toBe("rotated-token");
+      if (!closed) expect(JSON.parse(await reader.readFile("utf8")).refresh_token).toBe("old-token");
+      expect(await readdir(join(directory, "private"))).toEqual(["token.json"]);
+    } finally {
+      if (!closed) await reader.close();
+    }
+  });
+
+  it.each(["existing", "missing"] as const)("retains a flushed pending save after a rename failure with a %s destination", async kind => {
+    if (kind === "existing") await saveTokens({ ...freshTokens(), refresh_token: "old-token" });
+    const original = kind === "existing" ? await readFile(tokenFile, "utf8") : null;
+    vi.mocked(fs.rename).mockRejectedValue(Object.assign(new Error("synthetic sharing conflict"), { code: "EPERM" }));
+    await expect(auth.complete("code", verifier)).rejects.toMatchObject({ code: "GOOGLE_TOKEN_WRITE_FAILED" });
+    if (original !== null) expect(await readFile(tokenFile, "utf8")).toBe(original);
+    else await expect(readFile(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
+    const pending = (await readdir(join(directory, "private"))).find(name => name.endsWith(".pending"))!;
+    const intent = JSON.parse(await readFile(join(directory, "private", pending), "utf8"));
+    expect(intent).toMatchObject({ refresh_token: "secret-refresh-token", _saveIntent: { version: 1, tokenFile: "token.json" } });
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(fs.rename).mockImplementation(actual.rename);
+    expect(await auth.status()).toEqual({ configured: true, connected: true });
+    expect(await readdir(join(directory, "private"))).toEqual(["token.json"]);
+    expect(mocks.getToken).toHaveBeenCalledTimes(1);
+  });
+
+  it("rechecks destination identity before retrying a sharing conflict", async () => {
+    await saveTokens(freshTokens());
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(fs.rename).mockImplementationOnce(async () => {
+      await actual.rename(tokenFile, join(directory, "previous.json"));
+      await saveTokens({ ...freshTokens(), refresh_token: "replacement-account" });
+      throw Object.assign(new Error("synthetic sharing conflict"), { code: "EPERM" });
+    });
+    await expect(auth.complete("code", verifier)).rejects.toMatchObject({ code: "GOOGLE_TOKEN_WRITE_FAILED" });
+    expect(vi.mocked(fs.rename)).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(await readFile(tokenFile, "utf8")).refresh_token).toBe("replacement-account");
+    expect((await readdir(join(directory, "private"))).filter(name => name.endsWith(".pending"))).toHaveLength(1);
+  });
+
+  it.each(["reconnect", "refresh"] as const)("preserves a target replaced during %s and keeps new credentials for inspection", async operation => {
+    await saveTokens({ ...freshTokens(), expiry_date: 0 });
+    const replace = async () => {
+      await fs.rename(tokenFile, join(directory, "previous.json"));
+      await saveTokens({ ...freshTokens(), refresh_token: "newer-account" });
+      return { ...freshTokens(), refresh_token: "rotated-token" };
+    };
+    mocks.getToken.mockImplementation(async () => ({ tokens: await replace() }));
+    mocks.refresh.mockImplementation(async () => ({ credentials: await replace() }));
+    await expect(operation === "refresh" ? auth.getAccessToken() : auth.complete("code", verifier))
+      .rejects.toMatchObject({ code: "GOOGLE_TOKEN_WRITE_FAILED" });
+    expect(JSON.parse(await readFile(tokenFile, "utf8")).refresh_token).toBe("newer-account");
+    const pending = (await readdir(join(directory, "private"))).find(name => name.endsWith(".pending"))!;
+    expect(JSON.parse(await readFile(join(directory, "private", pending), "utf8")).refresh_token).toBe("rotated-token");
+    await expect(auth.status()).rejects.toMatchObject({ code: "GOOGLE_PENDING_CLEANUP_FAILED" });
+    expect(JSON.parse(await readFile(tokenFile, "utf8")).refresh_token).toBe("newer-account");
+  });
+
+  it("preserves the main file when it gains a hard link during authorization", async () => {
+    await saveTokens(freshTokens());
+    const source = await readFile(tokenFile, "utf8");
+    mocks.getToken.mockImplementation(async () => {
+      await fs.link(tokenFile, join(directory, "external.json"));
+      return { tokens: { ...freshTokens(), refresh_token: "new-token" } };
+    });
+    await expect(auth.complete("code", verifier)).rejects.toMatchObject({ code: "GOOGLE_TOKEN_WRITE_FAILED" });
+    expect(await readFile(tokenFile, "utf8")).toBe(source);
+    expect(await readFile(join(directory, "external.json"), "utf8")).toBe(source);
+    expect((await readdir(join(directory, "private"))).filter(name => name.endsWith(".pending"))).toHaveLength(1);
   });
 });
