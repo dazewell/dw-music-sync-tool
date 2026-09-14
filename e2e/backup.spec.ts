@@ -338,6 +338,37 @@ test("explicit pairs stay selectable and drive the manual mirror trigger", async
   await expect(page.locator("#notice")).toContainText("Synchronization completed.");
   expect(triggered).toEqual([{ pairId: "pair-1" }]);
 });
+test("ignoring a playlist submits the ignore form and reflects it in the ignored list", async ({ page, serverUrl }) => {
+  const initialState = {
+    pairs: [],
+    ignores: [],
+    runs: [],
+    removals: [],
+  };
+  let ignored: unknown[] = [];
+  await page.route("**/api/sync", async (route) => { await route.fulfill({ json: initialState }); });
+  await page.route("**/api/sync/ignored", async (route) => {
+    if (route.request().method() !== "POST") { await route.fallback(); return; }
+    ignored.push(route.request().postDataJSON());
+    await route.fulfill({
+      status: 201,
+      json: {
+        ...initialState,
+        ignores: [{ provider: "spotify", accountId: "acct-1", playlistId: "sp-42", reason: "Duplicate mix", createdAt: "2026-09-13T00:00:00.000Z" }],
+      },
+    });
+  });
+  await page.goto(serverUrl);
+  const form = page.locator("#ignore-form");
+  await form.getByLabel("Platform", { exact: true }).selectOption("spotify");
+  await form.getByLabel("Account ID", { exact: true }).fill("acct-1");
+  await form.getByLabel("Playlist ID", { exact: true }).fill("sp-42");
+  await form.getByLabel("Reason (optional)").fill("Duplicate mix");
+  await form.getByRole("button", { name: "Ignore playlist", exact: true }).click();
+  await expect(page.locator("#sync-ignored")).toContainText("Spotify sp-42");
+  await expect(page.locator("#sync-ignored")).toContainText("Duplicate mix");
+  expect(ignored).toEqual([{ provider: "spotify", accountId: "acct-1", playlistId: "sp-42", reason: "Duplicate mix" }]);
+});
 test("removing a pair updates the removal audit list immediately without a manual refresh", async ({ page, serverUrl }) => {
   const pair = {
     id: "pair-1",

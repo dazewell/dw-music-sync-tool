@@ -181,6 +181,20 @@ Direction: seed895a4aee / candidate4, mixing-desk studio console.
           <section aria-labelledby="ignored-list-title">
             <h3 id="ignored-list-title">Ignored playlists</h3>
             <div id="sync-ignored"></div>
+            <form id="ignore-form" class="sync-form">
+              <label for="ignore-provider">Platform</label>
+              <select id="ignore-provider" name="ignore-provider">
+                <option value="spotify">Spotify</option>
+                <option value="youtube">YouTube Music</option>
+              </select>
+              <label for="ignore-account">Account ID</label>
+              <input id="ignore-account" name="ignore-account" autocomplete="off" required>
+              <label for="ignore-playlist">Playlist ID</label>
+              <input id="ignore-playlist" name="ignore-playlist" autocomplete="off" required>
+              <label for="ignore-reason">Reason (optional)</label>
+              <input id="ignore-reason" name="ignore-reason" autocomplete="off" maxlength="500">
+              <button class="secondary-button" type="submit">Ignore playlist</button>
+            </form>
           </section>
           <section aria-labelledby="pair-form-title">
             <h3 id="pair-form-title">Manage a pair</h3>
@@ -271,7 +285,8 @@ Direction: seed895a4aee / candidate4, mixing-desk studio console.
       </section>
 
       <footer class="workspace-footer">
-        <p>Files stay local. Account authorization is read-only.</p>
+        <p>Files stay local. Google backup authorization is read-only.</p>
+        <p>Spotify and YouTube sync authorization is write-capable and separately, explicitly consented: it can add and remove tracks in paired playlists.</p>
         <p><strong>Spotify sync</strong> <span id="sync-footer-state" class="future-label">Checking availability…</span></p>
       </footer>
     </main>

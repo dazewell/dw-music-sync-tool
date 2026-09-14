@@ -100,6 +100,11 @@ const ui = {
   pairRightProvider: element<HTMLSelectElement>("pair-right-provider"),
   pairRightAccount: element<HTMLInputElement>("pair-right-account"),
   pairRightPlaylist: element<HTMLInputElement>("pair-right-playlist"),
+  ignoreForm: element<HTMLFormElement>("ignore-form"),
+  ignoreProvider: element<HTMLSelectElement>("ignore-provider"),
+  ignoreAccount: element<HTMLInputElement>("ignore-account"),
+  ignorePlaylist: element<HTMLInputElement>("ignore-playlist"),
+  ignoreReason: element<HTMLInputElement>("ignore-reason"),
   removalFeedback: element("removal-feedback"),
   removalTableWrap: element("removal-table-wrap"),
   removalRows: element<HTMLTableSectionElement>("removal-rows"),
@@ -717,6 +722,9 @@ function renderSync(): void {
   ui.pairForm.querySelectorAll("input, select, button").forEach((control) => {
     (control as HTMLInputElement | HTMLSelectElement | HTMLButtonElement).disabled = syncBusy || syncLoading || !available;
   });
+  ui.ignoreForm.querySelectorAll("input, select, button").forEach((control) => {
+    (control as HTMLInputElement | HTMLSelectElement | HTMLButtonElement).disabled = syncBusy || syncLoading || !available;
+  });
   ui.syncPairs.replaceChildren();
   for (const pair of pairs) {
     const row = text("p", pairLabel(pair), "sync-record");
@@ -834,6 +842,26 @@ async function unignore(ref: SyncRef): Promise<void> {
   const path = `/api/sync/ignored/${ref.provider}/${encodeURIComponent(ref.accountId)}/${encodeURIComponent(ref.playlistId)}`;
   try { sync = await request<SyncState>(path, "DELETE"); }
   catch (error) { notify(`Could not restore the playlist. ${message(error)}`, "error"); }
+  finally { syncBusy = false; if (!disposed) renderSync(); }
+}
+
+async function saveIgnore(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (ui.ignoreForm.querySelector(":invalid")) return;
+  const ignore = {
+    provider: ui.ignoreProvider.value as Platform,
+    accountId: ui.ignoreAccount.value.trim(),
+    playlistId: ui.ignorePlaylist.value.trim(),
+    reason: ui.ignoreReason.value.trim(),
+  };
+  syncBusy = true;
+  renderSync();
+  try {
+    sync = await request<SyncState>("/api/sync/ignored", "POST", ignore);
+    removals = sync.removals ?? removals;
+    ui.ignoreForm.reset();
+    notify("Playlist ignored. It will never be selected by a pair.", "success");
+  } catch (error) { notify(`Could not ignore the playlist. ${message(error)}`, "error"); }
   finally { syncBusy = false; if (!disposed) renderSync(); }
 }
 
@@ -1197,6 +1225,7 @@ ui.search.addEventListener("input", renderInventory);
 ui.retryJob.addEventListener("click", () => { void loadCurrentJob(); });
 ui.syncNow.addEventListener("click", () => { void syncNow(); });
 ui.pairForm.addEventListener("submit", (event) => { void savePair(event); });
+ui.ignoreForm.addEventListener("submit", (event) => { void saveIgnore(event); });
 ui.refreshRemovals.addEventListener("click", () => { void loadRemovals(); });
 ui.removalFilters.addEventListener("submit", (event) => { event.preventDefault(); void loadRemovals(); });
 ui.removalFiltersClear.addEventListener("click", () => { ui.removalFilters.reset(); void loadRemovals(); });
