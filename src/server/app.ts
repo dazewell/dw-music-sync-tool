@@ -210,7 +210,36 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     res.json({ url: pending.url });
   }
 
+  function rejectPendingGoogleAuthorization(req: Request, res: Response, next: NextFunction): void {
+    const current = session(req, res);
+    if (current.oauth !== null) {
+      if (current.oauth.expiresAt <= Date.now()) {
+        current.oauth = null;
+      } else {
+        throw new AppError("AUTH_PENDING", "A Google authorization is already pending in this browser. Complete it or wait for it to expire before starting another.", 409);
+      }
+    }
+    next();
+  }
+
+  function rejectGoogleAuthorizationWhenBusy(_req: Request, _res: Response, next: NextFunction): void {
+    if (operation === "backup") {
+      throw new AppError("BACKUP_RUNNING", "A backup is already running. Wait for it to finish.", 409);
+    }
+    if (operation === "auth") {
+      throw new AppError("AUTH_BUSY", "Google authorization is changing. Wait for it to finish, then try again.", 409);
+    }
+    if (operation === "inventory") {
+      throw new AppError("INVENTORY_BUSY", "Playlists are being read. Wait for discovery to finish, then try again.", 409);
+    }
+    if (operation === "sync") {
+      throw new AppError("SYNC_BUSY", "A synchronization operation is already running. Wait for it to finish, then try again.", 409);
+    }
+    next();
+  }
+
   function limitGoogleAuthorizationStarts(req: Request, res: Response, next: NextFunction): void {
+    if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
     const current = session(req, res);
     const now = Date.now();
     for (const [key, value] of authStarts) {
@@ -292,7 +321,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     next();
   });
 
-  app.post("/api/auth/connect", limitGoogleAuthorizationStarts, async (req, res) => {
+  app.post("/api/auth/connect", rejectGoogleAuthorizationWhenBusy, rejectPendingGoogleAuthorization, limitGoogleAuthorizationStarts, async (req, res) => {
     const release = reserve("auth");
     try {
       await beginGoogleAuthorization(req, res, "read");
@@ -301,7 +330,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     }
   });
 
-  app.post("/api/auth/connect-write", limitGoogleAuthorizationStarts, async (req, res) => {
+  app.post("/api/auth/connect-write", rejectGoogleAuthorizationWhenBusy, rejectPendingGoogleAuthorization, limitGoogleAuthorizationStarts, async (req, res) => {
     const release = reserve("auth");
     try {
       await beginGoogleAuthorization(req, res, "write");

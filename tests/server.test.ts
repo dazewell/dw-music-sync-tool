@@ -347,10 +347,23 @@ describe("loopback server", () => {
     expect(auth.beginWrite).not.toHaveBeenCalled();
   });
 
+  it("rejects overlapping Google authorization starts without discarding the pending callback", async () => {
+    const { browser, host, csrf, auth } = await setup(false);
+    await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    const rejected = await browser.post("/api/auth/connect-write").set("Host", host).set("X-CSRF-Token", csrf).expect(409);
+    expect(rejected.body.error.code).toBe("AUTH_PENDING");
+    expect(auth.begin).toHaveBeenCalledTimes(1);
+    expect(auth.beginWrite).not.toHaveBeenCalled();
+    await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host)
+      .expect(302).expect("Location", "/?connected=1");
+    expect(auth.complete).toHaveBeenCalledExactlyOnceWith("code", "test-verifier");
+  });
+
   it("rate-limits repeated Google authorization starts for one session", async () => {
     const { browser, host, csrf, auth } = await setup(false);
     for (let index = 0; index < 5; index += 1) {
       await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+      await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
     }
     const limited = await browser.post("/api/auth/connect-write").set("Host", host).set("X-CSRF-Token", csrf).expect(429);
     expect(limited.body.error.code).toBe("AUTH_RATE_LIMITED");
