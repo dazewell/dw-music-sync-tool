@@ -152,6 +152,10 @@ let syncBusy = false;
 const discovered: Record<Platform, Playlist[] | null> = { youtube: null, spotify: null };
 const discoveredLoading: Record<Platform, boolean> = { youtube: false, spotify: false };
 const discoveredError: Record<Platform, string | null> = { youtube: null, spotify: null };
+// Tracks the in-flight discovery request per provider so a second caller (e.g. auto-pair
+// clearing the cache while the initial picker load is still pending) awaits the same
+// request instead of getting an empty placeholder result back.
+const discoveredRequest: Record<Platform, Promise<Playlist[]> | null> = { youtube: null, spotify: null };
 let removals: SyncRemovalRecord[] = [];
 let removalsLoaded = false;
 let removalsLoading = false;
@@ -730,22 +734,28 @@ function populatePlaylistSelect(select: HTMLSelectElement, provider: Platform): 
 
 /** Loads real playlists for a provider once (cached), so pickers never require a hand-typed ID. */
 async function ensureDiscovered(provider: Platform): Promise<Playlist[]> {
-  if (discovered[provider] || discoveredLoading[provider]) return discovered[provider] ?? [];
+  if (discovered[provider]) return discovered[provider]!;
+  if (discoveredLoading[provider]) return discoveredRequest[provider] ?? [];
   discoveredLoading[provider] = true;
   discoveredError[provider] = null;
   renderSync();
-  try {
-    const response = await request<{ playlists: Playlist[] }>(`/api/sync/discover/${provider}`);
-    discovered[provider] = response.playlists;
-    return response.playlists;
-  } catch (error) {
-    discoveredError[provider] = message(error);
-    discovered[provider] = [];
-    return [];
-  } finally {
-    discoveredLoading[provider] = false;
-    if (!disposed) renderSync();
-  }
+  const requestPromise = (async () => {
+    try {
+      const response = await request<{ playlists: Playlist[] }>(`/api/sync/discover/${provider}`);
+      discovered[provider] = response.playlists;
+      return response.playlists;
+    } catch (error) {
+      discoveredError[provider] = message(error);
+      discovered[provider] = [];
+      return [];
+    } finally {
+      discoveredLoading[provider] = false;
+      discoveredRequest[provider] = null;
+      if (!disposed) renderSync();
+    }
+  })();
+  discoveredRequest[provider] = requestPromise;
+  return requestPromise;
 }
 
 function renderSync(): void {
@@ -768,7 +778,8 @@ function renderSync(): void {
   }
   if (pairs.some((pair) => pair.id === selected)) ui.syncPairSelect.value = selected;
   ui.syncPairSelect.disabled = syncBusy || syncLoading || !available || pairs.length === 0;
-  ui.syncNow.disabled = ui.syncPairSelect.disabled;
+  const selectedPair = pairs.find((pair) => pair.id === ui.syncPairSelect.value);
+  ui.syncNow.disabled = ui.syncPairSelect.disabled || !selectedPair || !selectedPair.enabled;
   ui.syncAllPairs.disabled = syncBusy || syncLoading || !available || pairs.filter((pair) => pair.enabled).length === 0;
   ui.autoPairByName.disabled = syncBusy || syncLoading || !available;
   if (available) {
@@ -1402,6 +1413,7 @@ ui.search.addEventListener("input", renderInventory);
 ui.retryJob.addEventListener("click", () => { void loadCurrentJob(); });
 ui.syncNow.addEventListener("click", () => { void syncNow(); });
 ui.syncAllPairs.addEventListener("click", () => { void syncAllPairs(); });
+ui.syncPairSelect.addEventListener("change", renderSync);
 ui.autoPairByName.addEventListener("click", () => { void autoPairByName(); });
 ui.pairForm.addEventListener("submit", (event) => { void savePair(event); });
 ui.ignoreForm.addEventListener("submit", (event) => { void saveIgnore(event); });

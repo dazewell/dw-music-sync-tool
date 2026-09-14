@@ -11,7 +11,7 @@ import { replaceFile } from "./core/replace-file.js";
 
 const AUTHORIZE_URL = "https://accounts.spotify.com/authorize";
 const TOKEN_URL = "https://accounts.spotify.com/api/token";
-// Matches the scopes documented in README.md for this tool''s Spotify provider.
+// Matches the scopes documented in README.md for this tool's Spotify provider.
 const SCOPES = "playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private";
 const DEFAULT_PORT = 8888;
 const CALLBACK_TIMEOUT_MS = 5 * 60_000;
@@ -24,7 +24,7 @@ Usage:
 
 Reads SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET from .env (a refresh token is
 not required to run this command; it is what this command produces). Opens
-your system browser to Spotify''s consent screen, receives the redirect on a
+your system browser to Spotify's consent screen, receives the redirect on a
 127.0.0.1-only loopback listener, exchanges the authorization code and writes
 only SPOTIFY_REFRESH_TOKEN back into your local, Git-ignored .env file.
 
@@ -96,12 +96,25 @@ function waitForCallback(server: Server, expectedState: string, timeoutMs: numbe
       const error = url.searchParams.get("error");
       const code = url.searchParams.get("code");
       const state = url.searchParams.get("state");
-      if (error) {
-        res.writeHead(200, { "Content-Type": "text/html" }).end(page("Spotify authorization declined", "Access was not granted."));
-        finish(() => reject(new AppError("SPOTIFY_AUTH_DENIED", `Spotify authorization was not granted (${error}).`, 401)));
+      // Verify the CSRF state before honoring anything else in the callback, including a
+      // denial. Otherwise any local process that can reach this loopback listener could
+      // terminate the flow (and inject arbitrary text into the error message) without
+      // ever presenting the expected state token.
+      if (!state || state !== expectedState) {
+        res.writeHead(400, { "Content-Type": "text/html" }).end(page("Spotify authorization failed", "The redirect was missing or unexpected. Run the command again."));
+        finish(() => reject(new AppError(
+          "SPOTIFY_AUTH_STATE_MISMATCH",
+          "The Spotify redirect was missing or did not match the expected authorization request. Run the command again.",
+          400,
+        )));
         return;
       }
-      if (!code || !state || state !== expectedState) {
+      if (error) {
+        res.writeHead(200, { "Content-Type": "text/html" }).end(page("Spotify authorization declined", "Access was not granted."));
+        finish(() => reject(new AppError("SPOTIFY_AUTH_DENIED", "Spotify authorization was not granted.", 401)));
+        return;
+      }
+      if (!code) {
         res.writeHead(400, { "Content-Type": "text/html" }).end(page("Spotify authorization failed", "The redirect was missing or unexpected. Run the command again."));
         finish(() => reject(new AppError(
           "SPOTIFY_AUTH_STATE_MISMATCH",

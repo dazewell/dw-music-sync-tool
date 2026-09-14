@@ -455,13 +455,13 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     const direction = req.query["direction"];
     const outcome = req.query["outcome"];
     const limit = req.query["limit"];
-    if (pairId !== undefined && (typeof pairId !== "string" || !pairId || pairId.length > 200)) {
+    if (pairId !== undefined && (typeof pairId !== "string" || !pairId.trim() || pairId.length > 200)) {
       throw new AppError("INVALID_SYNC_QUERY", "The optional pair ID must be a single non-empty value.", 400);
     }
     if (platform !== undefined && (typeof platform !== "string" || !["youtube", "spotify"].includes(platform))) {
       throw new AppError("INVALID_SYNC_QUERY", "The optional platform must be youtube or spotify.", 400);
     }
-    if (playlistId !== undefined && (typeof playlistId !== "string" || !playlistId || playlistId.length > 200)) {
+    if (playlistId !== undefined && (typeof playlistId !== "string" || !playlistId.trim() || playlistId.length > 200)) {
       throw new AppError("INVALID_SYNC_QUERY", "The optional playlist ID must be a single non-empty value.", 400);
     }
     if (itemIdentity !== undefined && (typeof itemIdentity !== "string" || !itemIdentity.trim() || itemIdentity.length > 200)) {
@@ -482,9 +482,9 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     }
     res.json({
       removals: collectRemovalRecords(await service.state(), {
-        ...(pairId === undefined ? {} : { pairId: pairId as string }),
+        ...(pairId === undefined ? {} : { pairId: (pairId as string).trim() }),
         ...(platform === undefined ? {} : { platform: platform as ProviderId }),
-        ...(playlistId === undefined ? {} : { playlistId: playlistId as string }),
+        ...(playlistId === undefined ? {} : { playlistId: (playlistId as string).trim() }),
         ...(itemIdentity === undefined ? {} : { itemIdentity: (itemIdentity as string).trim() }),
         ...(direction === undefined ? {} : { direction: direction as "left-to-right" | "right-to-left" }),
         ...(outcome === undefined ? {} : { outcome: outcome as "success" | "failed" | "unknown" }),
@@ -517,8 +517,8 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     try {
       const service = syncService();
       const id = req.params["id"];
-      if (!id || id.length > 200) throw new AppError("INVALID_SYNC_PAIR", "A valid pair ID is required.", 400);
-      res.json(toSyncView(await service.unpair(id)));
+      if (!id || !id.trim() || id.length > 200) throw new AppError("INVALID_SYNC_PAIR", "A valid pair ID is required.", 400);
+      res.json(toSyncView(await service.unpair(id.trim())));
     } finally {
       release();
     }
@@ -559,10 +559,10 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     try {
       const service = syncService();
       const body = req.body as { pairId?: unknown } | null;
-      if (typeof body?.pairId !== "string" || !body.pairId || body.pairId.length > 200) {
+      if (typeof body?.pairId !== "string" || !body.pairId.trim() || body.pairId.length > 200) {
         throw new AppError("INVALID_SYNC_RUN", "An explicit pair ID is required; unpaired playlists are never mirrored.", 400);
       }
-      const run = await service.run(body.pairId);
+      const run = await service.run(body.pairId.trim());
       res.status(run.status === "running" ? 202 : 200).json({ run });
     } finally {
       release();

@@ -38,11 +38,13 @@ function driveCallback(authorizeUrl: string, overrides: Partial<{ code: string; 
   const redirectUri = new URL(parsed.searchParams.get("redirect_uri")!);
   const state = overrides.state ?? parsed.searchParams.get("state")!;
   const callbackUrl = new URL(redirectUri.toString());
+  // Spotify always echoes the original `state` back on the redirect, denial included, so the
+  // real-world denial path still has to pass the CSRF check before the denial is honored.
+  callbackUrl.searchParams.set("state", state);
   if (overrides.error) {
     callbackUrl.searchParams.set("error", overrides.error);
   } else {
     callbackUrl.searchParams.set("code", overrides.code ?? "auth-code-123");
-    callbackUrl.searchParams.set("state", state);
   }
   http.get(callbackUrl, (res) => res.resume());
 }
@@ -103,6 +105,25 @@ describe("runSpotifyAuth", () => {
       envPath, port: 0, clientId: "abc", clientSecret: "def",
       fetch: vi.fn() as unknown as typeof fetch, openBrowser, log: () => {},
     })).rejects.toMatchObject({ code: "SPOTIFY_AUTH_DENIED" });
+  });
+
+  it("rejects a forged denial callback with a state mismatch instead of honoring it", async () => {
+    const directory = await tempDir();
+    const envPath = path.join(directory, ".env");
+    await writeFile(envPath, "SPOTIFY_CLIENT_ID=abc\nSPOTIFY_CLIENT_SECRET=def\n", "utf8");
+    const fetchMock = vi.fn();
+    // Simulates another local process racing the real browser to the loopback listener with a
+    // denial that does not carry the expected state; this must fail closed as a state mismatch,
+    // not be accepted as a legitimate user denial.
+    const openBrowser = vi.fn((url: string) => driveCallback(url, { error: "access_denied", state: "forged-state" }));
+
+    await expect(runSpotifyAuth({
+      envPath, port: 0, clientId: "abc", clientSecret: "def",
+      fetch: fetchMock as unknown as typeof fetch, openBrowser, log: () => {},
+    })).rejects.toMatchObject({ code: "SPOTIFY_AUTH_STATE_MISMATCH" });
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(await readFile(envPath, "utf8")).not.toContain("SPOTIFY_REFRESH_TOKEN");
   });
 
   it("fails closed with an actionable error when Spotify rejects the code exchange", async () => {

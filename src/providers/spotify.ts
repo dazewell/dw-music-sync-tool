@@ -29,7 +29,7 @@ const pageSchema = z.object({
 });
 const playlistPageSchema = z.object({
   items: z.array(z.object({
-    id: z.string().min(1), name: z.string(), description: z.string().optional(),
+    id: z.string().min(1), name: z.string(), description: z.string().nullable().optional(),
     owner: z.object({ id: z.string().optional() }).optional(),
     public: z.boolean().optional(), collaborative: z.boolean().optional(),
     tracks: z.object({ total: z.number().int().nonnegative().optional() }).optional(),

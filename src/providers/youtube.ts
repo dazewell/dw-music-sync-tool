@@ -16,6 +16,7 @@ const playlistSchema = z.object({
   snippet: z.object({
     title: z.string(),
     description: z.string(),
+    channelId: z.string().optional(),
     channelTitle: z.string(),
   }),
   contentDetails: z.object({ itemCount: count }),
@@ -122,7 +123,7 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
       id: item.id,
       title: item.snippet.title,
       description: item.snippet.description,
-      owner: item.snippet.channelTitle,
+      owner: item.snippet.channelId ?? item.snippet.channelTitle,
       itemCount: item.contentDetails.itemCount,
       visibility: item.status?.privacyStatus ?? "unknown",
       url: `https://www.youtube.com/playlist?list=${encodeURIComponent(item.id)}`,
@@ -176,7 +177,7 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
         403,
       );
     }
-    if (entries.some(entry => entry.mediaId === null)) {
+    if (entries.some(entry => entry.mediaId === null || entry.availability === "unavailable")) {
       throw new AppError("YOUTUBE_ENTRY_UNSUPPORTED", "Unavailable entries cannot be written to YouTube without a video ID.", 409);
     }
     const current = await this.getPlaylist(playlist);

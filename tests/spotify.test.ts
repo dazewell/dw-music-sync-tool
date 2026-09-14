@@ -168,3 +168,23 @@ describe("SpotifyProvider.replacePlaylist", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("SpotifyProvider.listPlaylists", () => {
+  it("accepts a null description instead of rejecting the page as invalid", async () => {
+    const { provider, fetcher } = fixture([
+      json({
+        items: [{
+          id: "playlist-2", name: "Untouched Playlist", description: null,
+          owner: { id: "user-1" }, public: true, tracks: { total: 0 },
+        }],
+        next: null,
+      }),
+    ]);
+    const playlists = await provider.listPlaylists();
+    expect(playlists).toEqual([{
+      provider: "spotify", id: "playlist-2", title: "Untouched Playlist", description: "",
+      url: "https://open.spotify.com/playlist/playlist-2", owner: "user-1", itemCount: 0, visibility: "public",
+    }]);
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});

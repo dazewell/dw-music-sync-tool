@@ -108,6 +108,23 @@ describe("YouTubeProvider official read-only coverage", () => {
     expect(new URL(String(fetcher.mock.calls[3]?.[0])).searchParams.get("pageToken")).toBe("items-50");
   });
 
+  it("uses the stable channel ID as the playlist owner instead of the mutable channel title, when present", async () => {
+    const { provider } = fixture([json({
+      items: [{
+        ...apiPlaylist(),
+        snippet: { title: "Owned music", description: "", channelId: "UC-stable-id", channelTitle: "Playlist curator" },
+      }],
+    })]);
+    const [listed] = await provider.listPlaylists();
+    expect(listed?.owner).toBe("UC-stable-id");
+  });
+
+  it("falls back to the channel title as owner when the API omits channelId", async () => {
+    const { provider } = fixture([json({ items: [apiPlaylist()] })]);
+    const [listed] = await provider.listPlaylists();
+    expect(listed?.owner).toBe("Playlist curator");
+  });
+
   it("keeps owner channel names only in provider metadata, never as recording artist", async () => {
     const item = apiItem();
     const { provider } = fixture([json({
@@ -493,6 +510,14 @@ describe("YouTubeProvider.replacePlaylist write-scope safety", () => {
     const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
     const unavailable = { ...newEntry, mediaId: null, availability: "unavailable" as const };
     await expect(provider.replacePlaylist(target, [unavailable])).rejects.toMatchObject({ code: "YOUTUBE_ENTRY_UNSUPPORTED" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unavailable entry that still retains a video ID, instead of writing a private/deleted placeholder", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    const staleUnavailable = { ...newEntry, mediaId: "stale-video", availability: "unavailable" as const };
+    await expect(provider.replacePlaylist(target, [staleUnavailable])).rejects.toMatchObject({ code: "YOUTUBE_ENTRY_UNSUPPORTED" });
     expect(fetcher).not.toHaveBeenCalled();
   });
 
