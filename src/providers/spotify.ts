@@ -162,6 +162,18 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
     if (expectedSnapshotId !== undefined && current.playlist.snapshotId !== expectedSnapshotId) {
       throw new AppError("SPOTIFY_STALE_PLAYLIST", "The Spotify playlist changed before the sync could be applied.", 409);
     }
+    // getPlaylist deliberately preserves local files/episodes as unaddressable placeholders
+    // (no spotify:track URI). They cannot be targeted by a DELETE by URI, so silently skipping
+    // them here would leave them behind while everything else is deleted and re-inserted,
+    // producing a mixed/duplicated playlist that only surfaces as a failure later, after the
+    // destructive request already ran. Fail closed before issuing any request instead.
+    if (current.entries.some(entry => typeof entry.providerData.uri !== "string")) {
+      throw new AppError(
+        "SPOTIFY_ENTRY_UNSUPPORTED",
+        "The current Spotify playlist has a local file or episode that cannot be addressed by a track URI; remove or resolve it manually before syncing this playlist.",
+        409,
+      );
+    }
     const tracks = current.entries
       .map((entry, position) => ({ uri: typeof entry.providerData.uri === "string" ? entry.providerData.uri : null, positions: [position] }))
       .filter((track): track is { uri: string; positions: number[] } => track.uri !== null);

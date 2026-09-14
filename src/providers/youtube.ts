@@ -178,19 +178,36 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
     // (network error, quota, malformed response) the previous playlist entries are still
     // intact instead of already deleted; nothing is lost, and the failure is explicit.
     const insertUrl = new URL(`playlistItems?${new URLSearchParams({ part: "snippet" }).toString()}`, API_ROOT);
-    for (const entry of entries) {
-      const body = await this.request(insertUrl, {
-        method: "POST",
-        body: JSON.stringify({ snippet: { playlistId: playlist.id, resourceId: { kind: "youtube#video", videoId: entry.mediaId } } }),
-      }, "write");
-      const inserted = insertedItemSchema.safeParse(body);
-      if (!inserted.success) {
-        throw new AppError(
-          "YOUTUBE_INSERT_UNCONFIRMED",
-          "YouTube did not confirm the inserted playlist item. The previously existing items were preserved; review the playlist before retrying.",
-          502,
-        );
+    const insertedIds: string[] = [];
+    try {
+      for (const entry of entries) {
+        const body = await this.request(insertUrl, {
+          method: "POST",
+          body: JSON.stringify({ snippet: { playlistId: playlist.id, resourceId: { kind: "youtube#video", videoId: entry.mediaId } } }),
+        }, "write");
+        const inserted = insertedItemSchema.safeParse(body);
+        if (!inserted.success) {
+          throw new AppError(
+            "YOUTUBE_INSERT_UNCONFIRMED",
+            "YouTube did not confirm the inserted playlist item. The previously existing items were preserved; review the playlist before retrying.",
+            502,
+          );
+        }
+        insertedIds.push(inserted.data.id);
       }
+    } catch (error) {
+      // A later insert failed after some earlier ones succeeded. Leaving the successful
+      // inserts in place alongside the still-intact original entries would let a retry
+      // compound duplicates, so best-effort clean them up before surfacing the failure.
+      for (const id of insertedIds) {
+        try {
+          await this.request(new URL(`playlistItems?${new URLSearchParams({ id }).toString()}`, API_ROOT), { method: "DELETE" }, "write");
+        } catch {
+          // Cleanup failing must not mask the original insert failure below; the playlist may
+          // still contain some inserted duplicates and needs manual review in that case.
+        }
+      }
+      throw error;
     }
     for (const entry of current.entries) {
       await this.request(new URL(`playlistItems?${new URLSearchParams({ id: entry.id }).toString()}`, API_ROOT), { method: "DELETE" }, "write");

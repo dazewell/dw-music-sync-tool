@@ -246,7 +246,11 @@ export async function applySyncPlan(
     } else {
       await targetProvider.replacePlaylist(plan.target.playlist, plan.entries, plan.target.playlist.snapshotId);
     }
-    verified = await targetProvider.getPlaylist(plan.target.playlist);
+    // plan.target.playlist is the pre-mutation discovery summary: its itemCount reflects the
+    // playlist before this write, not after. A legitimate length-changing write is expected to
+    // change it, so pass a version with itemCount cleared for the verification read - otherwise a
+    // provider that treats itemCount as an invariant (YouTube) would reject its own correct result.
+    verified = await targetProvider.getPlaylist({ ...plan.target.playlist, itemCount: null });
     if (verified.entries.length !== plan.entries.length
       || verified.entries.some((entry, index) => playlistEntryIdentity(entry) !== playlistEntryIdentity(plan.entries[index]!))) {
       throw new AppError("SYNC_VERIFY_FAILED", "The destination did not match the planned ordered result; no new baseline was recorded.", 502);

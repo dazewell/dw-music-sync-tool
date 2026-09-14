@@ -160,6 +160,15 @@ async function exchangeCode(options: ExchangeOptions): Promise<string> {
 
 /** Atomically replaces only the SPOTIFY_REFRESH_TOKEN line in the local .env file. */
 export async function updateEnvRefreshToken(envPath: string, refreshToken: string): Promise<void> {
+  // A CR/LF in the token would let it inject additional lines into .env, which
+  // process.loadEnvFile() would then parse as extra configuration. Fail closed instead.
+  if (/[\r\n]/.test(refreshToken)) {
+    throw new AppError(
+      "SPOTIFY_AUTH_TOKEN_INVALID",
+      "Spotify returned a refresh token containing a line break; refusing to write it to .env.",
+      502,
+    );
+  }
   let text = "";
   try {
     text = await readFile(envPath, "utf8");

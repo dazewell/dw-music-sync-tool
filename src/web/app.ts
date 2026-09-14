@@ -27,7 +27,7 @@ interface SyncRemovalRecord {
   /** The paired platform mirrored from, or null when the pair no longer exists. */
   sourcePlatform: Platform | null;
   timestamp: string;
-  outcome: "success" | "failed";
+  outcome: "success" | "failed" | "unknown";
   error: string | null;
 }
 interface SyncState { pairs: SyncPair[]; ignores: SyncIgnore[]; runs: SyncRun[]; removals: SyncRemovalRecord[]; }
@@ -593,7 +593,7 @@ function directionLabel(record: SyncRemovalRecord): string {
 }
 
 function outcomeLabel(outcome: SyncRemovalRecord["outcome"]): string {
-  return outcome === "success" ? "Removed" : "Failed";
+  return outcome === "success" ? "Removed" : outcome === "unknown" ? "Unknown" : "Failed";
 }
 
 function pairLabel(pair: SyncPair): string {
@@ -643,7 +643,7 @@ function renderRemovals(): void {
       time.append(stamp);
       const outcome = document.createElement("td");
       const badge = text("span", outcomeLabel(record.outcome), "badge");
-      badge.dataset.state = record.outcome === "success" ? "complete" : "failed";
+      badge.dataset.state = record.outcome === "success" ? "complete" : record.outcome === "unknown" ? "partial" : "failed";
       outcome.append(badge);
       if (record.error) outcome.append(text("span", record.error, "history-error"));
       row.append(

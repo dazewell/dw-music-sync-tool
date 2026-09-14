@@ -299,4 +299,30 @@ describe("common sync baseline comparison", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("never recovers a running run through a plain reporting peek, only through read()", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "music-sync-peek-"));
+    try {
+      const filename = path.join(directory, "sync-state.json");
+      const owner = new SyncStateStore(filename);
+      await owner.update((state) => {
+        state.baselines["pair-1"] = { sourceFingerprint: "left", targetFingerprint: "right" };
+      });
+      const run = await owner.startRun("pair-1");
+
+      // A second process (e.g. a CLI report, or the dashboard) reading concurrently must
+      // not treat this owning process's in-flight run as interrupted and destroy its baseline.
+      const reporter = new SyncStateStore(filename);
+      const peeked = await reporter.peek();
+      expect(peeked.runs.find(item => item.id === run.id)?.status).toBe("running");
+      expect(peeked.baselines["pair-1"]).toEqual({ sourceFingerprint: "left", targetFingerprint: "right" });
+
+      // Only a path that actually holds exclusive access for the whole operation recovers it.
+      const recovered = await reporter.read();
+      expect(recovered.runs.find(item => item.id === run.id)?.status).toBe("review-required");
+      expect(recovered.baselines["pair-1"]).toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });

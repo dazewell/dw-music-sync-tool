@@ -51,27 +51,49 @@ export class SyncStateStore implements SyncRemovalAuditSink {
   private readonly activeRuns = new Set<string>();
   constructor(private readonly filename: string) {}
 
-  async read(): Promise<SyncState> {
+  /**
+   * Reads the durable state without recovering interrupted runs. `activeRuns`
+   * is only ever populated in the process that actually started a run, so a
+   * plain reporting read (a CLI report, `--removals`, or a dashboard GET) must
+   * never treat a run started by *another* process as interrupted - doing so
+   * would race that process's in-flight run, marking it review-required and
+   * destroying its baseline out from under it. Use this for any read that
+   * does not hold the runtime lock for the whole operation.
+   */
+  async peek(): Promise<SyncState> {
     try {
       const parsed = stateSchema.safeParse(JSON.parse(await fs.readFile(this.filename, "utf8")));
       if (!parsed.success) throw new Error("invalid schema");
-      const state = parsed.data;
-      let recovered = false;
-      for (const run of state.runs) {
-        if (this.activeRuns.has(run.id)) continue;
-        if (run.status !== "running" && run.status !== "interrupted") continue;
-        run.status = "review-required";
-        run.completedAt = new Date().toISOString();
-        run.message = "A previous synchronization run was interrupted; review and reconcile both playlists before retrying.";
-        delete state.baselines[run.pairId];
-        recovered = true;
-      }
-      if (recovered) await this.write(state);
-      return state;
+      return parsed.data;
     } catch (error) {
       if (error instanceof Error && "code" in error && error.code === "ENOENT") return emptyState();
       throw new AppError("SYNC_STATE_INVALID", "The sync state is invalid or unreadable; preserve it for inspection.", 500);
     }
+  }
+
+  /**
+   * Reads the durable state and recovers any run left `running`/`interrupted`
+   * that this process did not itself start, marking it `review-required` and
+   * dropping its baseline. Only call this from a path that already holds
+   * exclusive access to the state directory for the whole operation (a CLI
+   * management option or the long-lived web server process), so recovery
+   * never races another process's active run. Reporting-only paths must use
+   * `peek()` instead.
+   */
+  async read(): Promise<SyncState> {
+    const state = await this.peek();
+    let recovered = false;
+    for (const run of state.runs) {
+      if (this.activeRuns.has(run.id)) continue;
+      if (run.status !== "running" && run.status !== "interrupted") continue;
+      run.status = "review-required";
+      run.completedAt = new Date().toISOString();
+      run.message = "A previous synchronization run was interrupted; review and reconcile both playlists before retrying.";
+      delete state.baselines[run.pairId];
+      recovered = true;
+    }
+    if (recovered) await this.write(state);
+    return state;
   }
 
   async update(mutator: (state: SyncState) => void): Promise<SyncState> {

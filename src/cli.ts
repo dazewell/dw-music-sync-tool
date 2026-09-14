@@ -75,7 +75,9 @@ management option.
 function createSyncIntegration(config: AppConfig, providers: SyncExecutorProviders): SyncIntegration {
   const store = new SyncStateStore(path.join(config.dataDirectory, "sync-state.json"));
   return {
-    state: () => store.read(),
+    // A plain report never holds the runtime lock for the whole operation, so it
+    // must not recover runs it can't actually observe as active; peek() is read-only.
+    state: () => store.peek(),
     pair: (pairing) => store.pair(pairing),
     unpair: (id) => store.update((state) => {
       const index = state.pairs.findIndex((item) => item.id === id);

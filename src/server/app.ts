@@ -380,8 +380,8 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     if (direction !== undefined && direction !== "left-to-right" && direction !== "right-to-left") {
       throw new AppError("INVALID_SYNC_QUERY", "The optional direction must be left-to-right or right-to-left.", 400);
     }
-    if (outcome !== undefined && outcome !== "success" && outcome !== "failed") {
-      throw new AppError("INVALID_SYNC_QUERY", "The optional outcome must be success or failed.", 400);
+    if (outcome !== undefined && outcome !== "success" && outcome !== "failed" && outcome !== "unknown") {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional outcome must be success, failed, or unknown.", 400);
     }
     let parsedLimit: number | undefined;
     if (limit !== undefined) {
@@ -397,7 +397,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
         ...(playlistId === undefined ? {} : { playlistId: playlistId as string }),
         ...(itemIdentity === undefined ? {} : { itemIdentity: (itemIdentity as string).trim() }),
         ...(direction === undefined ? {} : { direction: direction as "left-to-right" | "right-to-left" }),
-        ...(outcome === undefined ? {} : { outcome: outcome as "success" | "failed" }),
+        ...(outcome === undefined ? {} : { outcome: outcome as "success" | "failed" | "unknown" }),
         ...(parsedLimit === undefined ? {} : { limit: parsedLimit }),
       }),
     });
