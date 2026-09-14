@@ -83,9 +83,11 @@ accounts cannot race over a shared output folder. Each `runtime.lock` is a
 directory containing a uniquely named JSON ownership marker. If a process
 crashes, inspect those markers in both locations (including the `demo`
 subdirectories in demo mode), verify the recorded PID is no longer running,
-then remove **only that marker and its empty lock directory**. Older versions
-used a regular `runtime.lock` file; it remains blocking until the same PID check
-and explicit removal. Stop older versions before upgrading or starting the new
+then remove **only that marker and its empty lock directory**. Windows first
+claims `runtime.lock` with exclusive file creation, then replaces its own claim
+with the prepared directory; a racing legacy process cannot claim that name.
+A regular lock file from an older version or interrupted Windows acquisition
+remains blocking until the same PID check and explicit removal. Stop older versions before upgrading or starting the new
 version; never remove or modify a live process's lock. Unpublished
 `.runtime-lock-<nonce>` staging directories can remain after a crash but do not
 hold a lock; use the same marker/PID checks before removing them.
@@ -114,12 +116,14 @@ inventory request is not treated as an empty account. An empty playlist is a val
 export. Interrupted runs remain distinguishable from completed runs. Files are
 written atomically; an unwritable destination is reported rather than hidden.
 Startup removes positively owned empty runs that crashed before their first
-manifest. Export intent journals record exact output and staging paths, sizes and
-hashes before publication, so validated uncheckpointed files can expire safely
+manifest. Export intent journals record exact output and staging paths, sizes,
+hashes and original filesystem identities before publication, so validated uncheckpointed files can expire safely
 without being advertised as completed exports. Unrecognized or changed leftovers
 are preserved with an inspection error rather than guessed to be safe to delete.
-Completed results retain each export's original byte count and SHA-256 hash in
-the manifest, allowing cleanup to detect replacement files even at a known name.
+Completed results retain each export's original byte count, SHA-256 hash and
+filesystem generation (device, inode and creation time) in the manifest. Cleanup
+checks this persisted evidence instead of adopting a newly observed file, even
+if a replacement has identical bytes.
 After an interrupted publication, a journaled export and its staging name are
 reconciled only when they are the same file with exactly two links and matching
 recorded bytes. Unknown metadata staging files remain protected for inspection.
@@ -180,7 +184,7 @@ An interrupted credential save is recovered from a single intact pending file
 before authorization is used. Pending files are checked for the exact generated
 name, token shape, read-only scope, ordinary-file ownership and changes during
 inspection. New saves record the original destination identity (or its absence);
-publication and recovery refuse a destination that no longer matches. Failed
+publication and recovery refuse a mismatch detected during validation. Failed
 publication preserves the pending credentials rather than discarding a rotated
 refresh token. Ambiguous, partial, legacy unbound or unsafe leftovers require
 inspection instead of being silently accepted or deleted. A legacy pending file
@@ -192,12 +196,23 @@ three times (25/50/100 ms), rechecking file identities before each attempt.
 Persistent sharing or permission failures remain errors; the app never deletes
 the destination first as a replacement workaround.
 
+**Single-writer safety boundary:** while the app runs, only this app may modify
+its token files, run metadata, exports and runtime locks. Do not let another
+editor, sync client or script write these paths; edit downloaded copies instead,
+and stop the app before manually repairing its managed files. Runtime locks
+coordinate cooperating app instances, not unrelated programs. Atomic rename
+prevents partially written replacements, but it is **not compare-and-swap**:
+identity checks cannot prevent an outside writer changing a path between the
+check and rename or deletion. Concurrent external writes are unsupported, not
+guaranteed safe. The documented Desktop OAuth client-file recheck is separate
+from editing the app-managed token file.
+
 Disconnect revokes/removes authorization. Review any reported revocation failure
 and revoke access in your [Google account](https://myaccount.google.com/permissions)
 if necessary. Disconnect also revokes/removes validated pending credentials,
 even when the main token file was never published or cannot be safely read.
 An invalid or undeletable file does not prevent processing other validated
-credentials. Unreadable/replaced files are preserved, and all partial cleanup or
+credentials. Files detected as unreadable or replaced are preserved, and all partial cleanup or
 revocation failures remain explicit. Disconnect does not itself remove exports. Google's revocation and
 user-deletion requirements are separate from routine 30-day retention: remove
 app-managed exports and any user-created copies when those requirements apply.
@@ -215,13 +230,17 @@ There is no express local-personal-export exception. In this application:
 - Cleanup runs on startup, before a backup, and once per minute while the app is
   running. New snapshots do not reset old snapshots' deadlines.
 - Only positively marked, expired, inactive run directories with valid manifests
-  and original export-integrity evidence are eligible. Cleanup verifies content
+  and original export-integrity and filesystem-generation evidence are eligible. Cleanup verifies content
   before deleting any exports and rechecks files during deletion. It removes known files individually;
   unrelated files, unmarked folders, symlinks and unexpected content are preserved.
-- **Earlier backups without original integrity records remain readable but
-  require manual cleanup at expiry.** The app will not trust freshly calculated
-  hashes as proof that existing files are still its original exports. These runs
+- **Earlier backups without original integrity or generation records remain
+  readable but require manual cleanup at expiry.** Hash-only records are not
+  ownership proof, and current files are never adopted as the originals. These runs
   produce a cleanup warning and require inspection/removal before another backup.
+- Copying or recreating an export changes its filesystem generation, even with
+  identical content. Such files are not automatically deleted or adopted;
+  app-managed validation requires inspection. The export formats themselves
+  remain portable, but automatic cleanup requires verifiable original files.
 - Cleanup errors are visible, expired exports are not offered for download, and
   starting another backup is blocked until cleanup problems are resolved.
 - An active run's initialization is tracked before its directory is published,

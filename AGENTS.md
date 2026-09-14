@@ -15,6 +15,10 @@
   preflight checks and both runtime locks. Never delete unrelated user files.
 - Do not request write scopes or implement remote mutations without confirming
   the intended sync direction, deletion policy and ambiguous-match behavior.
+- This release is single-writer: runtime locks coordinate app instances, not
+  third-party filesystem writers. Keep identity checks and conservative ownership
+  handling, but do not describe check-then-rename/unlink as compare-and-swap.
+  External writes to app-managed paths while it runs are unsupported.
 
 ## Credentials and local data
 

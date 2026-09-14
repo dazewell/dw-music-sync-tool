@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { AppError, errorMessage } from "./errors.js";
-import type { BackupManifest, BackupPlaylistResult, ExportIntegrity } from "./models.js";
+import type { BackupManifest, BackupPlaylistResult, ExportFileIdentity, ExportIntegrity } from "./models.js";
 import { replaceFile } from "./replace-file.js";
 
 const runIdPattern = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -43,9 +43,15 @@ const filesSchema = z.strictObject({
   && files.json.slice(0, -5) === files.m3u.slice(0, -5)
   && files.json !== "manifest.json", "Export basenames must match");
 
+const fileIdentitySchema = z.strictObject({
+  dev: z.string().max(32).regex(/^(0|[1-9]\d*)$/),
+  ino: z.string().max(32).regex(/^[1-9]\d*$/),
+  birthtimeNs: z.string().max(32).regex(/^[1-9]\d*$/),
+});
 const exportIntegritySchema = z.strictObject({
   size: countSchema,
   sha256: fingerprintSchema,
+  identity: fileIdentitySchema.optional(),
 });
 const resultSchema = z.strictObject({
   playlistId: z.string(),
@@ -89,7 +95,7 @@ const manifestSchema = z.strictObject({
   error: z.string().nullable(),
 }).superRefine((manifest, context) => {
   const completed = manifest.playlists.filter(item => item.status === "complete");
-  const files = completed.flatMap(item => Object.values(item.files!));
+  const files = completed.flatMap(item => Object.values(item.files ?? {}));
   if (manifest.totals.completed !== completed.length
     || manifest.totals.failed !== manifest.playlists.length - completed.length
     || manifest.totals.entries !== completed.reduce((total, item) => total + item.entries, 0)
@@ -124,6 +130,28 @@ const pendingSchema = z.strictObject({
 
 function digest(contents: string | Buffer): string {
   return createHash("sha256").update(contents).digest("hex");
+}
+
+function fileIdentity(info: BigIntStats): ExportFileIdentity {
+  const parsed = fileIdentitySchema.safeParse({
+    dev: info.dev.toString(), ino: info.ino.toString(), birthtimeNs: info.birthtimeNs.toString(),
+  });
+  if (!parsed.success) throw recoveryError("The filesystem does not provide a usable original file generation");
+  return parsed.data;
+}
+
+function exportProof(output: ExportIntegrity): ExportIntegrity {
+  return {
+    size: output.size, sha256: output.sha256,
+    ...(output.identity ? { identity: output.identity } : {}),
+  };
+}
+
+async function assertFileGeneration(directory: string, name: string, expected: ExportFileIdentity): Promise<void> {
+  const current = await fs.lstat(path.join(directory, name), { bigint: true });
+  if (!isDeepStrictEqual(fileIdentity(current), expected)) {
+    throw recoveryError(`Export "${name}" no longer has its recorded original file identity`);
+  }
 }
 
 function recoveryError(message: string): AppError {
@@ -178,9 +206,10 @@ export interface PendingExports {
   present: Map<string, Stats>;
   integrity: Map<string, ExportIntegrity>;
   linkedStages: Map<string, string>;
+  emptyStages: Set<string>;
 }
 
-/** Verify original bytes, rejecting replacement content and links; missing files permit safe deletion retries. */
+/** Verify original generations and bytes; missing files permit safe deletion retries. */
 export async function verifyExportIntegrity(
   directory: string, name: string, expected: ExportIntegrity,
 ): Promise<Stats | null> {
@@ -189,6 +218,7 @@ export async function verifyExportIntegrity(
 
 async function verifyExport(
   directory: string, name: string, expected: ExportIntegrity, pairedName?: string,
+  emptyStage = false,
 ): Promise<Stats | null> {
   let before: Stats;
   try {
@@ -197,6 +227,11 @@ async function verifyExport(
     if (error instanceof AppError && error.code === "BACKUP_NOT_FOUND") return null;
     throw error;
   }
+  if (!expected.identity) {
+    throw recoveryError(`Export "${name}" has no original file identity evidence; manual inspection is required`);
+  }
+  await assertFileGeneration(directory, name, expected.identity);
+  if (emptyStage && before.size === 0) return before;
   if (before.size !== expected.size) throw recoveryError(`Export "${name}" has changed from its recorded size`);
   const handle = await fs.open(path.join(directory, name), constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
@@ -212,6 +247,7 @@ async function verifyExport(
   if (!sameFile(before, await ordinaryFile(directory, name, pairedName))) {
     throw recoveryError(`Export "${name}" was replaced while its contents were being verified`);
   }
+  await assertFileGeneration(directory, name, expected.identity);
   return before;
 }
 
@@ -253,13 +289,14 @@ export async function readPendingExports(directory: string, manifest: BackupMani
     || names.some(name => protectedNames.includes(name.toLowerCase()))
     || intent.outputs.some((output, index) => output.file !== expectedFiles[index]
       || (expectedIntegrity && !isDeepStrictEqual(
-        expectedIntegrity[index], { size: output.size, sha256: output.sha256 },
+        expectedIntegrity[index], exportProof(output),
       )))) {
     throw recoveryError("The pending export intent does not match its manifest");
   }
   const present = new Map<string, Stats>();
   const integrity = new Map<string, ExportIntegrity>();
   const linkedStages = new Map<string, string>();
+  const emptyStages = new Set<string>();
   for (const output of [...intent.outputs, intent.manifestWrite]) {
     const candidates = output.file === "manifest.json" ? [output.temporary] : [output.file, output.temporary];
     let paired = false;
@@ -277,13 +314,24 @@ export async function readPendingExports(directory: string, manifest: BackupMani
       if (paired) linkedStages.set(output.temporary, output.file);
     }
     for (const name of candidates) {
-      integrity.set(name, { size: output.size, sha256: output.sha256 });
+      integrity.set(name, exportProof(output));
       const partner = paired ? name === output.file ? output.temporary : output.file : undefined;
-      const info = await verifyExport(directory, name, output, partner);
-      if (info) present.set(name, info);
+      const info = await verifyExport(directory, name, output, partner, name === output.temporary && !paired);
+      if (info) {
+        present.set(name, info);
+        if (name === output.temporary && info.size === 0) emptyStages.add(name);
+      }
     }
   }
-  return { text, files: names, present, integrity, linkedStages };
+  return { text, files: names, present, integrity, linkedStages, emptyStages };
+}
+
+export async function verifyPendingFile(directory: string, name: string, pending: PendingExports): Promise<Stats | null> {
+  const partner = pending.linkedStages.get(name)
+    ?? [...pending.linkedStages].find(([, file]) => file === name)?.[0];
+  const proof = pending.integrity.get(name);
+  if (!proof) throw recoveryError("The file has no pending export evidence");
+  return verifyExport(directory, name, proof, partner, pending.emptyStages.has(name));
 }
 
 /** Link exceptions are restricted to pairs already validated against a durable export intent. */
@@ -361,41 +409,69 @@ export async function publishPlaylistExports(
 ): Promise<BackupPlaylistResult> {
   const outputs = writes.map(([file, text]) => ({
     file, temporary: `.write-${randomUUID()}.tmp`, size: Buffer.byteLength(text), sha256: digest(text),
+    identity: undefined as ExportFileIdentity | undefined,
   }));
-  const proof = (index: number): ExportIntegrity => ({
-    size: outputs[index]!.size, sha256: outputs[index]!.sha256,
-  });
-  const completed: BackupPlaylistResult = {
-    ...result,
-    integrity: { json: proof(0), csv: proof(1), m3u: proof(2) },
-  };
-  const checkpoint = manifestText({
-    ...manifest,
-    playlists: [...manifest.playlists, completed],
-    totals: {
-      ...manifest.totals,
-      completed: manifest.totals.completed + 1,
-      entries: manifest.totals.entries + result.entries,
-    },
-  });
   const manifestWrite = {
     file: "manifest.json", temporary: `.write-${randomUUID()}.tmp`,
-    size: Buffer.byteLength(checkpoint), sha256: digest(checkpoint),
+    size: 0, sha256: "", identity: undefined as ExportFileIdentity | undefined,
   };
-  const intent = pendingSchema.parse({
-    app: BACKUP_OWNER_APP, schemaVersion: 1, id: manifest.id, createdAt: manifest.startedAt,
-    index: manifest.playlists.length, totalPlaylists: manifest.totals.playlists,
-    checkpoint: checkpointDigest(manifest, manifest.playlists.length), result: completed, outputs, manifestWrite,
-  });
   const existing = new Set((await fs.readdir(directory)).map(name => name.toLowerCase()));
   if ([BACKUP_PENDING_FILENAME, ...outputs.flatMap(output => [output.file, output.temporary]), manifestWrite.temporary]
     .some(name => existing.has(name.toLowerCase()))) {
     throw recoveryError("A playlist output or pending intent already exists");
   }
-  await atomicWrite(directory, BACKUP_PENDING_FILENAME, `${JSON.stringify(intent, null, 2)}\n`);
+  const prepared = new Map<string, ExportFileIdentity>();
+  let completed: BackupPlaylistResult;
+  try {
+    // Reserve generations with exclusive creation; never infer them from an existing path after a restart.
+    for (const output of [...outputs, manifestWrite]) {
+      const handle = await fs.open(path.join(directory, output.temporary), "wx", 0o600);
+      try {
+        await handle.sync();
+        output.identity = fileIdentity(await handle.stat({ bigint: true }));
+        prepared.set(output.temporary, output.identity);
+      } finally {
+        await handle.close();
+      }
+    }
+    completed = {
+      ...result,
+      integrity: { json: exportProof(outputs[0]!), csv: exportProof(outputs[1]!), m3u: exportProof(outputs[2]!) },
+    };
+    const checkpoint = manifestText({
+      ...manifest, playlists: [...manifest.playlists, completed],
+      totals: {
+        ...manifest.totals,
+        completed: manifest.totals.completed + 1,
+        entries: manifest.totals.entries + result.entries,
+      },
+    });
+    manifestWrite.size = Buffer.byteLength(checkpoint);
+    manifestWrite.sha256 = digest(checkpoint);
+    const intent = pendingSchema.parse({
+      app: BACKUP_OWNER_APP, schemaVersion: 1, id: manifest.id, createdAt: manifest.startedAt,
+      index: manifest.playlists.length, totalPlaylists: manifest.totals.playlists,
+      checkpoint: checkpointDigest(manifest, manifest.playlists.length), result: completed, outputs, manifestWrite,
+    });
+    await atomicWrite(directory, BACKUP_PENDING_FILENAME, `${JSON.stringify(intent, null, 2)}\n`);
+  } catch (error) {
+    try {
+      for (const [name, identity] of prepared) {
+        await assertFileGeneration(directory, name, identity);
+        if ((await ordinaryFile(directory, name)).size !== 0) {
+          throw recoveryError("A prepared staging file is no longer empty");
+        }
+        await fs.unlink(path.join(directory, name));
+      }
+    } catch (cleanupError) {
+      throw new AppError("BACKUP_STORAGE_ERROR",
+        `${errorMessage(error)} Prepared-stage cleanup also failed: ${errorMessage(cleanupError)}`, 500);
+    }
+    throw error;
+  }
   try {
     for (const [index, [file, text]] of writes.entries()) {
-      await atomicWrite(directory, file, text, outputs[index]!.temporary);
+      await atomicWrite(directory, file, text, outputs[index]!.temporary, false, outputs[index]!.identity);
     }
   } catch (error) {
     try {
@@ -588,6 +664,15 @@ export async function recoverInterruptedBackups(backupDirectory: string): Promis
       if (intent) await inspectPendingFile(directory, name, intent);
       else await ordinaryFile(directory, name);
     }
+    for (const item of manifest.playlists) {
+      if (!item.files) continue;
+      for (const format of ["json", "csv", "m3u"] as const) {
+        const proof = item.integrity?.[format];
+        if (proof?.identity && !intent?.integrity.has(item.files[format])) {
+          await verifyExportIntegrity(directory, item.files[format], proof);
+        }
+      }
+    }
     if (intent && intent.linkedStages.size > 0) linked.push({ directory, manifest, intent });
     if (manifest.status === "running") pending.push({ directory, manifest, text });
   }
@@ -658,7 +743,16 @@ export async function resolveBackupFile(backupDirectory: string, id: string, fil
   if (!allowed) {
     throw new AppError("BACKUP_FILE_NOT_FOUND", "The file is not part of this backup.", 404);
   }
-  return safeChild(await runDirectory(backupDirectory, id), file);
+  const directory = await runDirectory(backupDirectory, id);
+  const filename = await safeChild(directory, file);
+  for (const item of manifest.playlists) {
+    if (!item.files) continue;
+    for (const format of ["json", "csv", "m3u"] as const) {
+      const proof = item.integrity?.[format];
+      if (item.files[format] === file && proof?.identity) await verifyExportIntegrity(directory, file, proof);
+    }
+  }
+  return filename;
 }
 
 async function replacementFile(directory: string, name: string): Promise<BigIntStats | null> {
@@ -685,6 +779,7 @@ function sameReplacementFile(before: BigIntStats | null, after: BigIntStats | nu
 /** New files require atomic hard-link publication; only explicit replacements may use rename. */
 export async function atomicWrite(
   directory: string, file: string, contents: string, stagingName?: string, replace = false,
+  preparedIdentity?: ExportFileIdentity,
 ): Promise<void> {
   if (!isBasename(file)) {
     throw new AppError("INVALID_BACKUP_FILE", "Invalid backup output basename.", 400);
@@ -700,12 +795,26 @@ export async function atomicWrite(
   let owned = false;
   let preserveStage = false;
   try {
-    const handle = await fs.open(temporary, "wx", 0o600);
-    owned = true;
+    if (preparedIdentity) {
+      const before = await replacementFile(directory, stage);
+      if (!before || before.size !== 0n || !isDeepStrictEqual(fileIdentity(before), preparedIdentity)) {
+        throw recoveryError("The prepared staging file is not the original empty generation");
+      }
+    }
+    const handle = await fs.open(temporary, preparedIdentity
+      ? constants.O_RDWR | (constants.O_NOFOLLOW ?? 0) : "wx", 0o600);
     try {
+      if (preparedIdentity) {
+        const before = await handle.stat({ bigint: true });
+        if (!before.isFile() || before.nlink !== 1n || before.size !== 0n
+          || !isDeepStrictEqual(fileIdentity(before), preparedIdentity)) {
+          throw recoveryError("The prepared staging file is not the original empty generation");
+        }
+      }
+      owned = true;
       await handle.writeFile(contents, "utf8");
       await handle.sync();
-      if (replace) stagedIdentity = await handle.stat({ bigint: true });
+      if (replace || preparedIdentity) stagedIdentity = await handle.stat({ bigint: true });
     } finally {
       await handle.close();
     }
@@ -826,14 +935,17 @@ function manifestText(manifest: BackupManifest): string {
 export async function checkpointManifest(directory: string, manifest: BackupManifest): Promise<void> {
   const text = manifestText(manifest);
   let stagingName: string | undefined;
+  let preparedIdentity: ExportFileIdentity | undefined;
   try {
-    const intent = pendingSchema.parse(JSON.parse(await checkedText(directory, BACKUP_PENDING_FILENAME, 1_024 * 1_024)));
+    const intentText = await checkedText(directory, BACKUP_PENDING_FILENAME, 1_024 * 1_024);
+    const intent = pendingSchema.parse(JSON.parse(intentText));
     if (intent.id === manifest.id && intent.manifestWrite.sha256 === digest(text)
       && intent.manifestWrite.size === Buffer.byteLength(text)) {
       stagingName = intent.manifestWrite.temporary;
+      preparedIdentity = intent.manifestWrite.identity;
     }
   } catch (error) {
     if (!(error instanceof AppError && error.code === "BACKUP_NOT_FOUND")) throw error;
   }
-  await atomicWrite(directory, "manifest.json", text, stagingName, true);
+  await atomicWrite(directory, "manifest.json", text, stagingName, true, preparedIdentity);
 }

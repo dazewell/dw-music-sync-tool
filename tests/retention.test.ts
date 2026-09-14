@@ -297,7 +297,7 @@ describe("original integrity evidence for completed exports", () => {
       const unlink = vi.spyOn(fs, "unlink");
       const result = await pruneExpiredBackups(root, expiry);
       expect(result.deleted).toEqual([]);
-      expect(result.warnings.join(" ")).toContain("recorded contents");
+      expect(result.warnings.join(" ")).toContain("recorded original file identity");
       expect(unlink).not.toHaveBeenCalled();
       expect(await runContents(manifest)).toEqual(contents);
       expect(await fs.readFile(filename)).toEqual(replacement);
@@ -455,7 +455,7 @@ describe("original integrity evidence for completed exports", () => {
     await fs.writeFile(runPath(manifest, files.json), Buffer.alloc(original.length, "u"));
     const before = await runContents(manifest);
     const retryUnlink = vi.spyOn(fs, "unlink");
-    expect((await pruneExpiredBackups(root, expiry)).warnings.join(" ")).toContain("recorded contents");
+    expect((await pruneExpiredBackups(root, expiry)).warnings.join(" ")).toContain("recorded original file identity");
     expect(retryUnlink).not.toHaveBeenCalled();
     expect(await runContents(manifest)).toEqual(before);
   });

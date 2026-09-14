@@ -6,7 +6,7 @@ import { acquireRuntimeLock } from "../src/runtime-lock.js";
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
-  return { ...actual, unlink: vi.fn(actual.unlink), rmdir: vi.fn(actual.rmdir), rename: vi.fn(actual.rename) };
+  return { ...actual, unlink: vi.fn(actual.unlink), rmdir: vi.fn(actual.rmdir), rename: vi.fn(actual.rename), open: vi.fn(actual.open) };
 });
 const nativeFs = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
 
@@ -77,12 +77,24 @@ describe("runtime lock ownership", () => {
     const gate = new Promise<void>(resolve => { unblock = resolve; });
     let prepared!: () => void;
     const ready = new Promise<void>(resolve => { prepared = resolve; });
-    vi.mocked(fs.rename).mockImplementationOnce(async (source, destination) => {
-      expect(await fs.readdir(source)).toHaveLength(1);
-      prepared();
-      await gate;
-      await originalRename(source, destination);
-    });
+    if (process.platform === "win32") {
+      let delayed = false;
+      vi.mocked(fs.open).mockImplementation(async (...args) => {
+        if (args[0] === lock && !delayed) {
+          delayed = true;
+          prepared();
+          await gate;
+        }
+        return nativeFs.open(...args);
+      });
+    } else {
+      vi.mocked(fs.rename).mockImplementationOnce(async (source, destination) => {
+        expect(await fs.readdir(source)).toHaveLength(1);
+        prepared();
+        await gate;
+        await originalRename(source, destination);
+      });
+    }
     const delayed = acquireRuntimeLock(directory);
     await ready;
     const winner = await acquireRuntimeLock(directory);
@@ -106,5 +118,60 @@ describe("runtime lock ownership", () => {
     await expect(acquireRuntimeLock(directory)).rejects.toMatchObject({ code: "APP_ALREADY_RUNNING" });
     expect(await fs.readFile(lock, "utf8")).toBe(legacy);
     expect(await fs.readdir(directory)).toEqual(["runtime.lock"]);
+  });
+
+  it("preserves an existing empty lock directory instead of adopting it", async () => {
+    await fs.mkdir(lock);
+    const identity = await fs.lstat(lock, { bigint: true });
+    await expect(acquireRuntimeLock(directory)).rejects.toMatchObject({ code: "APP_ALREADY_RUNNING" });
+    expect((await fs.lstat(lock, { bigint: true })).ino).toBe(identity.ino);
+    expect(await fs.readdir(lock)).toEqual([]);
+    expect(await fs.readdir(directory)).toEqual(["runtime.lock"]);
+  });
+
+  it("excludes a racing legacy acquisition at the directory-publication boundary", async () => {
+    const legacy = JSON.stringify({ pid: process.pid, nonce: "legacy-racer" });
+    let legacyAcquired = false;
+    vi.mocked(fs.rename).mockImplementationOnce(async (source, destination) => {
+      try {
+        await nativeFs.writeFile(lock, legacy, { flag: "wx" });
+        legacyAcquired = true;
+      } catch (error) {
+        expect(error).toMatchObject({ code: "EEXIST" });
+      }
+      await nativeFs.rename(source, destination);
+    });
+    const acquisition = acquireRuntimeLock(directory);
+    if (process.platform === "win32") {
+      const release = await acquisition;
+      expect(legacyAcquired).toBe(false);
+      await release();
+      expect(await fs.readdir(directory)).toEqual([]);
+    } else {
+      await expect(acquisition).rejects.toMatchObject({ code: "APP_ALREADY_RUNNING" });
+      expect(legacyAcquired).toBe(true);
+      expect(await fs.readFile(lock, "utf8")).toBe(legacy);
+    }
+  });
+
+  it("cleans its own reservation and staging after failed publication", async () => {
+    vi.mocked(fs.rename).mockRejectedValueOnce(Object.assign(new Error("synthetic publication failure"), { code: "ENOSPC" }));
+    await expect(acquireRuntimeLock(directory)).rejects.toThrow("synthetic publication failure");
+    expect(await fs.readdir(directory)).toEqual([]);
+  });
+
+  it("grants exactly one lease to simultaneous contenders", async () => {
+    const outcomes = await Promise.allSettled(Array.from({ length: 8 }, () => acquireRuntimeLock(directory)));
+    const winners = outcomes.flatMap(outcome => outcome.status === "fulfilled" ? [outcome.value] : []);
+    try {
+      expect(winners).toHaveLength(1);
+      for (const outcome of outcomes) {
+        if (outcome.status === "rejected") expect(outcome.reason).toMatchObject({ code: "APP_ALREADY_RUNNING" });
+      }
+      expect(await fs.readdir(directory)).toEqual(["runtime.lock"]);
+    } finally {
+      await Promise.all(winners.map(release => release()));
+    }
+    expect(await fs.readdir(directory)).toEqual([]);
   });
 });

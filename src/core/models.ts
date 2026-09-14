@@ -44,9 +44,17 @@ export interface PlaylistArchive extends PlaylistContents {
   fingerprint: string;
 }
 
+export interface ExportFileIdentity {
+  dev: string;
+  ino: string;
+  birthtimeNs: string;
+}
+
 export interface ExportIntegrity {
   size: number;
   sha256: string;
+  /** Original file generation, not a claim about copies or recreated files. */
+  identity?: ExportFileIdentity | undefined;
 }
 
 export interface BackupPlaylistResult {

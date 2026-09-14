@@ -49,8 +49,8 @@ multiple or unprovable intents require explicit inspection rather than guessing
 their order. Token files carry the last save's versioned `_saveIntent` metadata,
 binding a pending save to its destination basename and original bigint file
 identity, including an explicitly missing destination. Publication and recovery
-recheck that evidence; a changed destination or legacy unbound intent cannot be
-silently adopted. Failed publication preserves the pending save for retry or
+recheck that evidence and reject observed mismatches or legacy unbound intents.
+Failed publication preserves the pending save for retry or
 inspection. Disconnect processes independently validated files even when another
 credential path is invalid or cleanup fails, then reports combined local/remote
 failures without claiming that unreadable credentials were revoked.
@@ -62,6 +62,14 @@ persistence; an omitted refresh scope inherits only the validated stored scope.
 Credential and manifest replacement share bounded Windows sharing-conflict
 retries (25/50/100 ms). Staging and destination identities are revalidated before
 every attempt. Permanent failures propagate without a delete-first fallback.
+These checks are not an atomic compare-and-swap. The supported contract is a
+single writer holding the application runtime locks; third-party writes to
+tokens, manifests, exports or lock paths while the app runs are unsupported.
+The locks coordinate cooperating application instances, not arbitrary filesystem
+writers. Preflight checks detect observed changes but cannot prevent an external
+replacement between validation and rename/unlink. Strong concurrent-external-
+writer support would require a different publication/storage protocol; it is not
+claimed by this release. Low-level storage helpers rely on that caller contract.
 
 `src/core/backup.ts` and storage helpers own run lifecycle, portable filenames,
 atomic writes, export formats and history. JSON is the authoritative archive;
@@ -89,7 +97,12 @@ Shutdown first closes HTTP admission and drains requests, then waits for detache
 backup/reservation work before stopping retention and releasing the locks.
 Repeated signals share that shutdown; active work is not forcibly terminated,
 and cleanup failures are reported rather than releasing locks prematurely.
-Locks atomically publish a prepopulated directory with a nonce-specific marker.
+Locks publish a prepopulated directory with a nonce-specific marker. On Windows,
+exclusive file creation first reserves the shared name against legacy file-lock
+creators; publication replaces only that verified reservation. POSIX directory
+rename cannot overwrite a regular-file legacy lease. Failed Windows acquisition
+cleans its own verified reservation, or reports it for inspection if ownership
+cannot be established.
 Release removes only that lease's unique marker and then attempts an atomic
 empty-directory removal, so a stale release cannot unlink a successor's marker.
 Concurrent/repeated release calls share one promise. Legacy regular lock files
@@ -103,13 +116,19 @@ manually remove a live lock.
 - Preserve duplicates, ordering and inaccessible-entry indicators.
 - Persist an export intent before publishing files, write atomically, checkpoint
   per-playlist results, then finalize status. The intent binds the checkpoint,
-  output/staging paths, byte counts and content hashes. Recovery removes only
+  output/staging paths, byte counts, content hashes and original file generations. Recovery removes only
   verified owner-only empty runs; uncheckpointed outputs with validated intents
   remain unavailable for download but eligible for normal expiry. Unknown,
   changed or unprovable leftovers remain protected and produce an explicit error.
   Manifest v1 adds optional `playlists[].integrity.{json,csv,m3u}` records containing
-  original `{size, sha256}` values. New completed exports retain these values
-  before their pending intent is removed; failed and legacy results omit them.
+  original `{size, sha256, identity}` values. `identity` contains bigint decimal
+  strings `{dev, ino, birthtimeNs}`, captured from exclusively created staging
+  files before journal publication rather than inferred from later contents.
+  These generation fields survive hard-link publication; ctime is deliberately
+  not used as the durable generation because linking/unlinking changes it.
+  New completed exports retain this evidence before removing their pending
+  intent. The identity field is optional for reading older schemas, not permission
+  to infer missing ownership evidence for automatic cleanup.
   New files use atomic hard-link publication from flushed staging files; rename
   is reserved for explicit checkpoint replacement. Filesystems without hard-link
   support fail explicitly. A journaled output/stage pair is recoverable only with
@@ -132,9 +151,10 @@ manually remove a live lock.
   Persistent per-run ownership markers and validated manifests gate deletion.
   `src/core/retention.ts` preflights managed files and removes only recognized,
   expired, inactive runs without following links or recursively deleting content.
-  Original manifest/journal hashes protect against same-name replacements; missing
+  Original manifest/journal hashes and file generations detect same-name and
+  same-byte replacements within the single-writer contract; missing
   files allow retry of partial deletion, but reappearing or changed files stop it.
-  Legacy manifests remain readable, but exports without original integrity proof
+  Legacy manifests remain readable, but exports without original integrity and generation proof
   are preserved with a cleanup warning and require manual resolution. Existing
   contents are never silently hashed and adopted as ownership evidence.
   `src/services/retention.ts` shares startup/minute cleanup between server and CLI.

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { runBackup } from "../src/core/backup.js";
+import * as storage from "../src/core/storage.js";
 import type { PlaylistProvider } from "../src/core/models.js";
 import { pruneExpiredBackups } from "../src/core/retention.js";
 import {
@@ -12,6 +13,9 @@ import {
 
 vi.mock("node:fs/promises", async importOriginal => ({
   ...await importOriginal<typeof import("node:fs/promises")>(),
+}));
+vi.mock("../src/core/storage.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../src/core/storage.js")>(),
 }));
 
 const startedAt = "2026-01-01T00:00:00.000Z";
@@ -47,30 +51,31 @@ type Boundary = "owner" | "owner-linked" | "initial-manifest-stage" | "intent-st
   | "json-stage" | "json" | "json-linked" | "csv-stage" | "csv" | "csv-linked" | "m3u-stage" | "full" | "m3u-linked"
   | "checkpoint-stage" | "checkpoint" | "cleanup";
 
-/** Copy the actual durable bytes at a write boundary, without a real process crash. */
+/** Suspend the writer at a crash boundary without copying files or rewriting original identity evidence. */
 async function snapshot(boundary: Boundary, playlistCount = 1): Promise<string> {
   let id: string | undefined;
   let captures = 0;
   const link = fs.link;
+  let run: storage.BackupRun | undefined;
+  let resolveStopped!: (id: string) => void;
+  let rejectStopped!: (error: unknown) => void;
+  const stopped = new Promise<string>((resolve, reject) => {
+    resolveStopped = resolve;
+    rejectStopped = reject;
+  });
   const capture = async (directory: string) => {
     if (id || ++captures !== playlistCount) return;
     id = path.basename(directory);
-    const destination = path.join(root, id);
-    await fs.mkdir(destination);
-    const identities = new Map<string, string>();
-    for (const name of await fs.readdir(directory)) {
-      const source = path.join(directory, name);
-      const target = path.join(destination, name);
-      const info = await fs.lstat(source, { bigint: true });
-      const key = `${info.dev}:${info.ino}`;
-      const prior = identities.get(key);
-      if (prior) await link(prior, target);
-      else {
-        await fs.copyFile(source, target);
-        identities.set(key, target);
-      }
-    }
+    if (!run) throw new Error("The fixture has no active run lease");
+    await run.release();
+    resolveStopped(id);
+    await new Promise<void>(() => {});
   };
+  const createRun = storage.createBackupRun;
+  const createSpy = vi.spyOn(storage, "createBackupRun").mockImplementation(async directory => {
+    run = await createRun(directory);
+    return run;
+  });
   const rename = fs.rename;
   const stages = new Map<string, { directory: string; boundary: Boundary | undefined }>();
   const publish = async (
@@ -96,7 +101,11 @@ async function snapshot(boundary: Boundary, playlistCount = 1): Promise<string> 
       expect(output.size).toBe(text.length);
       expect(output.sha256).toBe(createHash("sha256").update(text).digest("hex"));
       const format = file.endsWith(".json") ? "json" : file.endsWith(".csv") ? "csv" : "m3u";
-      expect(intent.result.integrity[format]).toEqual({ size: output.size, sha256: output.sha256 });
+      const info = await fs.stat(source, { bigint: true });
+      expect(intent.result.integrity[format]).toEqual({
+        size: output.size, sha256: output.sha256,
+        identity: { dev: info.dev.toString(), ino: info.ino.toString(), birthtimeNs: info.birthtimeNs.toString() },
+      });
       if (file.endsWith(".json")) { before = "json-stage"; after = "json"; linked = "json-linked"; }
       if (file.endsWith(".csv")) { before = "csv-stage"; after = "csv"; linked = "csv-linked"; }
       if (file.endsWith(".m3u8")) { before = "m3u-stage"; after = "full"; linked = "m3u-linked"; }
@@ -116,18 +125,23 @@ async function snapshot(boundary: Boundary, playlistCount = 1): Promise<string> 
     } else {
       await link(source, destination);
       stages.set(String(source), { directory, boundary: after });
-      if (linked === boundary) await capture(directory);
+      if (linked === boundary && boundary !== "owner-linked" && boundary !== "intent-linked") await capture(directory);
     }
   };
   const renameSpy = vi.spyOn(fs, "rename").mockImplementation((source, destination) => publish(source, destination, true));
   const linkSpy = vi.spyOn(fs, "link").mockImplementation((source, destination) => publish(source, destination, false));
   const unlink = fs.unlink;
   const unlinkSpy = vi.spyOn(fs, "unlink").mockImplementation(async filename => {
-    await unlink(filename);
     const stage = stages.get(String(filename));
+    if (stage && ((boundary === "owner-linked" && stage.boundary === "owner")
+      || (boundary === "intent-linked" && stage.boundary === "intent"))) {
+      id = path.basename(stage.directory);
+      throw new Error("Synthetic metadata publication stop");
+    }
+    await unlink(filename);
     if (stage) {
       stages.delete(String(filename));
-      if (stage.boundary === boundary) await capture(stage.directory);
+      if (stage.boundary === boundary && boundary !== "owner") await capture(stage.directory);
     }
     if (boundary === "cleanup" && path.basename(String(filename)) === BACKUP_PENDING_FILENAME) {
       await capture(path.dirname(String(filename)));
@@ -136,6 +150,11 @@ async function snapshot(boundary: Boundary, playlistCount = 1): Promise<string> 
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date(startedAt));
   try {
+    if (boundary === "owner") {
+      const ownerOnly = await createRun(root);
+      await ownerOnly.release();
+      return ownerOnly.id;
+    }
     const fixture = provider();
     if (playlistCount > 1) {
       const [playlist] = await fixture.listPlaylists();
@@ -143,15 +162,21 @@ async function snapshot(boundary: Boundary, playlistCount = 1): Promise<string> 
         ...playlist!, id: `fixture-${index}`,
       }));
     }
-    await runBackup(fixture, path.join(scratch, "source"));
+    void runBackup(fixture, root).then(
+      () => rejectStopped(new Error(`The fixture missed boundary ${boundary}`)),
+      error => {
+        if (id && (boundary === "owner-linked" || boundary === "intent-linked")) resolveStopped(id);
+        else rejectStopped(error);
+      },
+    );
+    return await stopped;
   } finally {
     vi.useRealTimers();
     renameSpy.mockRestore();
     linkSpy.mockRestore();
     unlinkSpy.mockRestore();
+    createSpy.mockRestore();
   }
-  expect(id).toBeDefined();
-  return id!;
 }
 
 async function contents(id: string): Promise<Record<string, Buffer>> {
@@ -198,6 +223,7 @@ describe("durable interruption boundaries", () => {
         const bytes = before[recovered!.playlists[0]!.files![format]]!;
         expect(recovered!.playlists[0]!.integrity![format]).toEqual({
           size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+          identity: JSON.parse(before["manifest.json"]!.toString()).playlists[0].integrity[format].identity,
         });
       }
     }
@@ -251,6 +277,52 @@ describe("durable interruption boundaries", () => {
     expect(recovered!.playlists).toHaveLength(1);
     expect(recovered!.status).toBe("interrupted");
     expect(await pruneExpiredBackups(root, expiry)).toEqual({ deleted: [], warnings: [] });
+  });
+});
+
+describe("journaled original generations", () => {
+  it.each(["intent", "json-stage", "json", "json-linked", "checkpoint-stage"] as const)(
+    "preserves a same-byte replacement at the %s boundary",
+    async boundary => {
+      const id = await snapshot(boundary);
+      const intent = await pending(id);
+      const directory = path.join(root, id);
+      const output = boundary === "checkpoint-stage" ? intent.manifestWrite : intent.outputs[0];
+      const names: string[] = boundary === "json-linked" ? [output.file, output.temporary]
+        : [boundary === "json" ? output.file : output.temporary];
+      const bytes = await fs.readFile(path.join(directory, names[0]!));
+      await fs.link(path.join(directory, names[0]!), path.join(scratch, "original-generation"));
+      for (const name of names) await fs.unlink(path.join(directory, name));
+      await fs.writeFile(path.join(directory, names[0]!), bytes);
+      if (names.length === 2) await fs.link(path.join(directory, names[0]!), path.join(directory, names[1]!));
+      const before = await contents(id);
+      const unlink = vi.spyOn(fs, "unlink");
+      await expect(recoverInterruptedBackups(root)).rejects.toMatchObject({
+        code: "BACKUP_RECOVERY_ERROR", message: expect.stringContaining("original file identity"),
+      });
+      expect(unlink).not.toHaveBeenCalled();
+      expect(await contents(id)).toEqual(before);
+      const manifest = await readManifest(root, id);
+      await fs.writeFile(path.join(directory, "manifest.json"), JSON.stringify({ ...manifest, status: "interrupted" }));
+      const result = await pruneExpiredBackups(root, expiry);
+      expect(result.deleted).toEqual([]);
+      expect(result.warnings.join(" ")).toContain("original file identity");
+      expect(unlink).not.toHaveBeenCalled();
+      for (const name of names) expect(await fs.readFile(path.join(directory, name))).toEqual(bytes);
+    },
+  );
+
+  it("preserves a legacy hash-only pending journal rather than adopting its current files", async () => {
+    const id = await snapshot("full");
+    const intent = await pending(id);
+    for (const output of [...intent.outputs, intent.manifestWrite]) delete output.identity;
+    for (const proof of Object.values(intent.result.integrity) as { identity?: unknown }[]) delete proof.identity;
+    await fs.writeFile(path.join(root, id, BACKUP_PENDING_FILENAME), JSON.stringify(intent));
+    const before = await contents(id);
+    await expect(recoverInterruptedBackups(root)).rejects.toMatchObject({
+      code: "BACKUP_RECOVERY_ERROR", message: expect.stringContaining("no original file identity"),
+    });
+    expect(await contents(id)).toEqual(before);
   });
 });
 
@@ -561,7 +633,7 @@ describe("unprovable ownership remains protected", () => {
 });
 
 describe("recovery and journal retention retries", () => {
-  it("still accepts original evidence from a legacy pending journal without backfilling a manifest", async () => {
+  it("accepts recorded generations from a pending journal without backfilling an older manifest result", async () => {
     const id = await snapshot("checkpoint");
     const manifest = await readManifest(root, id);
     delete manifest.playlists[0]!.integrity;

@@ -1,7 +1,7 @@
 import { rename } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 
-/** Keep replacement atomic; retry only brief Windows sharing conflicts, never unlink either path. */
+/** Atomic replacement, not compare-and-swap: callers must exclude competing writers. */
 export async function replaceFile(
   source: string, destination: string, beforeAttempt?: () => Promise<void>,
 ): Promise<void> {

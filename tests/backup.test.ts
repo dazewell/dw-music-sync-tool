@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { listBackups, readManifest, recoverInterruptedBackups, resolveBackupFile, runBackup } from "../src/core/backup.js";
 import type { BackupManifest, Playlist, PlaylistEntry, PlaylistProvider } from "../src/core/models.js";
 import { fingerprintPlaylist } from "../src/core/sync.js";
-import { BACKUP_OWNER_FILENAME } from "../src/core/storage.js";
+import { BACKUP_OWNER_FILENAME, BACKUP_PENDING_FILENAME, checkpointManifest } from "../src/core/storage.js";
 
 vi.mock("node:fs/promises", async importOriginal => ({
   ...await importOriginal<typeof import("node:fs/promises")>(),
@@ -104,9 +104,12 @@ describe("complete local playlist archives", () => {
       const basename = `Favorites-${hash}-${String(index + 1).padStart(4, "0")}`;
       expect(result.files).toEqual({ json: `${basename}.json`, csv: `${basename}.csv`, m3u: `${basename}.m3u8` });
       for (const format of ["json", "csv", "m3u"] as const) {
-        const bytes = await fs.readFile(await resolveBackupFile(root, manifest.id, result.files![format]));
+        const filename = await resolveBackupFile(root, manifest.id, result.files![format]);
+        const bytes = await fs.readFile(filename);
+        const identity = await fs.stat(filename, { bigint: true });
         expect(result.integrity![format]).toEqual({
           size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
+          identity: { dev: identity.dev.toString(), ino: identity.ino.toString(), birthtimeNs: identity.birthtimeNs.toString() },
         });
       }
       const archive = JSON.parse(await fs.readFile(await resolveBackupFile(root, manifest.id, result.files!.json), "utf8"));
@@ -328,7 +331,7 @@ describe("failures and recoverable checkpoints", () => {
     };
     vi.spyOn(fs, "rename").mockImplementation(async (source, destination) => {
       await inspect(source, destination);
-      expect(path.basename(String(destination))).toBe("manifest.json");
+      expect(["manifest.json", BACKUP_PENDING_FILENAME]).toContain(path.basename(String(destination)));
       await originalRename(source, destination);
       renames++;
     });
@@ -430,7 +433,17 @@ describe("failures and recoverable checkpoints", () => {
 });
 
 describe("safe backup discovery and file resolution", () => {
-  it.each(["hash", "negative-size", "fractional-size", "missing-format", "extra-field", "null"] as const)(
+  it("reports INVALID_MANIFEST, not a refinement TypeError, for a complete result with null files", async () => {
+    const manifest = await successfulBackup();
+    manifest.playlists[0]!.files = null;
+    const directory = path.join(root, manifest.id);
+    await fs.writeFile(path.join(directory, "manifest.json"), JSON.stringify(manifest));
+    await expect(readManifest(root, manifest.id)).rejects.toMatchObject({ code: "INVALID_MANIFEST" });
+    await expect(listBackups(root)).rejects.toMatchObject({ code: "INVALID_MANIFEST" });
+    await expect(checkpointManifest(directory, manifest)).rejects.toMatchObject({ code: "INVALID_MANIFEST" });
+  });
+
+  it.each(["hash", "negative-size", "fractional-size", "missing-format", "extra-field", "null", "invalid-identity"] as const)(
     "rejects invalid completed integrity metadata: %s",
     async corruption => {
       const manifest = await successfulBackup();
@@ -441,6 +454,9 @@ describe("safe backup discovery and file resolution", () => {
       if (corruption === "fractional-size") integrity.json = { ...result.integrity!.json, size: 0.5 };
       if (corruption === "missing-format") delete integrity.csv;
       if (corruption === "extra-field") integrity.other = result.integrity!.json;
+      if (corruption === "invalid-identity") {
+        integrity.json = { ...result.integrity!.json, identity: { ...result.integrity!.json.identity, ino: "0" } };
+      }
       await fs.writeFile(path.join(root, manifest.id, "manifest.json"), JSON.stringify({
         ...manifest,
         playlists: [{ ...result, integrity: corruption === "null" ? null : integrity }],

@@ -6,7 +6,7 @@ import { z } from "zod";
 import { AppError, errorMessage } from "./errors.js";
 import {
   BACKUP_OWNER_APP, BACKUP_OWNER_FILENAME, BACKUP_PENDING_FILENAME, readManifest, readPendingExports,
-  activeBackupStartedAt, inspectPendingFile, settlePendingExportLinks, verifyExportIntegrity,
+  activeBackupStartedAt, inspectPendingFile, settlePendingExportLinks, verifyExportIntegrity, verifyPendingFile,
 } from "./storage.js";
 
 export const RETENTION_DAYS = 30;
@@ -181,6 +181,9 @@ async function pruneRun(
       if (!integrity.has(name)) {
         throw new Error(`no original integrity evidence for "${name}"; legacy exports require manual inspection, not automatic deletion`);
       }
+      if (!integrity.get(name)!.identity) {
+        throw new Error(`no original file identity evidence for "${name}"; legacy exports require manual inspection, not automatic deletion`);
+      }
     }
   }
   const verified = new Map(pending?.present);
@@ -232,7 +235,10 @@ async function pruneRun(
         }
       }
       const proof = integrity.get(name);
-      const info = proof ? await verifyExportIntegrity(directory, name, proof) : await regularFile(directory, name);
+      const info = proof
+        ? pending?.integrity.has(name) ? await verifyPendingFile(directory, name, pending)
+          : await verifyExportIntegrity(directory, name, proof)
+        : await regularFile(directory, name);
       if (!info || !unchanged(expected, info)) {
         throw new Error(`"${name}" changed after the deletion preflight`);
       }
