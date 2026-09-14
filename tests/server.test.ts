@@ -331,10 +331,20 @@ describe("loopback server", () => {
     const started = await browser.post("/api/auth/connect-write").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
     expect(started.body.url).toBe("https://accounts.google.com/write-example");
     expect(auth.beginWrite).toHaveBeenCalledTimes(1);
+    const mismatch = await browser.get("/auth/google/callback?state=wrong-state&code=code").set("Host", host).expect(302);
+    expect(mismatch.headers.location).toContain("authError=");
+    expect(auth.completeWrite).not.toHaveBeenCalled();
     await browser.get("/auth/google/callback?state=test-write-state&code=code").set("Host", host)
       .expect(302).expect("Location", "/?writeConnected=1");
     expect(auth.completeWrite).toHaveBeenCalledExactlyOnceWith("code", "test-write-verifier");
     expect(auth.complete).not.toHaveBeenCalled();
+  });
+
+  it("rejects YouTube write authorization in demo mode", async () => {
+    const { browser, host, csrf, auth } = await setup(true);
+    const rejected = await browser.post("/api/auth/connect-write").set("Host", host).set("X-CSRF-Token", csrf).expect(400);
+    expect(rejected.body.error.code).toBe("DEMO_MODE");
+    expect(auth.beginWrite).not.toHaveBeenCalled();
   });
 
   it.each([
