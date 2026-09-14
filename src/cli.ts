@@ -84,6 +84,9 @@ function createSyncIntegration(config: AppConfig, providers: SyncExecutorProvide
       const index = state.pairs.findIndex((item) => item.id === id);
       if (index < 0) throw new AppError("SYNC_PAIR_NOT_FOUND", "That playlist pair does not exist.", 404);
       state.pairs.splice(index, 1);
+      // Otherwise a stale baseline for this pair id survives the unpair and would be reused
+      // as the "last known state" for an unrelated future pair that happens to get the same id.
+      delete state.baselines[id];
     }),
     ignore: (ignore) => store.ignore(ignore),
     unignore: (ref) => store.unignore(ref),

@@ -120,21 +120,31 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
           + `pageInfo.totalResults reported ${[...new Set(totals)].join(", ")}. Using the returned playlists.`,
       );
     }
-    return items.map((item) => ({
-      provider: this.id,
-      id: item.id,
-      title: item.snippet.title,
-      description: item.snippet.description,
-      owner: item.snippet.channelId ?? item.snippet.channelTitle,
-      itemCount: item.contentDetails.itemCount,
-      visibility: item.status?.privacyStatus ?? "unknown",
-      url: `https://www.youtube.com/playlist?list=${encodeURIComponent(item.id)}`,
-    }));
+    return items.map((item) => {
+      // mine=true always scopes results to the authenticated channel's own playlists, so a
+      // missing channelId is anomalous. Falling back to the mutable, display-only channelTitle
+      // would silently store an owner value that can never match getAuthenticatedAccountId()'s
+      // stable channel id, permanently breaking account verification for that playlist; fail
+      // closed instead, consistent with Spotify's owner.id requirement.
+      if (!item.snippet.channelId) {
+        throw new AppError("YOUTUBE_RESPONSE_INVALID", "YouTube did not return a channel id for one of your playlists.", 502);
+      }
+      return {
+        provider: this.id,
+        id: item.id,
+        title: item.snippet.title,
+        description: item.snippet.description,
+        owner: item.snippet.channelId,
+        itemCount: item.contentDetails.itemCount,
+        visibility: item.status?.privacyStatus ?? "unknown",
+        url: `https://www.youtube.com/playlist?list=${encodeURIComponent(item.id)}`,
+      };
+    });
   }
 
-  /** Fetches the id of the channel the current access token is actually authenticated as. */
-  async getAuthenticatedAccountId(): Promise<string> {
-    const { items } = await this.pages("channels", { part: "id", mine: "true", maxResults: "1" }, channelSchema);
+  /** Fetches the id of the channel actually authenticated by the given credential scope. */
+  async getAuthenticatedAccountId(scope: "read" | "write" = "read"): Promise<string> {
+    const { items } = await this.pages("channels", { part: "id", mine: "true", maxResults: "1" }, channelSchema, scope);
     const channel = items[0];
     if (!channel) throw new AppError("YOUTUBE_RESPONSE_INVALID", "YouTube did not return the authenticated channel id.", 502);
     return channel.id;
@@ -194,6 +204,20 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
     }
     if (entries.some(entry => entry.mediaId === null || entry.availability === "unavailable")) {
       throw new AppError("YOUTUBE_ENTRY_UNSUPPORTED", "Unavailable entries cannot be written to YouTube without a video ID.", 409);
+    }
+    // The read credential's account is verified against the pair before this method is ever
+    // called, but the separately-consented write credential is not: if write access was granted
+    // for a different Google account, every check upstream would still pass while this write
+    // silently mutates the wrong account's channel. Verify the credential that will actually
+    // perform the mutation, not just the one that read the playlist.
+    const writeAccountId = await this.getAuthenticatedAccountId("write");
+    const expectedAccountId = playlist.owner.trim() || "default";
+    if (writeAccountId !== expectedAccountId) {
+      throw new AppError(
+        "YOUTUBE_WRITE_ACCOUNT_MISMATCH",
+        "The write-authorized Google account does not match the account this playlist belongs to. Reconnect write access for the correct account before syncing.",
+        409,
+      );
     }
     const current = await this.getPlaylist(playlist);
     // A fresh read here only supplies IDs for the later deletes; without comparing it against
@@ -265,6 +289,7 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
     endpoint: string,
     parameters: Record<string, string>,
     schema: T,
+    tokenKind: "read" | "write" = "read",
   ): Promise<{ items: z.infer<T>[]; totals: number[] }> {
     const items: z.infer<T>[] = [];
     const totals: number[] = [];
@@ -274,7 +299,7 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
       const url = new URL(endpoint, API_ROOT);
       for (const [key, value] of Object.entries(parameters)) url.searchParams.set(key, value);
       if (pageToken !== undefined) url.searchParams.set("pageToken", pageToken);
-      const parsed = pageSchema(schema).safeParse(await this.request(url));
+      const parsed = pageSchema(schema).safeParse(await this.request(url, {}, tokenKind));
       if (!parsed.success) {
         throw new AppError("YOUTUBE_RESPONSE_INVALID", `YouTube returned an invalid playlist response (${describeIssues(parsed)}). No complete backup can be assumed.`, 502);
       }

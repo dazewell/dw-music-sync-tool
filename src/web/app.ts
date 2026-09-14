@@ -921,22 +921,25 @@ async function syncAllPairs(): Promise<void> {
   renderSync();
   let completed = 0;
   const failures: string[] = [];
+  // "review-required" is a deliberate, safe outcome (e.g. an unacknowledged conflict or a
+  // not-yet-supported cross-provider pair) - not an error - and must be reported to the user
+  // distinctly from an actual failure instead of being counted as one.
+  const reviewRequired: string[] = [];
   try {
     for (const pair of pairs) {
       try {
         const response = await request<{ run: SyncRun }>("/api/sync/run", "POST", { pairId: pair.id });
         if (response.run.status === "complete") completed += 1;
+        else if (response.run.status === "review-required") reviewRequired.push(pairLabel(pair));
         else failures.push(`${pairLabel(pair)}: ${response.run.status}`);
       } catch (error) {
         failures.push(`${pairLabel(pair)}: ${message(error)}`);
       }
     }
-    notify(
-      failures.length === 0
-        ? `Synchronized all ${completed} pair${completed === 1 ? "" : "s"}.`
-        : `Synchronized ${completed} of ${pairs.length} pairs. ${failures.length} failed: ${failures.join("; ")}`,
-      failures.length === 0 ? "success" : "error",
-    );
+    const parts: string[] = [`Synchronized ${completed} of ${pairs.length} pair${pairs.length === 1 ? "" : "s"}.`];
+    if (reviewRequired.length > 0) parts.push(`${reviewRequired.length} need review: ${reviewRequired.join("; ")}`);
+    if (failures.length > 0) parts.push(`${failures.length} failed: ${failures.join("; ")}`);
+    notify(parts.join(" "), failures.length > 0 ? "error" : reviewRequired.length > 0 ? "info" : "success");
     await loadSync();
   } finally {
     syncBusy = false;
@@ -1049,6 +1052,16 @@ async function autoPairByName(): Promise<void> {
       (async () => { discovered.youtube = null; return ensureDiscovered("youtube"); })(),
       (async () => { discovered.spotify = null; return ensureDiscovered("spotify"); })(),
     ]);
+    // ensureDiscovered() turns a genuine discovery failure into an empty list (while separately
+    // recording discoveredError), so without this check a real error (e.g. a misconfigured
+    // provider) is misreported as simply finding no matching names.
+    if (discoveredError.youtube || discoveredError.spotify) {
+      notify(
+        `Auto-pair could not check every playlist: ${[discoveredError.youtube, discoveredError.spotify].filter(Boolean).join(" ")}`,
+        "error",
+      );
+      return;
+    }
     const taken = new Set([
       ...sync.pairs.flatMap((pair) => [`${pair.left.provider}:${pair.left.playlistId}`, `${pair.right.provider}:${pair.right.playlistId}`]),
       ...sync.ignores.map((item) => `${item.provider}:${item.playlistId}`),

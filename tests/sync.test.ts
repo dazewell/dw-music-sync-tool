@@ -279,6 +279,23 @@ describe("common sync baseline comparison", () => {
       expect(plan.removals).toBe(1);
     });
 
+    it("requires review instead of a ready plan when the changed side has an unwritable entry", () => {
+      const changed = contents("youtube", ["a", "c"]);
+      // Give it a valid provider-agnostic identity (artist+title) so it doesn't hit the earlier
+      // "ambiguous/incomplete identity" branch; mediaId===null still makes it unwritable, which
+      // both providers' replacePlaylist() would otherwise reject at write time.
+      changed.entries[1] = { ...changed.entries[1]!, mediaId: null, availability: "unavailable", artist: "Someone", title: "A Song" };
+      const right = contents("youtube", ["a", "b", "c"]);
+      const baseline = {
+        sourceFingerprint: fingerprintPlaylist("youtube", contents("youtube", ["a", "b", "c"]).entries),
+        targetFingerprint: fingerprintPlaylist("youtube", right.entries),
+      };
+      const plan = planBidirectionalSync(changed, right, baseline);
+      expect(plan.status).toBe("review-required");
+      expect(plan.reason).toMatch(/unavailable/i);
+    });
+
+
     it("returns verified fingerprints in fixed pair-left and pair-right order", async () => {
       const left = contents("youtube", ["a"]);
       const right = contents("youtube", ["a", "b"]);

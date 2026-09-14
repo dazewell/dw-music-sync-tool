@@ -144,35 +144,48 @@ async function exchangeCode(options: ExchangeOptions): Promise<string> {
   let response: Response;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? TOKEN_EXCHANGE_TIMEOUT_MS);
+  let payload: { refresh_token?: unknown } | null;
   try {
-    response = await options.fetch(TOKEN_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Authorization: `Basic ${Buffer.from(`${options.clientId}:${options.clientSecret}`).toString("base64")}`,
-      },
-      body: new URLSearchParams({
-        grant_type: "authorization_code",
-        code: options.code,
-        redirect_uri: options.redirectUri,
-        code_verifier: options.codeVerifier,
-      }).toString(),
-      redirect: "error",
-      signal: controller.signal,
-    });
-  } catch {
-    throw new AppError("SPOTIFY_AUTH_NETWORK", "Unable to reach Spotify to exchange the authorization code.", 502);
+    try {
+      response = await options.fetch(TOKEN_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Authorization: `Basic ${Buffer.from(`${options.clientId}:${options.clientSecret}`).toString("base64")}`,
+        },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code: options.code,
+          redirect_uri: options.redirectUri,
+          code_verifier: options.codeVerifier,
+        }).toString(),
+        redirect: "error",
+        signal: controller.signal,
+      });
+    } catch {
+      throw new AppError("SPOTIFY_AUTH_NETWORK", "Unable to reach Spotify to exchange the authorization code.", 502);
+    }
+    if (!response.ok) {
+      throw new AppError(
+        "SPOTIFY_AUTH_EXCHANGE_FAILED",
+        "Spotify rejected the authorization code exchange. Run the command again and approve access again.",
+        401,
+      );
+    }
+    // Keep the abort timer active until the body has actually been consumed: fetch() resolving
+    // only means headers arrived, and a response that stalls while streaming the body would
+    // otherwise run unbounded despite the configured timeout.
+    try {
+      payload = (await response.json()) as typeof payload;
+    } catch {
+      if (controller.signal.aborted) {
+        throw new AppError("SPOTIFY_AUTH_NETWORK", "Unable to reach Spotify to exchange the authorization code.", 502);
+      }
+      payload = null;
+    }
   } finally {
     clearTimeout(timer);
   }
-  if (!response.ok) {
-    throw new AppError(
-      "SPOTIFY_AUTH_EXCHANGE_FAILED",
-      "Spotify rejected the authorization code exchange. Run the command again and approve access again.",
-      401,
-    );
-  }
-  const payload = (await response.json().catch(() => null)) as { refresh_token?: unknown } | null;
   if (!payload || typeof payload.refresh_token !== "string" || !payload.refresh_token) {
     throw new AppError(
       "SPOTIFY_AUTH_TOKEN_INVALID",

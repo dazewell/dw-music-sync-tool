@@ -39,8 +39,11 @@ export interface PlaylistProvider {
   /** The account id of the credential currently authenticated with this provider - not a
    * playlist's `owner` field, which (for providers that can discover followed/collaborative
    * playlists, e.g. Spotify) may not reflect who is actually authenticated right now. Used to
-   * verify a sync pair still matches the configured credential before reading or writing. */
-  getAuthenticatedAccountId(): Promise<string>;
+   * verify a sync pair still matches the configured credential before reading or writing.
+   * `scope` distinguishes providers (YouTube) whose read and write credentials can be
+   * separately consented for different accounts; it is ignored by providers with a single
+   * credential shared by both (e.g. Spotify). */
+  getAuthenticatedAccountId(scope?: "read" | "write"): Promise<string>;
 }
 
 export interface PlaylistMutation {

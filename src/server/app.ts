@@ -51,6 +51,10 @@ export interface SyncIntegration {
 
 const RECENT_RUNS = 20;
 const RECENT_REMOVALS = 100;
+// The search endpoint's own default when the caller omits `limit`: large enough to cover
+// realistic searches, but still bounded, unlike passing `undefined` straight through (which
+// returns the entire unbounded removal history from collectRemovalRecords).
+const DEFAULT_REMOVAL_SEARCH_LIMIT = 500;
 const AUTH_PENDING_TTL_MS = 600_000;
 const AUTH_START_WINDOW_MS = 600_000;
 const AUTH_START_LIMIT = 5;
@@ -483,7 +487,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     if (outcome !== undefined && outcome !== "success" && outcome !== "failed" && outcome !== "unknown") {
       throw new AppError("INVALID_SYNC_QUERY", "The optional outcome must be success, failed, or unknown.", 400);
     }
-    let parsedLimit: number | undefined;
+    let parsedLimit: number = DEFAULT_REMOVAL_SEARCH_LIMIT;
     if (limit !== undefined) {
       if (typeof limit !== "string" || !/^[1-9][0-9]{0,3}$/.test(limit) || Number(limit) > 1000) {
         throw new AppError("INVALID_SYNC_QUERY", "The optional limit must be a whole number between 1 and 1000.", 400);
@@ -498,7 +502,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
         ...(itemIdentity === undefined ? {} : { itemIdentity: (itemIdentity as string).trim() }),
         ...(direction === undefined ? {} : { direction: direction as "left-to-right" | "right-to-left" }),
         ...(outcome === undefined ? {} : { outcome: outcome as "success" | "failed" | "unknown" }),
-        ...(parsedLimit === undefined ? {} : { limit: parsedLimit }),
+        limit: parsedLimit,
       }),
     });
   });

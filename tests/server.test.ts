@@ -231,6 +231,20 @@ describe("loopback server", () => {
     expect(none.body.removals).toHaveLength(0);
   });
 
+  it("bounds the removal audit history by default instead of returning it unbounded", async () => {
+    const fixture = await syncFixture();
+    const many: SyncRemovalAudit[] = Array.from({ length: 600 }, (_, index) => ({
+      pairId: "pair-1", platform: "spotify" as const, playlistId: "sp-1", itemIdentity: `media:bulk-${index}`,
+      direction: "left-to-right" as const, timestamp: "2026-09-12T19:00:00.000Z", outcome: "success" as const, error: null,
+    }));
+    await fixture.store.recordRemovalAudits(fixture.runId, many);
+    const { browser, host } = await setup(true, undefined, fixture.integration);
+    const unbounded = await browser.get("/api/sync/removals").set("Host", host).expect(200);
+    expect(unbounded.body.removals.length).toBeLessThanOrEqual(500);
+    const explicit = await browser.get("/api/sync/removals?limit=1000").set("Host", host).expect(200);
+    expect(explicit.body.removals.length).toBeGreaterThan(500);
+  });
+
   it.each(["limit=0", "limit=-1", "limit=abc", "limit=1001", "pairId=", "pairId=a&pairId=b",
     "platform=bogus", "playlistId=", "itemIdentity=", "itemIdentity=%20", "direction=bogus", "outcome=bogus"])(
     "rejects the malformed removal audit query %s without reading records",

@@ -1,9 +1,13 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SpotifyAuth } from "../src/auth/spotify.js";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("SpotifyAuth", () => {
   const options = { clientId: "client-id", clientSecret: "client-secret", refreshToken: "refresh-token" };
@@ -63,5 +67,44 @@ describe("SpotifyAuth", () => {
     const auth = new SpotifyAuth({ ...options, fetch: fetchMock as unknown as typeof fetch });
     await auth.getAccessToken();
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("rotated refresh token"));
+  });
+
+  it("propagates a persistence failure for a rotated refresh token instead of reporting success", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(200, { access_token: "token-1", expires_in: 3600, refresh_token: "rotated-token" }));
+    const onRefreshTokenRotated = vi.fn(async () => { throw new Error("disk full"); });
+    const auth = new SpotifyAuth({ ...options, fetch: fetchMock as unknown as typeof fetch, onRefreshTokenRotated });
+    await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "SPOTIFY_AUTH_ROTATION_PERSIST_FAILED" });
+  });
+
+  it("does not permanently block future rotations after a persistence failure", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(200, { access_token: "token-1", expires_in: 3600, refresh_token: "rotated-1" }));
+    const onRefreshTokenRotated = vi.fn(async () => { throw new Error("disk full"); });
+    const auth = new SpotifyAuth({ ...options, fetch: fetchMock as unknown as typeof fetch, onRefreshTokenRotated });
+    await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "SPOTIFY_AUTH_ROTATION_PERSIST_FAILED" });
+    // A later, unrelated rotation attempt must still run (and can still succeed), instead of the
+    // internal serialization queue staying rejected forever after the first failure.
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { access_token: "token-2", expires_in: 3600, refresh_token: "rotated-2" }));
+    onRefreshTokenRotated.mockResolvedValueOnce(undefined);
+    (auth as unknown as { cached: unknown }).cached = null;
+    await expect(auth.getAccessToken()).resolves.toBe("token-2");
+    expect(onRefreshTokenRotated).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports a timeout, not an invalid response, when the body stalls after headers arrive", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      const response = new Response("{}", { status: 200 });
+      // A real fetch's AbortSignal also governs body consumption, so a response that stalls
+      // while streaming its body still gets aborted; response.json() must reject, not just hang.
+      response.json = () => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+      return Promise.resolve(response);
+    });
+    const auth = new SpotifyAuth({ ...options, requestTimeoutMs: 20, fetch: fetchMock as unknown as typeof fetch });
+    const assertion = expect(auth.getAccessToken()).rejects.toMatchObject({ code: "SPOTIFY_AUTH_TIMEOUT" });
+    await vi.advanceTimersByTimeAsync(21);
+    await assertion;
   });
 });

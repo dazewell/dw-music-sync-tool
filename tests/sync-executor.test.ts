@@ -116,6 +116,26 @@ describe("executeSyncRun", () => {
     expect(state.runs[0]?.status).toBe("failed");
   });
 
+  it("does not reject a legitimate collaborative/followed playlist whose owner differs from the authenticated account", async () => {
+    const store = await makeStore();
+    await store.pair({
+      id: "pair-1",
+      left: { provider: "youtube", accountId: "default", playlistId: "yt-1" },
+      right: { provider: "spotify", accountId: "default", playlistId: "sp-1" },
+      enabled: true, createdAt: now, updatedAt: now,
+    });
+    // The authenticated account (FakeProvider.getAuthenticatedAccountId() always returns
+    // "default") matches ref.accountId, but the playlist's own `owner` field is someone else's -
+    // e.g. a Spotify playlist collaboratively owned by a different user. This must still be
+    // observable; only a genuine authenticated-account mismatch should fail closed.
+    const youtube = new FakeProvider(
+      "youtube", [{ ...playlist("yt-1", "youtube"), owner: "someone-else" }], new Map([["yt-1", [entry("a", "a")]]]),
+    );
+    const spotify = new FakeProvider("spotify", [playlist("sp-1", "spotify")], new Map([["sp-1", [entry("a", "a")]]]));
+    const run = await executeSyncRun(store, { youtube, spotify }, "pair-1");
+    expect(run.status).toBe("review-required");
+  });
+
   it("records an uninitialized pair as review-required without mutating either side", async () => {
     const store = await makeStore();
     await store.pair({

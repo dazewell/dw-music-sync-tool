@@ -195,6 +195,19 @@ export function planBidirectionalSync(
     };
   }
 
+  // A "ready" plan promises applySyncPlan() can actually write it; entries with no mediaId or
+  // marked unavailable are exactly what both providers' replacePlaylist() reject at write time.
+  // Catching that here means it surfaces as an explicit, explainable review-required decision
+  // during planning instead of an opaque write failure partway through applying the plan.
+  const unwritable = source.entries.some((entry) => entry.mediaId === null || entry.availability === "unavailable");
+  if (unwritable) {
+    return {
+      status: "review-required", direction: "none", source: null, target: null, entries: [],
+      additions: 0, removals: 0,
+      reason: "The changed side has entries with no usable media ID or that are unavailable; resolve them before mirroring.",
+    };
+  }
+
   const entries = source.entries.map((entry) => ({ ...entry, position: 0 }));
   const sourceKeys = new Set(sourceMap.keys());
   const targetKeys = new Set(targetMap.keys());
