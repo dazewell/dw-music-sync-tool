@@ -92,11 +92,16 @@ export class SyncStateStore implements SyncRemovalAuditSink {
     return this.update(state => {
       const sameRef = (left: SyncPair["left"], right: SyncPair["right"]) =>
         left.provider === right.provider && left.accountId === right.accountId && left.playlistId === right.playlistId;
+      const isIgnored = (candidate: SyncPair["left"]) =>
+        state.ignores.some(item => item.provider === candidate.provider && item.accountId === candidate.accountId && item.playlistId === candidate.playlistId);
       if (pairing.left.provider === pairing.right.provider
         || state.pairs.some(item => item.id === pairing.id
           || sameRef(item.left, pairing.left) || sameRef(item.right, pairing.left)
           || sameRef(item.left, pairing.right) || sameRef(item.right, pairing.right))) {
         throw new AppError("SYNC_PAIR_EXISTS", "A playlist is already explicitly paired.", 409);
+      }
+      if (isIgnored(pairing.left) || isIgnored(pairing.right)) {
+        throw new AppError("SYNC_PAIR_IGNORED", "An ignored playlist cannot be paired; unignore it first if you want it synchronized.", 409);
       }
       state.pairs.push(pairing);
     });
@@ -104,6 +109,13 @@ export class SyncStateStore implements SyncRemovalAuditSink {
 
   async ignore(ignore: SyncIgnore): Promise<SyncState> {
     return this.update(state => {
+      const matches = (candidate: SyncPair["left"]) =>
+        candidate.provider === ignore.provider && candidate.accountId === ignore.accountId && candidate.playlistId === ignore.playlistId;
+      // An ignored playlist must never be selected through an existing pair either;
+      // disable (not delete) any pair referencing it so the audit trail is preserved.
+      for (const existing of state.pairs) {
+        if (matches(existing.left) || matches(existing.right)) existing.enabled = false;
+      }
       if (!state.ignores.some(item => item.provider === ignore.provider && item.accountId === ignore.accountId && item.playlistId === ignore.playlistId)) state.ignores.push(ignore);
     });
   }

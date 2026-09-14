@@ -85,6 +85,31 @@ describe("playlist names and pairing", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("rejects pairing an ignored playlist, and disables an existing pair when either side is ignored", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "music-sync-ignore-"));
+    try {
+      const store = new SyncStateStore(path.join(directory, "sync-state.json"));
+      const left = { provider: "youtube" as const, accountId: "acct", playlistId: "yt-1" };
+      const right = { provider: "spotify" as const, accountId: "acct", playlistId: "sp-1" };
+      await store.ignore({ ...left, reason: "Duplicate", createdAt: "2026-09-13T20:00:00.000Z" });
+      await expect(store.pair({
+        id: "pair-1", left, right, enabled: true,
+        createdAt: "2026-09-13T20:00:00.000Z", updatedAt: "2026-09-13T20:00:00.000Z",
+      })).rejects.toMatchObject({ code: "SYNC_PAIR_IGNORED" });
+
+      const otherRight = { provider: "spotify" as const, accountId: "acct", playlistId: "sp-2" };
+      await store.pair({
+        id: "pair-2", left: { ...left, playlistId: "yt-2" }, right: otherRight, enabled: true,
+        createdAt: "2026-09-13T20:00:00.000Z", updatedAt: "2026-09-13T20:00:00.000Z",
+      });
+      await store.ignore({ ...otherRight, reason: "", createdAt: "2026-09-13T20:00:00.000Z" });
+      const state = await store.read();
+      expect(state.pairs.find((item) => item.id === "pair-2")?.enabled).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("stable ordered fingerprints", () => {
