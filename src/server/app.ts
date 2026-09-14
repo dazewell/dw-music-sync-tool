@@ -49,6 +49,7 @@ export interface SyncIntegration {
 
 const RECENT_RUNS = 20;
 const RECENT_REMOVALS = 100;
+const AUTH_PENDING_TTL_MS = 600_000;
 const AUTH_START_WINDOW_MS = 600_000;
 const AUTH_START_LIMIT = 5;
 
@@ -125,6 +126,7 @@ export interface ServerDependencies {
 }
 
 interface BrowserSession {
+  id: string;
   expiresAt: number;
   csrfToken: string;
   oauth: { kind: "read" | "write"; state: string; codeVerifier: string; expiresAt: number } | null;
@@ -169,7 +171,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
         if (oldest) sessions.delete(oldest);
       }
       id = randomBytes(32).toString("hex");
-      current = { expiresAt: now + 86_400_000, csrfToken: randomBytes(32).toString("hex"), oauth: null };
+      current = { id, expiresAt: now + 86_400_000, csrfToken: randomBytes(32).toString("hex"), oauth: null };
       sessions.set(id, current);
       res.cookie("music_session", id, { httpOnly: true, sameSite: "lax", path: "/", maxAge: 86_400_000 });
     }
@@ -203,11 +205,15 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
   }
 
   async function beginGoogleAuthorization(req: Request, res: Response, kind: NonNullable<BrowserSession["oauth"]>["kind"]): Promise<void> {
-    if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
     const current = session(req, res);
     const pending = kind === "write" ? await auth.beginWrite() : await auth.begin();
-    current.oauth = { kind, state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
+    current.oauth = { kind, state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + AUTH_PENDING_TTL_MS };
     res.json({ url: pending.url });
+  }
+
+  function rejectGoogleAuthorizationInDemo(_req: Request, _res: Response, next: NextFunction): void {
+    if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
+    next();
   }
 
   function rejectPendingGoogleAuthorization(req: Request, res: Response, next: NextFunction): void {
@@ -239,13 +245,12 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
   }
 
   function limitGoogleAuthorizationStarts(req: Request, res: Response, next: NextFunction): void {
-    if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
     const current = session(req, res);
     const now = Date.now();
     for (const [key, value] of authStarts) {
       if (value.resetAt <= now) authStarts.delete(key);
     }
-    const key = current.csrfToken;
+    const key = current.id;
     const attempt = authStarts.get(key);
     if (attempt === undefined || attempt.resetAt <= now) {
       authStarts.set(key, { count: 1, resetAt: now + AUTH_START_WINDOW_MS });
@@ -321,7 +326,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     next();
   });
 
-  app.post("/api/auth/connect", rejectGoogleAuthorizationWhenBusy, rejectPendingGoogleAuthorization, limitGoogleAuthorizationStarts, async (req, res) => {
+  app.post("/api/auth/connect", rejectGoogleAuthorizationWhenBusy, rejectGoogleAuthorizationInDemo, rejectPendingGoogleAuthorization, limitGoogleAuthorizationStarts, async (req, res) => {
     const release = reserve("auth");
     try {
       await beginGoogleAuthorization(req, res, "read");
@@ -330,7 +335,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     }
   });
 
-  app.post("/api/auth/connect-write", rejectGoogleAuthorizationWhenBusy, rejectPendingGoogleAuthorization, limitGoogleAuthorizationStarts, async (req, res) => {
+  app.post("/api/auth/connect-write", rejectGoogleAuthorizationWhenBusy, rejectGoogleAuthorizationInDemo, rejectPendingGoogleAuthorization, limitGoogleAuthorizationStarts, async (req, res) => {
     const release = reserve("auth");
     try {
       await beginGoogleAuthorization(req, res, "write");
