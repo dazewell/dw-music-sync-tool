@@ -196,19 +196,27 @@ Spotify access is requested for YouTube backup.
 
 ## Planned manual same-name sync
 
-The pure name-pairing and baseline helpers in `src/core/sync.ts` are implemented
-now. Persistent pairing workflows and all remote writes are **future work**.
-Future observation, match and baseline storage must also respect provider
-retention rules rather than silently extending the lifetime of API-derived data.
+The name-pairing and baseline helpers in `src/core/sync.ts` were the design
+starting point. Persistent pairing/ignoring, planning, direct YouTube/Spotify
+provider execution, destination verification and baseline/removal-audit
+persistence are now implemented (`src/core/sync.ts`, `src/core/sync-state.ts`,
+`src/services/sync-executor.ts`). Still-open follow-on work is itemized below
+and in the README: richer preview/review UI before applying, scheduling, and
+cross-platform recording-identity resolution (step 4). Future observation,
+match and baseline storage must also respect provider retention rules rather
+than silently extending the lifetime of API-derived data.
 
 1. **Read-only discovery.** Add Spotify reader and account identity/capability
    records. Request only needed read scopes. Surface unreadable or incomplete
    playlists; never represent them as empty.
 2. **Pair and ignore.** Suggest names normalized with Unicode normalization,
-   whitespace collapsing and case folding. A unique name match is a suggestion,
-   not authorization. Show duplicate-name candidates for user choice. Persist
-   stable provider/account/playlist IDs and independent ignore records; names
-   can change without breaking a confirmed pair.
+   whitespace collapsing and case folding (`src/web/text-normalize.ts`). This
+   is implemented: the dashboard's "Auto-pair by name" immediately creates a
+   pair for every unique normalized-name match across both providers — no
+   confirmation step — while a name with more than one candidate on either
+   side is skipped and reported rather than guessed at. Persist stable
+   provider/account/playlist IDs and independent ignore records; names can
+   change without breaking a confirmed pair.
 3. **Choose direction and operation.** Require a source, destination and a
    deliberate add-only versus replace policy. Bidirectional sync is not two
    blind replacement jobs. Confirm deletions, reorder and duplicate semantics.
@@ -237,6 +245,38 @@ must be created separately and their source, destination and add/replace mode
 verified before triggering. No trigger idempotency key or reliable per-run result
 history is documented; an uncertain timeout must be reconciled, not blindly
 triggered again.
+
+**Direct executor wiring (implemented).** `src/services/sync-executor.ts`
+connects step 6 (approve and execute) to the composition root: an explicit
+`pairId` from the web app's sync run control re-reads both playlists through
+fresh discovery (never the just-listed summary), plans against the stored
+baseline with `planBidirectionalSync`, and, when ready, applies and verifies
+through whichever real authenticated `PlaylistProvider & PlaylistMutation` is
+actually wired for the changed side, when the plan reaches `ready`. Triggering
+a run is the user's approval; there is no separate preview/confirm step yet.
+Because every pair is cross-provider and recording-identity resolution (below)
+is not implemented, `planBidirectionalSync` currently returns
+`review-required` for every real pair instead of `ready`, so a run today never
+reaches a destructive `replacePlaylist` call; this is intentional (a
+destination cannot yet be told which native identifier to write) and is
+covered by `tests/sync-executor.test.ts`. The `ready`/`complete` path is
+exercised directly against `applySyncPlan` in `tests/sync.test.ts` and takes
+effect for real pairs once matching lands. Every outcome - complete,
+review-required or failed - is persisted as a `SyncRun`, and every mirrored
+removal is recorded as a durable, per-item audit entry through
+`SyncStateStore`, whether the mutation succeeds or fails. `src/cli.ts` supplies
+the real `YouTubeProvider` (backed by the already-connected Google account,
+never in demo mode) and, only when `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`
+and `SPOTIFY_REFRESH_TOKEN` are all configured, a real `SpotifyProvider` backed
+by `src/auth/spotify.ts`'s refresh-token exchange. There is no in-app Spotify
+connect flow yet (building one needs its own product decision per
+`PRODUCT.md`), so an unwired or demo-mode side fails the run closed with an
+explicit `SPOTIFY_NOT_CONFIGURED` or `YOUTUBE_SYNC_NOT_AVAILABLE` error instead
+of a fake success. Recording-identity resolution across platforms (item 4) is
+still not implemented, so a mirrored entry still carries its source platform's
+native identifiers; a destination provider that cannot accept them (for
+example, Spotify requiring a track URI) fails the mutation explicitly rather
+than silently dropping or mismatching an item.
 
 ## Planned durable sync state
 

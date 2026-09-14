@@ -16,6 +16,7 @@
     "dev": "tsx src/cli.ts serve",
     "demo": "node dist/cli.js serve --demo",
     "backup": "node dist/cli.js backup",
+    "spotify-auth": "tsx src/spotify-auth-cli.ts",
     "typecheck": "tsc --noEmit",
     "test:browser": "playwright test",
     "test": "vitest run",

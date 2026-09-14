@@ -36,6 +36,23 @@ export interface PlaylistProvider {
   readonly coverage: string;
   listPlaylists(): Promise<Playlist[]>;
   getPlaylist(playlist: Playlist): Promise<PlaylistContents>;
+  /** The account id of the credential currently authenticated with this provider - not a
+   * playlist's `owner` field, which (for providers that can discover followed/collaborative
+   * playlists, e.g. Spotify) may not reflect who is actually authenticated right now. Used to
+   * verify a sync pair still matches the configured credential before reading or writing.
+   * `scope` distinguishes providers (YouTube) whose read and write credentials can be
+   * separately consented for different accounts; it is ignored by providers with a single
+   * credential shared by both (e.g. Spotify). */
+  getAuthenticatedAccountId(scope?: "read" | "write"): Promise<string>;
+}
+
+export interface PlaylistMutation {
+  /** Replace the complete ordered occurrence list after a fresh observation. */
+  replacePlaylist(
+    playlist: Playlist,
+    entries: readonly PlaylistEntry[],
+    expectedSnapshotId?: string,
+  ): Promise<void>;
 }
 
 export interface PlaylistArchive extends PlaylistContents {

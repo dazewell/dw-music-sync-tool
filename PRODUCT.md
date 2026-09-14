@@ -36,8 +36,16 @@ a terminal application. The first release will run locally, not as a hosted serv
   playlists matching by name; issue #1 also describes pairing, ignored playlists,
   history and eventual scheduling.
 - Treat the supplied API comparison as a research starting point, not authority.
-- First-release authorization must be read-only. Provider writes, matching
-  policy, conflict resolution and scheduling are future work.
+- Direct-API bidirectional sync is implemented per issue #1's explicit,
+  user-confirmed decisions: pairs are explicit and provider-agnostic; a
+  "Sync Pair" run always re-observes and mirrors both sides against the last
+  verified baseline (never a blind one-shot replace); "Auto-pair by name"
+  creates a pair immediately for every unique normalized-title match with no
+  confirmation step, and skips and reports ambiguous titles; every run and
+  every per-item removal is recorded in a durable, searchable audit trail.
+  Provider writes (YouTube via a separately-consented write scope, Spotify via
+  an operator-provided refresh token) are in scope for this release, not
+  future work.
 
 ## Evidence on Hand
 
@@ -53,5 +61,12 @@ visual identity, user library data or account authorization in the repository.
 
 ## Open Decisions
 
-Sync direction, deletion handling, track matching thresholds and scheduling
-policy must be confirmed when implementing synchronization.
+Sync direction is bidirectional per pair (mirroring both sides against the
+last verified baseline, not a one-shot copy); deletion handling mirrors
+removals on the changed side and records every one in the audit trail; track
+matching for pairing uses an exact normalized-title match only (no fuzzy
+threshold); and scheduling remains manual (an explicit "Sync Pair" or "Sync
+all pairs" action) with no background/automatic runs yet. Cross-provider
+track-level translation (matching a specific YouTube video to a specific
+Spotify track) remains unresolved, so a pair with untranslated cross-provider
+entries is reported as review-required rather than written.

@@ -1,5 +1,37 @@
 import type { ApiError, BackupJob, StatusResponse } from "../shared/api.js";
 import type { BackupManifest, BackupPlaylistResult, Playlist } from "../core/models.js";
+import { normalizePlaylistName } from "./text-normalize.js";
+
+type Platform = "youtube" | "spotify";
+interface SyncRef { provider: Platform; accountId: string; playlistId: string; }
+interface SyncPair { id: string; left: SyncRef; right: SyncRef; enabled: boolean; createdAt: string; updatedAt: string; }
+interface SyncIgnore { provider: Platform; accountId: string; playlistId: string; reason: string; createdAt: string; }
+type SyncRunStatus = "running" | "complete" | "partial" | "failed" | "review-required";
+interface SyncRun {
+  id: string;
+  pairId: string;
+  status: SyncRunStatus;
+  startedAt: string;
+  completedAt: string | null;
+  message: string | null;
+}
+interface SyncRemovalRecord {
+  runId: string;
+  runStatus: SyncRunStatus;
+  pairId: string;
+  /** The platform the removal was applied to. */
+  platform: Platform;
+  playlistId: string;
+  /** Provider-native identity; never a cross-platform equivalence claim. */
+  itemIdentity: string;
+  direction: "left-to-right" | "right-to-left";
+  /** The paired platform mirrored from, or null when the pair no longer exists. */
+  sourcePlatform: Platform | null;
+  timestamp: string;
+  outcome: "success" | "failed" | "unknown";
+  error: string | null;
+}
+interface SyncState { pairs: SyncPair[]; ignores: SyncIgnore[]; runs: SyncRun[]; removals: SyncRemovalRecord[]; }
 
 function element<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);
@@ -55,6 +87,35 @@ const ui = {
   refreshHistory: element<HTMLButtonElement>("refresh-history"),
   historyFeedback: element("history-feedback"),
   historyList: element("history-list"),
+  syncNow: element<HTMLButtonElement>("sync-now"),
+  syncAllPairs: element<HTMLButtonElement>("sync-all-pairs"),
+  autoPairByName: element<HTMLButtonElement>("auto-pair-by-name"),
+  syncFeedback: element("sync-feedback"),
+  syncPairs: element("sync-pairs"),
+  syncIgnored: element("sync-ignored"),
+  syncLogs: element("sync-logs"),
+  syncFooterState: element("sync-footer-state"),
+  syncPairSelect: element<HTMLSelectElement>("sync-pair"),
+  pairForm: element<HTMLFormElement>("pair-form"),
+  pairLeftProvider: element<HTMLSelectElement>("pair-left-provider"),
+  pairLeftPlaylist: element<HTMLSelectElement>("pair-left-playlist"),
+  pairRightProvider: element<HTMLSelectElement>("pair-right-provider"),
+  pairRightPlaylist: element<HTMLSelectElement>("pair-right-playlist"),
+  ignoreForm: element<HTMLFormElement>("ignore-form"),
+  ignoreProvider: element<HTMLSelectElement>("ignore-provider"),
+  ignorePlaylist: element<HTMLSelectElement>("ignore-playlist"),
+  ignoreReason: element<HTMLInputElement>("ignore-reason"),
+  removalFeedback: element("removal-feedback"),
+  removalTableWrap: element("removal-table-wrap"),
+  removalRows: element<HTMLTableSectionElement>("removal-rows"),
+  refreshRemovals: element<HTMLButtonElement>("refresh-removals"),
+  removalFilters: element<HTMLFormElement>("removal-filters"),
+  removalFilterPlatform: element<HTMLSelectElement>("removal-filter-platform"),
+  removalFilterPlaylist: element<HTMLInputElement>("removal-filter-playlist"),
+  removalFilterIdentity: element<HTMLInputElement>("removal-filter-identity"),
+  removalFilterDirection: element<HTMLSelectElement>("removal-filter-direction"),
+  removalFilterOutcome: element<HTMLSelectElement>("removal-filter-outcome"),
+  removalFiltersClear: element<HTMLButtonElement>("removal-filters-clear"),
 };
 
 let status: StatusResponse | null = null;
@@ -84,6 +145,27 @@ let retentionTimer: number | null = null;
 let retentionPolling = false;
 let retentionRefreshPromise: Promise<void> | null = null;
 let retentionFailures = 0;
+let sync: SyncState | null = null;
+let syncLoading = false;
+let syncError: string | null = null;
+let syncBusy = false;
+const discovered: Record<Platform, Playlist[] | null> = { youtube: null, spotify: null };
+const discoveredLoading: Record<Platform, boolean> = { youtube: false, spotify: false };
+const discoveredError: Record<Platform, string | null> = { youtube: null, spotify: null };
+// Tracks the in-flight discovery request per provider so a second caller (e.g. auto-pair
+// clearing the cache while the initial picker load is still pending) awaits the same
+// request instead of getting an empty placeholder result back.
+const discoveredRequest: Record<Platform, Promise<Playlist[]> | null> = { youtube: null, spotify: null };
+// Serializes discovery requests across providers: the server holds a single global
+// "inventory" reservation, so two concurrent discover calls for different providers would
+// otherwise race for it and the loser would get INVENTORY_BUSY, which ensureDiscovered would
+// then cache as a (wrong) empty result. Chaining every request through this promise means
+// only one discovery request is ever in flight at a time, matching the server's real capacity.
+let discoveryQueue: Promise<void> = Promise.resolve();
+let removals: SyncRemovalRecord[] = [];
+let removalsLoaded = false;
+let removalsLoading = false;
+let removalsError: string | null = null;
 const maxRetentionFailures = 3;
 const retentionPollInterval = 60_000;
 const maxPollFailures = 4;
@@ -99,12 +181,19 @@ function text<K extends keyof HTMLElementTagNameMap>(
   if (className) node.className = className;
   return node;
 }
+/** An HTTP API error, carrying the server-issued error code so callers can
+ * distinguish specific failure conditions from a generic message string. */
+class RequestError extends Error {
+  constructor(message: string, readonly code: string | null) {
+    super(message);
+  }
+}
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "An unexpected error occurred. Please try again.";
 }
 
-async function request<T>(path: string, method: "GET" | "POST" = "GET"): Promise<T> {
+async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET", body?: unknown): Promise<T> {
   const controller = new AbortController();
   const abort = () => controller.abort();
   lifetime.signal.addEventListener("abort", abort, { once: true });
@@ -112,13 +201,14 @@ async function request<T>(path: string, method: "GET" | "POST" = "GET"): Promise
   const timer = window.setTimeout(abort, 30_000);
   try {
     const headers: Record<string, string> = { Accept: "application/json" };
-    if (method === "POST") {
+    if (method !== "GET") {
       if (!status?.csrfToken) throw new Error("The connection check has expired. Reload this page before trying again.");
       headers["X-CSRF-Token"] = status.csrfToken;
     }
     const response = await fetch(path, {
       method,
       headers,
+      ...(body === undefined ? {} : { body: JSON.stringify(body), headers: { ...headers, "Content-Type": "application/json" } }),
       credentials: "same-origin",
       cache: "no-store",
       signal: controller.signal,
@@ -132,9 +222,10 @@ async function request<T>(path: string, method: "GET" | "POST" = "GET"): Promise
     if (!response.ok) {
       const apiError = data as Partial<ApiError> | null;
       const detail = apiError?.error?.message;
-      throw new Error(typeof detail === "string" && detail
+      const code = typeof apiError?.error?.code === "string" ? apiError.error.code : null;
+      throw new RequestError(typeof detail === "string" && detail
         ? detail
-        : `The request failed (${response.status}). Please try again.`);
+        : `The request failed (${response.status}). Please try again.`, code);
     }
     return data as T;
   } catch (error) {
@@ -504,6 +595,517 @@ function renderHistory(): void {
   renderControls();
 }
 
+function platformLabel(providerId: Platform): string {
+  return providerId === "youtube" ? "YouTube Music" : "Spotify";
+}
+
+/** The real playlist title for a stored reference, when discovery has loaded it; falls back to the raw ID. */
+function playlistTitle(ref: SyncRef): string {
+  return discovered[ref.provider]?.find((item) => item.id === ref.playlistId)?.title ?? ref.playlistId;
+}
+
+function directionLabel(record: SyncRemovalRecord): string {
+  return record.sourcePlatform
+    ? `${platformLabel(record.sourcePlatform)} → ${platformLabel(record.platform)}`
+    : `Mirrored to ${platformLabel(record.platform)}`;
+}
+
+function outcomeLabel(outcome: SyncRemovalRecord["outcome"]): string {
+  return outcome === "success" ? "Removed" : outcome === "unknown" ? "Unknown" : "Failed";
+}
+
+function pairLabel(pair: SyncPair): string {
+  return `${platformLabel(pair.left.provider)} "${playlistTitle(pair.left)}" ↔ ${platformLabel(pair.right.provider)} "${playlistTitle(pair.right)}"`;
+}
+
+function renderRemovals(): void {
+  const available = sync !== null;
+  ui.refreshRemovals.disabled = removalsLoading || syncBusy || !available;
+  const filtersDisabled = removalsLoading || syncBusy || !available;
+  ui.removalFilterPlatform.disabled = filtersDisabled;
+  ui.removalFilterPlaylist.disabled = filtersDisabled;
+  ui.removalFilterIdentity.disabled = filtersDisabled;
+  ui.removalFilterDirection.disabled = filtersDisabled;
+  ui.removalFilterOutcome.disabled = filtersDisabled;
+  ui.removalFiltersClear.disabled = filtersDisabled;
+  ui.refreshRemovals.textContent = removalsLoading ? "Refreshing…" : "Refresh Removal Records";
+  ui.removalFeedback.dataset.error = String(Boolean(removalsError));
+  ui.removalRows.replaceChildren();
+  ui.removalTableWrap.hidden = true;
+  if (!available) {
+    ui.removalFeedback.textContent = "Removal audit records require a configured synchronization service.";
+  } else if (removalsLoading && !removalsLoaded) {
+    ui.removalFeedback.textContent = "Loading removal audit records…";
+  } else if (removalsError) {
+    ui.removalFeedback.textContent = `${removalsError} Use Refresh Removal Records to retry.${removalsLoaded ? " Previously loaded records are shown below." : ""}`;
+  } else if (removals.length === 0) {
+    ui.removalFeedback.textContent = removalsLoaded
+      ? "No removals have been mirrored yet."
+      : "Removal audit records have not been loaded yet.";
+  } else {
+    ui.removalFeedback.textContent = `${removals.length.toLocaleString()} recorded ${removals.length === 1 ? "removal" : "removals"}, newest first.`;
+  }
+  if (removals.length > 0) {
+    ui.removalTableWrap.hidden = false;
+    const fragment = document.createDocumentFragment();
+    for (const record of removals) {
+      const row = document.createElement("tr");
+      const playlistCell = document.createElement("td");
+      playlistCell.append(text("span", record.playlistId, "playlist-title"));
+      playlistCell.append(text("span", `Pair: ${record.pairId}`, "playlist-owner"));
+      const identity = document.createElement("td");
+      identity.append(text("code", record.itemIdentity));
+      const time = document.createElement("td");
+      const stamp = text("time", timestamp(record.timestamp));
+      stamp.dateTime = record.timestamp;
+      time.append(stamp);
+      const outcome = document.createElement("td");
+      const badge = text("span", outcomeLabel(record.outcome), "badge");
+      badge.dataset.state = record.outcome === "success" ? "complete" : record.outcome === "unknown" ? "partial" : "failed";
+      outcome.append(badge);
+      if (record.error) outcome.append(text("span", record.error, "history-error"));
+      row.append(
+        text("td", platformLabel(record.platform)),
+        playlistCell,
+        identity,
+        text("td", directionLabel(record)),
+        time,
+        outcome,
+      );
+      fragment.append(row);
+    }
+    ui.removalRows.append(fragment);
+  }
+}
+
+function removalFilterQuery(): string {
+  const params = new URLSearchParams();
+  const platform = ui.removalFilterPlatform.value;
+  const playlistId = ui.removalFilterPlaylist.value.trim();
+  const itemIdentity = ui.removalFilterIdentity.value.trim();
+  const direction = ui.removalFilterDirection.value;
+  const outcome = ui.removalFilterOutcome.value;
+  if (platform) params.set("platform", platform);
+  if (playlistId) params.set("playlistId", playlistId);
+  if (itemIdentity) params.set("itemIdentity", itemIdentity);
+  if (direction) params.set("direction", direction);
+  if (outcome) params.set("outcome", outcome);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+async function loadRemovals(): Promise<void> {
+  if (removalsLoading || sync === null) {
+    renderRemovals();
+    return;
+  }
+  removalsLoading = true;
+  removalsError = null;
+  renderRemovals();
+  try {
+    const response = await request<{ removals: SyncRemovalRecord[] }>(`/api/sync/removals${removalFilterQuery()}`);
+    if (disposed) return;
+    removals = response.removals;
+    removalsLoaded = true;
+  } catch (error) {
+    if (!disposed) removalsError = message(error);
+  } finally {
+    removalsLoading = false;
+    if (!disposed) renderRemovals();
+  }
+}
+
+
+function populatePlaylistSelect(select: HTMLSelectElement, provider: Platform): void {
+  const previous = select.value;
+  const list = discovered[provider] ?? [];
+  select.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = discoveredLoading[provider]
+    ? "Loading playlists…"
+    : discoveredError[provider]
+      ? "Could not load playlists"
+      : list.length === 0 ? "No playlists found" : "Choose a playlist…";
+  select.append(placeholder);
+  for (const item of list) {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.dataset.owner = item.owner;
+    option.textContent = item.itemCount === null ? item.title : `${item.title} (${item.itemCount})`;
+    select.append(option);
+  }
+  if (list.some((item) => item.id === previous)) select.value = previous;
+}
+
+/** Loads real playlists for a provider once (cached), so pickers never require a hand-typed ID. */
+async function ensureDiscovered(provider: Platform): Promise<Playlist[]> {
+  if (discovered[provider]) return discovered[provider]!;
+  if (discoveredLoading[provider]) return discoveredRequest[provider] ?? [];
+  discoveredLoading[provider] = true;
+  discoveredError[provider] = null;
+  renderSync();
+  // Wait for any discovery already queued for another provider before issuing this one, so
+  // concurrent discover calls never race for the server's single global inventory reservation.
+  const previousInQueue = discoveryQueue;
+  const requestPromise = previousInQueue.then(async () => {
+    try {
+      const response = await request<{ playlists: Playlist[] }>(`/api/sync/discover/${provider}`);
+      discovered[provider] = response.playlists;
+      return response.playlists;
+    } catch (error) {
+      discoveredError[provider] = message(error);
+      discovered[provider] = [];
+      return [];
+    } finally {
+      discoveredLoading[provider] = false;
+      discoveredRequest[provider] = null;
+      if (!disposed) renderSync();
+    }
+  });
+  // Keep the queue alive regardless of this request's outcome, so one provider's failure
+  // never blocks the next queued discovery for a different provider.
+  discoveryQueue = requestPromise.then(() => undefined, () => undefined);
+  discoveredRequest[provider] = requestPromise;
+  return requestPromise;
+}
+
+function renderSync(): void {
+  const available = sync !== null;
+  const pairs = sync?.pairs ?? [];
+  ui.syncFooterState.textContent = available ? "Available" : "Not configured";
+  ui.syncFeedback.textContent = syncError
+    ? `${syncError} No remote changes were made.`
+    : syncLoading ? "Loading pair state…"
+      : available ? "Pairing is explicit. Ambiguous, unpaired or ignored playlists are never changed."
+        : "Direct Spotify and YouTube Music synchronization is not configured in this release.";
+  ui.syncFeedback.dataset.error = String(Boolean(syncError));
+  const selected = ui.syncPairSelect.value;
+  ui.syncPairSelect.replaceChildren();
+  for (const pair of pairs) {
+    const option = document.createElement("option");
+    option.value = pair.id;
+    option.textContent = pairLabel(pair);
+    ui.syncPairSelect.append(option);
+  }
+  if (pairs.some((pair) => pair.id === selected)) ui.syncPairSelect.value = selected;
+  ui.syncPairSelect.disabled = syncBusy || syncLoading || !available || pairs.length === 0;
+  const selectedPair = pairs.find((pair) => pair.id === ui.syncPairSelect.value);
+  ui.syncNow.disabled = ui.syncPairSelect.disabled || !selectedPair || !selectedPair.enabled;
+  ui.syncAllPairs.disabled = syncBusy || syncLoading || !available || pairs.filter((pair) => pair.enabled).length === 0;
+  ui.autoPairByName.disabled = syncBusy || syncLoading || !available;
+  if (available) {
+    void ensureDiscovered(ui.pairLeftProvider.value as Platform);
+    void ensureDiscovered(ui.pairRightProvider.value as Platform);
+    void ensureDiscovered(ui.ignoreProvider.value as Platform);
+  }
+  populatePlaylistSelect(ui.pairLeftPlaylist, ui.pairLeftProvider.value as Platform);
+  populatePlaylistSelect(ui.pairRightPlaylist, ui.pairRightProvider.value as Platform);
+  populatePlaylistSelect(ui.ignorePlaylist, ui.ignoreProvider.value as Platform);
+  ui.pairForm.querySelectorAll("input, select, button").forEach((control) => {
+    (control as HTMLInputElement | HTMLSelectElement | HTMLButtonElement).disabled = syncBusy || syncLoading || !available;
+  });
+  ui.ignoreForm.querySelectorAll("input, select, button").forEach((control) => {
+    (control as HTMLInputElement | HTMLSelectElement | HTMLButtonElement).disabled = syncBusy || syncLoading || !available;
+  });
+  ui.syncPairs.replaceChildren();
+  for (const pair of pairs) {
+    const row = text("p", pairLabel(pair), "sync-record");
+    row.append(text("span", pair.enabled ? "Active" : "Inactive", "badge"));
+    const remove = text("button", "Remove", "text-button") as HTMLButtonElement;
+    remove.type = "button";
+    remove.disabled = syncBusy || !available;
+    remove.addEventListener("click", () => { void removePair(pair.id); });
+    row.append(remove);
+    ui.syncPairs.append(row);
+  }
+  if (pairs.length === 0) ui.syncPairs.append(text("p", "No pairs have been confirmed.", "sync-empty"));
+  ui.syncIgnored.replaceChildren();
+  for (const item of sync?.ignores ?? []) {
+    const row = text("p", `${platformLabel(item.provider)} "${playlistTitle(item)}"`, "sync-record");
+    row.append(text("span", "Ignored", "badge"));
+    if (item.reason) row.append(text("span", item.reason, "playlist-owner"));
+    const restore = text("button", "Unignore", "text-button") as HTMLButtonElement;
+    restore.type = "button";
+    restore.disabled = syncBusy || !available;
+    restore.addEventListener("click", () => { void unignore(item); });
+    row.append(restore);
+    ui.syncIgnored.append(row);
+  }
+  if (!sync?.ignores.length) ui.syncIgnored.append(text("p", "No playlists are ignored.", "sync-empty"));
+  ui.syncLogs.replaceChildren();
+  for (const run of sync?.runs ?? []) {
+    const row = text("p", `${timestamp(run.startedAt)} · ${run.status}`, "sync-record");
+    if (run.message) row.append(text("span", run.message, "playlist-owner"));
+    ui.syncLogs.append(row);
+  }
+  if (!sync?.runs.length) ui.syncLogs.append(text("p", "No sync runs have been recorded.", "sync-empty"));
+  renderRemovals();
+}
+
+async function loadSync(): Promise<void> {
+  if (syncLoading) return;
+  syncLoading = true;
+  syncError = null;
+  renderSync();
+  try {
+    sync = await request<SyncState>("/api/sync");
+    removals = sync.removals ?? [];
+    removalsLoaded = true;
+  } catch (error) {
+    sync = null;
+    removals = [];
+    removalsLoaded = false;
+    syncError = message(error);
+  } finally {
+    syncLoading = false;
+    if (!disposed) renderSync();
+  }
+}
+
+/** Codes the API returns before a run is ever persisted (validation, disabled
+ * services, an unknown pair, or an already-running operation). Any other
+ * error reaching this point means the run was recorded, then failed. */
+const RUN_NOT_STARTED_CODES = new Set([
+  "SYNC_UNAVAILABLE",
+  "INVALID_SYNC_RUN",
+  "SYNC_BUSY",
+  "SYNC_PAIR_NOT_FOUND",
+  "SYNC_PAIR_DISABLED",
+]);
+
+function runDidNotStart(error: unknown): boolean {
+  if (!(error instanceof RequestError)) return true;
+  return error.code === null || RUN_NOT_STARTED_CODES.has(error.code);
+}
+
+async function syncNow(): Promise<void> {
+  if (ui.syncNow.disabled) return;
+  const pairId = ui.syncPairSelect.value;
+  if (!pairId) {
+    notify("Select an explicit pair before synchronizing. Unpaired playlists are never changed.", "error");
+    return;
+  }
+  syncBusy = true;
+  renderSync();
+  try {
+    const response = await request<{ run: SyncRun }>("/api/sync/run", "POST", { pairId });
+    notify(
+      response.run.status === "complete"
+        ? "Synchronization completed."
+        : `Synchronization finished with status: ${response.run.status}.`,
+      response.run.status === "complete" ? "success" : "info",
+    );
+    await loadSync();
+  } catch (error) {
+    notify(runDidNotStart(error)
+      ? `Synchronization did not start. ${message(error)}`
+      : `Synchronization failed. ${message(error)} The outcome was recorded; check Recent sync runs.`, "error");
+    await loadSync();
+  } finally {
+    syncBusy = false;
+    if (!disposed) renderSync();
+  }
+}
+
+/**
+ * Runs every enabled pair one at a time (never in parallel, to stay gentle on both providers'
+ * rate limits) and reports a single aggregate summary. Each pair's outcome is independent: one
+ * pair failing never stops or skips the rest.
+ */
+async function syncAllPairs(): Promise<void> {
+  if (ui.syncAllPairs.disabled || !sync) return;
+  const pairs = sync.pairs.filter((pair) => pair.enabled);
+  if (pairs.length === 0) return;
+  syncBusy = true;
+  renderSync();
+  let completed = 0;
+  const failures: string[] = [];
+  // "review-required" is a deliberate, safe outcome (e.g. an unacknowledged conflict or a
+  // not-yet-supported cross-provider pair) - not an error - and must be reported to the user
+  // distinctly from an actual failure instead of being counted as one.
+  const reviewRequired: string[] = [];
+  try {
+    for (const pair of pairs) {
+      try {
+        const response = await request<{ run: SyncRun }>("/api/sync/run", "POST", { pairId: pair.id });
+        if (response.run.status === "complete") completed += 1;
+        else if (response.run.status === "review-required") reviewRequired.push(pairLabel(pair));
+        else failures.push(`${pairLabel(pair)}: ${response.run.status}`);
+      } catch (error) {
+        failures.push(`${pairLabel(pair)}: ${message(error)}`);
+      }
+    }
+    const parts: string[] = [`Synchronized ${completed} of ${pairs.length} pair${pairs.length === 1 ? "" : "s"}.`];
+    if (reviewRequired.length > 0) parts.push(`${reviewRequired.length} need review: ${reviewRequired.join("; ")}`);
+    if (failures.length > 0) parts.push(`${failures.length} failed: ${failures.join("; ")}`);
+    notify(parts.join(" "), failures.length > 0 ? "error" : reviewRequired.length > 0 ? "info" : "success");
+    await loadSync();
+  } finally {
+    syncBusy = false;
+    if (!disposed) renderSync();
+  }
+}
+
+async function removePair(id: string): Promise<void> {
+  syncBusy = true;
+  renderSync();
+  try {
+    sync = await request<SyncState>(`/api/sync/pairs/${encodeURIComponent(id)}`, "DELETE");
+    removals = sync.removals ?? removals;
+  }
+  catch (error) { notify(`Could not remove the pair. ${message(error)}`, "error"); }
+  finally { syncBusy = false; if (!disposed) renderSync(); }
+}
+
+async function unignore(ref: SyncRef): Promise<void> {
+  syncBusy = true;
+  renderSync();
+  const path = `/api/sync/ignored/${ref.provider}/${encodeURIComponent(ref.accountId)}/${encodeURIComponent(ref.playlistId)}`;
+  try { sync = await request<SyncState>(path, "DELETE"); }
+  catch (error) { notify(`Could not restore the playlist. ${message(error)}`, "error"); }
+  finally { syncBusy = false; if (!disposed) renderSync(); }
+}
+
+/** Builds a sync reference from a provider/playlist picker pair, or null while nothing is chosen yet. */
+function refFromPicker(providerSelect: HTMLSelectElement, playlistSelect: HTMLSelectElement): SyncRef | null {
+  const option = playlistSelect.selectedOptions[0];
+  if (!option || !option.value) return null;
+  return {
+    provider: providerSelect.value as Platform,
+    // Only one account per provider is connected today; the playlist's own owner
+    // identifies it without asking the user to type an account ID by hand.
+    accountId: option.dataset.owner?.trim() || "default",
+    playlistId: option.value,
+  };
+}
+
+async function saveIgnore(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (ui.ignoreForm.querySelector(":invalid")) return;
+  const ref = refFromPicker(ui.ignoreProvider, ui.ignorePlaylist);
+  if (!ref) {
+    notify("Choose a playlist to ignore.", "error");
+    return;
+  }
+  const ignore = { ...ref, reason: ui.ignoreReason.value.trim() };
+  syncBusy = true;
+  renderSync();
+  try {
+    sync = await request<SyncState>("/api/sync/ignored", "POST", ignore);
+    removals = sync.removals ?? removals;
+    ui.ignoreForm.reset();
+    notify("Playlist ignored. It will never be selected by a pair.", "success");
+  } catch (error) { notify(`Could not ignore the playlist. ${message(error)}`, "error"); }
+  finally { syncBusy = false; if (!disposed) renderSync(); }
+}
+
+async function savePair(event: SubmitEvent): Promise<void> {
+  event.preventDefault();
+  if (ui.pairForm.querySelector(":invalid")) return;
+  const left = refFromPicker(ui.pairLeftProvider, ui.pairLeftPlaylist);
+  const right = refFromPicker(ui.pairRightProvider, ui.pairRightPlaylist);
+  if (!left || !right) {
+    notify("Choose a playlist on both sides before saving a pair.", "error");
+    return;
+  }
+  if (left.provider === right.provider) {
+    notify("A pair needs one Spotify playlist and one YouTube Music playlist.", "error");
+    return;
+  }
+  syncBusy = true;
+  renderSync();
+  try {
+    sync = await request<SyncState>("/api/sync/pairs", "POST", { left, right });
+    removals = sync.removals ?? removals;
+    ui.pairForm.reset();
+    notify("Pair saved. Review it before running synchronization.", "success");
+  } catch (error) { notify(`Could not save the pair. ${message(error)}`, "error"); }
+  finally { syncBusy = false; if (!disposed) renderSync(); }
+}
+
+/** Groups playlists by a normalized title, so a title with more than one candidate is
+ * treated as ambiguous rather than guessed at. Uses the same normalizer as the core
+ * pairing/matching logic so auto-pair recognizes the same titles as equal. */
+function groupByTitle(list: readonly Playlist[]): Map<string, Playlist[]> {
+  const groups = new Map<string, Playlist[]>();
+  for (const item of list) {
+    const key = normalizePlaylistName(item.title);
+    if (!key) continue;
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(item); else groups.set(key, [item]);
+  }
+  return groups;
+}
+
+/**
+ * Immediately creates a pair for every playlist whose title matches exactly (case-insensitive)
+ * across both platforms, skipping playlists that are already paired or ignored. A title with
+ * more than one candidate on either side is ambiguous and is skipped, not guessed at.
+ */
+async function autoPairByName(): Promise<void> {
+  if (!sync || ui.autoPairByName.disabled) return;
+  syncBusy = true;
+  renderSync();
+  try {
+    const [youtube, spotify] = await Promise.all([
+      (async () => { discovered.youtube = null; return ensureDiscovered("youtube"); })(),
+      (async () => { discovered.spotify = null; return ensureDiscovered("spotify"); })(),
+    ]);
+    // ensureDiscovered() turns a genuine discovery failure into an empty list (while separately
+    // recording discoveredError), so without this check a real error (e.g. a misconfigured
+    // provider) is misreported as simply finding no matching names.
+    if (discoveredError.youtube || discoveredError.spotify) {
+      notify(
+        `Auto-pair could not check every playlist: ${[discoveredError.youtube, discoveredError.spotify].filter(Boolean).join(" ")}`,
+        "error",
+      );
+      return;
+    }
+    const taken = new Set([
+      ...sync.pairs.flatMap((pair) => [`${pair.left.provider}:${pair.left.playlistId}`, `${pair.right.provider}:${pair.right.playlistId}`]),
+      ...sync.ignores.map((item) => `${item.provider}:${item.playlistId}`),
+    ]);
+    const available = (list: readonly Playlist[]) => list.filter((item) => !taken.has(`${item.provider}:${item.id}`));
+    const youtubeByTitle = groupByTitle(available(youtube));
+    const spotifyByTitle = groupByTitle(available(spotify));
+    let created = 0;
+    const ambiguous: string[] = [];
+    for (const [title, youtubeMatches] of youtubeByTitle) {
+      const spotifyMatches = spotifyByTitle.get(title);
+      if (!spotifyMatches) continue;
+      if (youtubeMatches.length > 1 || spotifyMatches.length > 1) {
+        ambiguous.push(youtubeMatches[0]!.title);
+        continue;
+      }
+      const left: SyncRef = { provider: "youtube", accountId: youtubeMatches[0]!.owner.trim() || "default", playlistId: youtubeMatches[0]!.id };
+      const right: SyncRef = { provider: "spotify", accountId: spotifyMatches[0]!.owner.trim() || "default", playlistId: spotifyMatches[0]!.id };
+      try {
+        sync = await request<SyncState>("/api/sync/pairs", "POST", { left, right });
+        removals = sync.removals ?? removals;
+        created += 1;
+      } catch (error) {
+        notify(`Could not auto-pair "${youtubeMatches[0]!.title}". ${message(error)}`, "error");
+      }
+    }
+    if (created === 0 && ambiguous.length === 0) {
+      notify("No matching playlist names were found to auto-pair.", "info");
+    } else {
+      notify(
+        `Auto-paired ${created} playlist${created === 1 ? "" : "s"} by matching name.`
+          + (ambiguous.length ? ` Skipped ${ambiguous.length} ambiguous title${ambiguous.length === 1 ? "" : "s"}: ${ambiguous.join(", ")}.` : ""),
+        created > 0 ? "success" : "info",
+      );
+    }
+  } catch (error) {
+    notify(`Could not auto-pair playlists. ${message(error)}`, "error");
+  } finally {
+    syncBusy = false;
+    if (!disposed) renderSync();
+  }
+}
+
+
 async function loadInventory(): Promise<void> {
   if (inventoryLoading || !status?.connected || running() || !jobKnown) return;
   inventoryLoading = true;
@@ -714,7 +1316,7 @@ async function boot(loadPlaylists = true): Promise<void> {
     renderInventory();
     await loadCurrentJob();
     if (disposed) return;
-    await Promise.all([loadHistory(), loadPlaylists && jobKnown && !running() ? loadInventory() : Promise.resolve()]);
+    await Promise.all([loadHistory(), loadSync(), loadPlaylists && jobKnown && !running() ? loadInventory() : Promise.resolve()]);
     if (disposed) return;
     renderInventory();
     ui.retryStatus.hidden = true;
@@ -834,6 +1436,18 @@ ui.refreshHistory.addEventListener("click", () => { void loadHistory(); });
 ui.recheckRetention.addEventListener("click", () => { void recheckRetention(); });
 ui.search.addEventListener("input", renderInventory);
 ui.retryJob.addEventListener("click", () => { void loadCurrentJob(); });
+ui.syncNow.addEventListener("click", () => { void syncNow(); });
+ui.syncAllPairs.addEventListener("click", () => { void syncAllPairs(); });
+ui.syncPairSelect.addEventListener("change", renderSync);
+ui.autoPairByName.addEventListener("click", () => { void autoPairByName(); });
+ui.pairForm.addEventListener("submit", (event) => { void savePair(event); });
+ui.ignoreForm.addEventListener("submit", (event) => { void saveIgnore(event); });
+ui.pairLeftProvider.addEventListener("change", renderSync);
+ui.pairRightProvider.addEventListener("change", renderSync);
+ui.ignoreProvider.addEventListener("change", renderSync);
+ui.refreshRemovals.addEventListener("click", () => { void loadRemovals(); });
+ui.removalFilters.addEventListener("submit", (event) => { event.preventDefault(); void loadRemovals(); });
+ui.removalFiltersClear.addEventListener("click", () => { ui.removalFilters.reset(); void loadRemovals(); });
 ui.retryStatus.addEventListener("click", () => { void boot(false); });
 ui.recheckConnection.addEventListener("click", () => { void boot(false); });
 ui.dismissNotice.addEventListener("click", () => { ui.notice.hidden = true; });
@@ -860,9 +1474,11 @@ const callbackUrl = new URL(window.location.href);
 const authError = callbackUrl.searchParams.get("authError");
 if (authError) notify(`YouTube authorization was not completed. ${authError}`, "error");
 else if (callbackUrl.searchParams.get("connected") === "1") notify("YouTube authorization completed. Checking your connection…", "success");
-if (callbackUrl.searchParams.has("authError") || callbackUrl.searchParams.has("connected")) {
+else if (callbackUrl.searchParams.get("writeConnected") === "1") notify("YouTube write authorization completed. Playlist sync can now apply changes.", "success");
+if (callbackUrl.searchParams.has("authError") || callbackUrl.searchParams.has("connected") || callbackUrl.searchParams.has("writeConnected")) {
   callbackUrl.searchParams.delete("authError");
   callbackUrl.searchParams.delete("connected");
+  callbackUrl.searchParams.delete("writeConnected");
   window.history.replaceState(null, "", callbackUrl);
 }
 void boot();

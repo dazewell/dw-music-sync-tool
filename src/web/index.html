@@ -160,9 +160,132 @@ Direction: seed895a4aee / candidate4, mixing-desk studio console.
         </aside>
       </div>
 
+      <section class="sync-console" aria-labelledby="sync-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="sync-title">Cross-platform sync</h2>
+            <p>Direct Spotify and YouTube Music APIs only. Removals mirror in both directions after the sync service verifies the plan.</p>
+          </div>
+          <div class="sync-trigger">
+            <label for="sync-pair">Pair to synchronize</label>
+            <select id="sync-pair" disabled></select>
+            <button id="sync-now" class="primary-button" type="button" disabled>Sync Pair</button>
+            <button id="sync-all-pairs" class="primary-button" type="button" disabled>Sync all pairs</button>
+            <button id="auto-pair-by-name" class="secondary-button" type="button" disabled>Auto-pair by name</button>
+          </div>
+        </div>
+        <div id="sync-feedback" class="table-feedback" role="status" aria-live="polite">Checking sync service…</div>
+        <div class="sync-grid">
+          <section aria-labelledby="pair-list-title">
+            <h3 id="pair-list-title">Active pairs</h3>
+            <div id="sync-pairs"></div>
+          </section>
+          <section aria-labelledby="ignored-list-title">
+            <h3 id="ignored-list-title">Ignored playlists</h3>
+            <div id="sync-ignored"></div>
+            <form id="ignore-form" class="sync-form">
+              <label for="ignore-provider">Platform</label>
+              <select id="ignore-provider" name="ignore-provider">
+                <option value="spotify">Spotify</option>
+                <option value="youtube">YouTube Music</option>
+              </select>
+              <label for="ignore-playlist">Playlist</label>
+              <select id="ignore-playlist" name="ignore-playlist" required></select>
+              <label for="ignore-reason">Reason (optional)</label>
+              <input id="ignore-reason" name="ignore-reason" autocomplete="off" maxlength="500">
+              <button class="secondary-button" type="submit">Ignore playlist</button>
+            </form>
+          </section>
+          <section aria-labelledby="pair-form-title">
+            <h3 id="pair-form-title">Manage a pair</h3>
+            <p>Pick real playlists discovered from your connected accounts; no IDs to type.</p>
+            <form id="pair-form" class="sync-form">
+              <label for="pair-left-provider">First platform</label>
+              <select id="pair-left-provider" name="pair-left-provider">
+                <option value="spotify">Spotify</option>
+                <option value="youtube">YouTube Music</option>
+              </select>
+              <label for="pair-left-playlist">First playlist</label>
+              <select id="pair-left-playlist" name="pair-left-playlist" required></select>
+              <label for="pair-right-provider">Second platform</label>
+              <select id="pair-right-provider" name="pair-right-provider">
+                <option value="youtube">YouTube Music</option>
+                <option value="spotify">Spotify</option>
+              </select>
+              <label for="pair-right-playlist">Second playlist</label>
+              <select id="pair-right-playlist" name="pair-right-playlist" required></select>
+              <button class="secondary-button" type="submit">Save pair</button>
+            </form>
+          </section>
+        </div>
+        <details class="sync-history">
+          <summary>Recent sync runs</summary>
+          <div id="sync-logs"></div>
+        </details>
+        <details class="sync-history" id="removal-audit">
+          <summary>Removal audit records</summary>
+          <div class="details-body">
+            <p>Removals are mirrored in both directions. Each attempt is kept as a durable record of the platform changed, the playlist, the provider-native track identity, the direction, the time and the outcome.</p>
+            <form id="removal-filters" class="removal-filters">
+              <label for="removal-filter-platform">Platform
+                <select id="removal-filter-platform" name="removal-filter-platform" disabled>
+                  <option value="">Any platform</option>
+                  <option value="youtube">YouTube Music</option>
+                  <option value="spotify">Spotify</option>
+                </select>
+              </label>
+              <label for="removal-filter-playlist">Playlist ID
+                <input id="removal-filter-playlist" name="removal-filter-playlist" autocomplete="off" disabled>
+              </label>
+              <label for="removal-filter-identity">Track identity
+                <input id="removal-filter-identity" name="removal-filter-identity" autocomplete="off" placeholder="Search track identity" disabled>
+              </label>
+              <label for="removal-filter-direction">Direction
+                <select id="removal-filter-direction" name="removal-filter-direction" disabled>
+                  <option value="">Any direction</option>
+                  <option value="left-to-right">Left to right</option>
+                  <option value="right-to-left">Right to left</option>
+                </select>
+              </label>
+              <label for="removal-filter-outcome">Outcome
+                <select id="removal-filter-outcome" name="removal-filter-outcome" disabled>
+                  <option value="">Any outcome</option>
+                  <option value="success">Removed</option>
+                  <option value="unknown">Unknown</option>
+                  <option value="failed">Failed</option>
+                </select>
+              </label>
+              <button class="secondary-button" type="submit">Search</button>
+              <button id="removal-filters-clear" class="text-button" type="button" disabled>Clear filters</button>
+            </form>
+            <div class="section-heading">
+              <p id="removal-feedback" role="status" aria-live="polite">Checking removal audit records…</p>
+              <button id="refresh-removals" class="text-button" type="button" disabled>Refresh Removal Records</button>
+            </div>
+            <div id="removal-table-wrap" class="table-scroll" role="region" aria-label="Removal audit records" tabindex="0" hidden>
+              <table>
+                <caption class="visually-hidden">Durable records of mirrored playlist removals</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Platform</th>
+                    <th scope="col">Playlist</th>
+                    <th scope="col">Track identity</th>
+                    <th scope="col">Direction</th>
+                    <th scope="col">Time</th>
+                    <th scope="col">Outcome</th>
+                  </tr>
+                </thead>
+                <tbody id="removal-rows"></tbody>
+              </table>
+            </div>
+          </div>
+        </details>
+      </section>
+
       <footer class="workspace-footer">
-        <p>Files stay local. Account authorization is read-only.</p>
-        <p><strong>Spotify sync</strong> <span class="future-label">Future · not available</span></p>
+        <p>Files stay local. Google backup authorization is read-only.</p>
+        <p>Spotify and YouTube sync authorization is write-capable and separately, explicitly consented: it can add and remove tracks in paired playlists.</p>
+        <p><strong>Spotify sync</strong> <span id="sync-footer-state" class="future-label">Checking availability…</span></p>
       </footer>
     </main>
   </body>

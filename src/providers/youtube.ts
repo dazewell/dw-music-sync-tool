@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { AppError } from "../core/errors.js";
-import type { Playlist, PlaylistContents, PlaylistEntry, PlaylistProvider } from "../core/models.js";
+import type { Playlist, PlaylistContents, PlaylistEntry, PlaylistMutation, PlaylistProvider } from "../core/models.js";
 
 const API_ROOT = "https://www.googleapis.com/youtube/v3/";
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -16,11 +17,13 @@ const playlistSchema = z.object({
   snippet: z.object({
     title: z.string(),
     description: z.string(),
+    channelId: z.string().optional(),
     channelTitle: z.string(),
   }),
   contentDetails: z.object({ itemCount: count }),
   status: status.optional(),
 });
+const channelSchema = z.object({ id: nonempty });
 
 const itemSchema = z.object({
   id: nonempty,
@@ -49,6 +52,8 @@ const itemSchema = z.object({
   status: status.optional(),
 });
 
+const insertedItemSchema = z.object({ id: nonempty });
+
 function pageSchema<T extends z.ZodType>(item: T) {
   return z.object({
     items: z.array(item),
@@ -60,18 +65,31 @@ function pageSchema<T extends z.ZodType>(item: T) {
   });
 }
 
+/** Summarizes the first few schema validation issues so a shape mismatch is diagnosable
+ * from the error message alone, instead of a bare "invalid response" with no detail. */
+function describeIssues(result: z.ZodSafeParseError<unknown>): string {
+  return result.error.issues.slice(0, 3).map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`).join("; ");
+}
+
 type YouTubeItem = z.infer<typeof itemSchema>;
 
 export interface YouTubeProviderOptions {
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Supplies an access token for a separately, explicitly consented write-capable Google
+   * credential. Never derive this from the read-only backup credential: if it is omitted,
+   * every mutating call fails closed before any request is sent.
+   */
+  writeAccessToken?: () => Promise<string>;
 }
 
-export class YouTubeProvider implements PlaylistProvider {
+export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
   readonly id = "youtube" as const;
   readonly coverage = "Owned playlists exposed by the official YouTube Data API, including non-music videos; not a complete YouTube Music library. Saved third-party playlists and special Music collections (mixes, audio uploads, liked Music) are outside this backup's coverage. Private/deleted entries may have incomplete metadata. Metadata only; no audio downloads.";
   private readonly fetcher: typeof fetch;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly writeAccessToken: (() => Promise<string>) | undefined;
 
   constructor(
     private readonly accessToken: () => Promise<string>,
@@ -79,6 +97,7 @@ export class YouTubeProvider implements PlaylistProvider {
   ) {
     this.fetcher = options.fetch ?? globalThis.fetch;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.writeAccessToken = options.writeAccessToken;
   }
 
   async listPlaylists(): Promise<Playlist[]> {
@@ -101,22 +120,41 @@ export class YouTubeProvider implements PlaylistProvider {
           + `pageInfo.totalResults reported ${[...new Set(totals)].join(", ")}. Using the returned playlists.`,
       );
     }
-    return items.map((item) => ({
-      provider: this.id,
-      id: item.id,
-      title: item.snippet.title,
-      description: item.snippet.description,
-      owner: item.snippet.channelTitle,
-      itemCount: item.contentDetails.itemCount,
-      visibility: item.status?.privacyStatus ?? "unknown",
-      url: `https://www.youtube.com/playlist?list=${encodeURIComponent(item.id)}`,
-    }));
+    return items.map((item) => {
+      // mine=true always scopes results to the authenticated channel's own playlists, so a
+      // missing channelId is anomalous. Falling back to the mutable, display-only channelTitle
+      // would silently store an owner value that can never match getAuthenticatedAccountId()'s
+      // stable channel id, permanently breaking account verification for that playlist; fail
+      // closed instead, consistent with Spotify's owner.id requirement.
+      if (!item.snippet.channelId) {
+        throw new AppError("YOUTUBE_RESPONSE_INVALID", "YouTube did not return a channel id for one of your playlists.", 502);
+      }
+      return {
+        provider: this.id,
+        id: item.id,
+        title: item.snippet.title,
+        description: item.snippet.description,
+        owner: item.snippet.channelId,
+        itemCount: item.contentDetails.itemCount,
+        visibility: item.status?.privacyStatus ?? "unknown",
+        url: `https://www.youtube.com/playlist?list=${encodeURIComponent(item.id)}`,
+      };
+    });
+  }
+
+  /** Fetches the id of the channel actually authenticated by the given credential scope. */
+  async getAuthenticatedAccountId(scope: "read" | "write" = "read"): Promise<string> {
+    const { items } = await this.pages("channels", { part: "id", mine: "true", maxResults: "1" }, channelSchema, scope);
+    const channel = items[0];
+    if (!channel) throw new AppError("YOUTUBE_RESPONSE_INVALID", "YouTube did not return the authenticated channel id.", 502);
+    return channel.id;
   }
 
   async getPlaylist(playlist: Playlist): Promise<PlaylistContents> {
     if (playlist.provider !== this.id || !playlist.id) {
       throw new AppError("YOUTUBE_PLAYLIST_INVALID", "A YouTube playlist is required.", 400);
     }
+
     const { items, totals } = await this.pages(
       "playlistItems",
       { part: "snippet,contentDetails,status", playlistId: playlist.id, maxResults: "50" },
@@ -143,7 +181,90 @@ export class YouTubeProvider implements PlaylistProvider {
     if (entries.some((entry) => entry.mediaId === null)) {
       warnings.push("Some entries have no video ID in the API response; the entries were preserved without a media link.");
     }
-    return { playlist, entries, warnings };
+    // YouTube has no native snapshot/etag concept for a playlist's ordered item list. Derive one
+    // from the ordered playlist-item IDs so a concurrent edit between this observation and a
+    // later write can be detected the same way Spotify's snapshot_id is used, instead of a write
+    // blindly deleting whatever this fresh read finds (which could include items added since).
+    const snapshotId = createHash("sha256").update(JSON.stringify(entries.map((entry) => entry.id))).digest("hex");
+    return { playlist: { ...playlist, snapshotId }, entries, warnings };
+  }
+
+  async replacePlaylist(playlist: Playlist, entries: readonly PlaylistEntry[], expectedSnapshotId?: string): Promise<void> {
+    if (playlist.provider !== this.id || !playlist.id) {
+      throw new AppError("YOUTUBE_PLAYLIST_INVALID", "A YouTube playlist is required.", 400);
+    }
+    // Fail closed before any request: without a separately consented write-capable credential,
+    // no playlist mutation can be authorized by Google, and none is attempted.
+    if (this.writeAccessToken === undefined) {
+      throw new AppError(
+        "YOUTUBE_WRITE_NOT_AUTHORIZED",
+        "YouTube playlist writes require a separately, explicitly authorized write-scope Google credential. Connect write access before syncing changes to YouTube.",
+        403,
+      );
+    }
+    if (entries.some(entry => entry.mediaId === null || entry.availability === "unavailable")) {
+      throw new AppError("YOUTUBE_ENTRY_UNSUPPORTED", "Unavailable entries cannot be written to YouTube without a video ID.", 409);
+    }
+    // The read credential's account is verified against the pair before this method is ever
+    // called, but the separately-consented write credential is not: if write access was granted
+    // for a different Google account, every check upstream would still pass while this write
+    // silently mutates the wrong account's channel. Verify the credential that will actually
+    // perform the mutation, not just the one that read the playlist.
+    const writeAccountId = await this.getAuthenticatedAccountId("write");
+    const expectedAccountId = playlist.owner.trim() || "default";
+    if (writeAccountId !== expectedAccountId) {
+      throw new AppError(
+        "YOUTUBE_WRITE_ACCOUNT_MISMATCH",
+        "The write-authorized Google account does not match the account this playlist belongs to. Reconnect write access for the correct account before syncing.",
+        409,
+      );
+    }
+    const current = await this.getPlaylist(playlist);
+    // A fresh read here only supplies IDs for the later deletes; without comparing it against
+    // what was actually observed when the sync plan was built, a concurrent edit to the
+    // destination (e.g. a manually added video) between planning and this write would be
+    // silently deleted along with the previous entries. Fail closed instead.
+    if (expectedSnapshotId !== undefined && current.playlist.snapshotId !== expectedSnapshotId) {
+      throw new AppError("YOUTUBE_STALE_PLAYLIST", "The YouTube playlist changed before the sync could be applied.", 409);
+    }
+    // Insert the new entries before removing the previous ones. If insertion fails partway
+    // (network error, quota, malformed response) the previous playlist entries are still
+    // intact instead of already deleted; nothing is lost, and the failure is explicit.
+    const insertUrl = new URL(`playlistItems?${new URLSearchParams({ part: "snippet" }).toString()}`, API_ROOT);
+    const insertedIds: string[] = [];
+    try {
+      for (const entry of entries) {
+        const body = await this.request(insertUrl, {
+          method: "POST",
+          body: JSON.stringify({ snippet: { playlistId: playlist.id, resourceId: { kind: "youtube#video", videoId: entry.mediaId } } }),
+        }, "write");
+        const inserted = insertedItemSchema.safeParse(body);
+        if (!inserted.success) {
+          throw new AppError(
+            "YOUTUBE_INSERT_UNCONFIRMED",
+            "YouTube did not confirm the inserted playlist item. The previously existing items were preserved; review the playlist before retrying.",
+            502,
+          );
+        }
+        insertedIds.push(inserted.data.id);
+      }
+    } catch (error) {
+      // A later insert failed after some earlier ones succeeded. Leaving the successful
+      // inserts in place alongside the still-intact original entries would let a retry
+      // compound duplicates, so best-effort clean them up before surfacing the failure.
+      for (const id of insertedIds) {
+        try {
+          await this.request(new URL(`playlistItems?${new URLSearchParams({ id }).toString()}`, API_ROOT), { method: "DELETE" }, "write");
+        } catch {
+          // Cleanup failing must not mask the original insert failure below; the playlist may
+          // still contain some inserted duplicates and needs manual review in that case.
+        }
+      }
+      throw error;
+    }
+    for (const entry of current.entries) {
+      await this.request(new URL(`playlistItems?${new URLSearchParams({ id: entry.id }).toString()}`, API_ROOT), { method: "DELETE" }, "write");
+    }
   }
 
   private entry(item: YouTubeItem): PlaylistEntry {
@@ -168,6 +289,7 @@ export class YouTubeProvider implements PlaylistProvider {
     endpoint: string,
     parameters: Record<string, string>,
     schema: T,
+    tokenKind: "read" | "write" = "read",
   ): Promise<{ items: z.infer<T>[]; totals: number[] }> {
     const items: z.infer<T>[] = [];
     const totals: number[] = [];
@@ -177,9 +299,9 @@ export class YouTubeProvider implements PlaylistProvider {
       const url = new URL(endpoint, API_ROOT);
       for (const [key, value] of Object.entries(parameters)) url.searchParams.set(key, value);
       if (pageToken !== undefined) url.searchParams.set("pageToken", pageToken);
-      const parsed = pageSchema(schema).safeParse(await this.request(url));
+      const parsed = pageSchema(schema).safeParse(await this.request(url, {}, tokenKind));
       if (!parsed.success) {
-        throw new AppError("YOUTUBE_RESPONSE_INVALID", "YouTube returned an invalid playlist response. No complete backup can be assumed.", 502);
+        throw new AppError("YOUTUBE_RESPONSE_INVALID", `YouTube returned an invalid playlist response (${describeIssues(parsed)}). No complete backup can be assumed.`, 502);
       }
       items.push(...parsed.data.items);
       if (parsed.data.pageInfo !== undefined) totals.push(parsed.data.pageInfo.totalResults);
@@ -194,16 +316,34 @@ export class YouTubeProvider implements PlaylistProvider {
     return { items, totals };
   }
 
-  private async request(url: URL): Promise<unknown> {
+  private async request(url: URL, init: RequestInit = {}, tokenKind: "read" | "write" = "read"): Promise<unknown> {
+    const method = (init.method ?? "GET").toUpperCase();
+    // Automatic retries are safe only for idempotent reads. A lost or transient response to a
+    // non-idempotent playlist insert/delete could otherwise be retried and duplicate or repeat it.
+    const retryable = method === "GET";
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
       let token: string;
       try {
-        token = await this.accessToken();
-      } catch {
-        throw new AppError("YOUTUBE_AUTH_FAILED", "Unable to obtain YouTube access. Check your Google connection and reconnect if needed.", 401);
+        token = tokenKind === "write" ? await this.writeAccessToken!() : await this.accessToken();
+      } catch (error) {
+        // Preserve a specific, actionable AppError from the token supplier (e.g. a distinct
+        // "write access not connected" or refresh failure) instead of masking it with a generic
+        // "check your Google connection" message that loses that detail.
+        if (error instanceof AppError) throw error;
+        throw new AppError(
+          tokenKind === "write" ? "YOUTUBE_WRITE_AUTH_FAILED" : "YOUTUBE_AUTH_FAILED",
+          "Unable to obtain YouTube access. Check your Google connection and reconnect if needed.",
+          401,
+        );
       }
       if (!token) {
-        throw new AppError("YOUTUBE_AUTH_FAILED", "Connect your Google account before reading YouTube playlists.", 401);
+        throw new AppError(
+          tokenKind === "write" ? "YOUTUBE_WRITE_AUTH_FAILED" : "YOUTUBE_AUTH_FAILED",
+          tokenKind === "write"
+            ? "Connect write-capable Google access before changing YouTube playlists."
+            : "Connect your Google account before reading YouTube playlists.",
+          401,
+        );
       }
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -213,8 +353,14 @@ export class YouTubeProvider implements PlaylistProvider {
         const result = await Promise.race([
           (async () => {
             const fetched = await this.fetcher(url, {
-              method: "GET",
-              headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+              ...init,
+              method: init.method ?? "GET",
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: "application/json",
+                ...(init.body ? { "Content-Type": "application/json" } : {}),
+                ...(init.headers ?? {}),
+              },
               signal: controller.signal,
               redirect: "error",
             });
@@ -244,7 +390,13 @@ export class YouTubeProvider implements PlaylistProvider {
       }
       if (response.ok) return body;
       if (response.status === 401) {
-        throw new AppError("YOUTUBE_UNAUTHORIZED", "Google authorization was rejected. Reconnect your Google account, then retry.", 401);
+        throw new AppError(
+          "YOUTUBE_UNAUTHORIZED",
+          tokenKind === "write"
+            ? "Google write authorization was rejected. Reconnect write access, then retry."
+            : "Google authorization was rejected. Reconnect your Google account, then retry.",
+          401,
+        );
       }
       let rateLimited = response.status === 429;
       if (response.status === 403) {
@@ -265,6 +417,13 @@ export class YouTubeProvider implements PlaylistProvider {
         throw new AppError("YOUTUBE_NOT_FOUND", "The YouTube playlist was not found or is no longer accessible.", 404);
       }
       if (rateLimited || response.status >= 500) {
+        if (!retryable) {
+          throw new AppError(
+            "YOUTUBE_MUTATION_FAILED",
+            "YouTube rate-limited or temporarily failed this playlist write. Automatic retry was skipped because retrying a non-idempotent change could duplicate or repeat it. Check the playlist state, then retry manually.",
+            502,
+          );
+        }
         if (attempt < MAX_RETRIES) {
           const retryAfter = response.headers.get("retry-after");
           const requested = retryAfter === null ? NaN
@@ -292,7 +451,13 @@ export class YouTubeProvider implements PlaylistProvider {
           503,
         );
       }
-      throw new AppError("YOUTUBE_REQUEST_FAILED", "YouTube could not complete the playlist request. Check your Google connection and retry.", 502);
+      throw new AppError(
+        tokenKind === "write" ? "YOUTUBE_MUTATION_FAILED" : "YOUTUBE_REQUEST_FAILED",
+        tokenKind === "write"
+          ? "YouTube could not complete the playlist write. Check your Google write access and retry."
+          : "YouTube could not complete the playlist request. Check your Google connection and retry.",
+        502,
+      );
     }
     throw new AppError("YOUTUBE_REQUEST_FAILED", "YouTube could not complete the playlist request.", 502);
   }

@@ -5,21 +5,137 @@ import type { AppConfig } from "../config.js";
 import { listBackups, readManifest, resolveBackupFile, runBackup } from "../core/backup.js";
 import { backupExpiresAt } from "../core/retention.js";
 import { AppError, errorMessage } from "../core/errors.js";
-import type { PlaylistProvider } from "../core/models.js";
+import type { PlaylistProvider, ProviderId, Playlist } from "../core/models.js";
+import type { SyncIgnore, SyncPair, SyncPairRef, SyncRemovalAudit } from "../core/sync.js";
+import type { SyncRun, SyncState } from "../core/sync-state.js";
 import type { BackupJob, StatusResponse } from "../shared/api.js";
 import { RetentionController } from "../services/retention.js";
 
+export type { SyncIgnore, SyncPair, SyncPairRef, SyncRemovalAudit, SyncRun, SyncState };
+
+/**
+ * A durable removal audit record as presented by the API: the core audit plus
+ * the run it belongs to and the platform the removal mirrored from. Mirroring
+ * deletes remote entries, so every attempt stays inspectable afterwards.
+ */
+export interface SyncRemovalRecord extends SyncRemovalAudit {
+  runId: string;
+  runStatus: SyncRun["status"];
+  /** The paired platform the removal mirrored from; null when the pair is gone. */
+  sourcePlatform: ProviderId | null;
+}
+
+/** The sync surface presented to clients; persisted baselines stay internal. */
+export interface SyncStateView {
+  pairs: SyncPair[];
+  ignores: SyncIgnore[];
+  runs: SyncRun[];
+  removals: SyncRemovalRecord[];
+}
+
+/**
+ * The sync application service owns provider discovery, matching, persistence,
+ * direct API writes, verification and removal policy. The interface keeps the
+ * HTTP/CLI layers from reimplementing any of those decisions.
+ */
+export interface SyncIntegration {
+  state(): Promise<SyncState>;
+  pair(pairing: SyncPair): Promise<SyncState>;
+  unpair(id: string): Promise<SyncState>;
+  ignore(ignore: SyncIgnore): Promise<SyncState>;
+  unignore(ref: SyncPairRef): Promise<SyncState>;
+  run(pairId: string): Promise<SyncRun>;
+  /** Lists real playlists currently visible to the given provider, for a picker UI. */
+  discover(provider: ProviderId): Promise<Playlist[]>;
+}
+
+const RECENT_RUNS = 20;
+const RECENT_REMOVALS = 100;
+// The search endpoint's own default when the caller omits `limit`: large enough to cover
+// realistic searches, but still bounded, unlike passing `undefined` straight through (which
+// returns the entire unbounded removal history from collectRemovalRecords).
+const DEFAULT_REMOVAL_SEARCH_LIMIT = 500;
+const AUTH_PENDING_TTL_MS = 600_000;
+const AUTH_START_WINDOW_MS = 600_000;
+const AUTH_START_LIMIT = 5;
+
+/** Optional filters for the durable removal audit history: safe equality checks
+ * plus a case-insensitive substring search on the provider-native track identity. */
+export interface RemovalRecordQuery {
+  pairId?: string;
+  platform?: ProviderId;
+  playlistId?: string;
+  itemIdentity?: string;
+  direction?: SyncRemovalAudit["direction"];
+  outcome?: SyncRemovalAudit["outcome"];
+  limit?: number;
+}
+
+/** Flattens durable run audits into newest-first removal records, applying any filters. */
+export function collectRemovalRecords(
+  state: SyncState,
+  query: RemovalRecordQuery = {},
+): SyncRemovalRecord[] {
+  const pairs = new Map(state.pairs.map((item) => [item.id, item]));
+  const identitySearch = query.itemIdentity?.toLowerCase();
+  const records: SyncRemovalRecord[] = [];
+  for (const run of state.runs) {
+    for (const audit of run.removals) {
+      if (query.pairId !== undefined && audit.pairId !== query.pairId) continue;
+      if (query.platform !== undefined && audit.platform !== query.platform) continue;
+      if (query.playlistId !== undefined && audit.playlistId !== query.playlistId) continue;
+      if (identitySearch !== undefined && !audit.itemIdentity.toLowerCase().includes(identitySearch)) continue;
+      if (query.direction !== undefined && audit.direction !== query.direction) continue;
+      if (query.outcome !== undefined && audit.outcome !== query.outcome) continue;
+      const pair = pairs.get(audit.pairId);
+      records.push({
+        ...audit,
+        runId: run.id,
+        runStatus: run.status,
+        sourcePlatform: pair
+          ? (pair.left.provider === audit.platform ? pair.right.provider : pair.left.provider)
+          : null,
+      });
+    }
+  }
+  records.sort((left, right) => right.timestamp.localeCompare(left.timestamp));
+  return query.limit === undefined ? records : records.slice(0, query.limit);
+}
+
+function toSyncView(state: SyncState): SyncStateView {
+  return {
+    pairs: state.pairs,
+    ignores: state.ignores,
+    runs: [...state.runs].sort((left, right) => right.startedAt.localeCompare(left.startedAt)).slice(0, RECENT_RUNS),
+    removals: collectRemovalRecords(state, { limit: RECENT_REMOVALS }),
+  };
+}
+
+function readRef(value: unknown): SyncPairRef {
+  const ref = value as Partial<SyncPairRef> | null;
+  if (!ref || !["youtube", "spotify"].includes(ref.provider ?? "")
+    || typeof ref.accountId !== "string" || !ref.accountId.trim() || ref.accountId.length > 200
+    || typeof ref.playlistId !== "string" || !ref.playlistId.trim() || ref.playlistId.length > 200) {
+    throw new AppError("INVALID_SYNC_PAIR", "Each playlist reference requires a provider, account ID and playlist ID.", 400);
+  }
+  // Persist the normalized value: an accepted whitespace-padded ID must still match
+  // the provider's actual ID, which discovery never returns with padding.
+  return { provider: ref.provider as ProviderId, accountId: ref.accountId.trim(), playlistId: ref.playlistId.trim() };
+}
+
 export interface ServerDependencies {
   config: AppConfig;
-  auth: Pick<GoogleAuth, "status" | "begin" | "complete" | "disconnect">;
+  auth: Pick<GoogleAuth, "status" | "begin" | "beginWrite" | "complete" | "completeWrite" | "disconnect" | "disconnectWrite">;
   provider: PlaylistProvider;
   backupRunner?: typeof runBackup;
+  sync?: SyncIntegration;
 }
 
 interface BrowserSession {
+  id: string;
   expiresAt: number;
   csrfToken: string;
-  oauth: { state: string; codeVerifier: string; expiresAt: number } | null;
+  oauth: { kind: "read" | "write"; state: string; codeVerifier: string; expiresAt: number } | null;
 }
 
 function sameSecret(actual: string | undefined, expected: string): boolean {
@@ -29,12 +145,13 @@ function sameSecret(actual: string | undefined, expected: string): boolean {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-export function createApp({ config, auth, provider, backupRunner = runBackup }: ServerDependencies) {
+export function createApp({ config, auth, provider, backupRunner = runBackup, sync }: ServerDependencies) {
   const app = express();
   const sessions = new Map<string, BrowserSession>();
   const jobs = new Map<string, BackupJob>();
+  const authStarts = new Map<string, { count: number; resetAt: number }>();
   let latestJob: BackupJob | null = null;
-  let operation: "backup" | "auth" | "inventory" | null = null;
+  let operation: "backup" | "auth" | "inventory" | "sync" | null = null;
   const expireJobs = () => {
     for (const [id, job] of jobs) {
       if (job.state !== "running" && Date.parse(backupExpiresAt(job.startedAt)) <= Date.now()) {
@@ -60,7 +177,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
         if (oldest) sessions.delete(oldest);
       }
       id = randomBytes(32).toString("hex");
-      current = { expiresAt: now + 86_400_000, csrfToken: randomBytes(32).toString("hex"), oauth: null };
+      current = { id, expiresAt: now + 86_400_000, csrfToken: randomBytes(32).toString("hex"), oauth: null };
       sessions.set(id, current);
       res.cookie("music_session", id, { httpOnly: true, sameSite: "lax", path: "/", maxAge: 86_400_000 });
     }
@@ -78,6 +195,9 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
     if (operation === "inventory") {
       throw new AppError("INVENTORY_BUSY", "Playlists are being read. Wait for discovery to finish, then try again.", 409);
     }
+    if (operation === "sync") {
+      throw new AppError("SYNC_BUSY", "A synchronization operation is already running. Wait for it to finish, then try again.", 409);
+    }
     // Reserve before any await so credential changes cannot interleave with provider reads or backup preflight.
     operation = next;
     return () => { operation = null; };
@@ -88,6 +208,66 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
     const status = await auth.status();
     if (!status.configured) throw new AppError("SETUP_REQUIRED", "Configure your Google Desktop OAuth client first. See README.", 400);
     if (!status.connected) throw new AppError("CONNECT_REQUIRED", "Connect your Google account before reading playlists.", 401);
+  }
+
+  async function beginGoogleAuthorization(req: Request, res: Response, kind: NonNullable<BrowserSession["oauth"]>["kind"]): Promise<void> {
+    const current = session(req, res);
+    const pending = kind === "write" ? await auth.beginWrite() : await auth.begin();
+    current.oauth = { kind, state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + AUTH_PENDING_TTL_MS };
+    res.json({ url: pending.url });
+  }
+
+  function rejectGoogleAuthorizationInDemo(_req: Request, _res: Response, next: NextFunction): void {
+    if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
+    next();
+  }
+
+  function rejectPendingGoogleAuthorization(req: Request, res: Response, next: NextFunction): void {
+    const current = session(req, res);
+    if (current.oauth !== null) {
+      if (current.oauth.expiresAt <= Date.now()) {
+        current.oauth = null;
+      } else {
+        throw new AppError("AUTH_PENDING", "A Google authorization is already pending in this browser. Complete it or wait for it to expire before starting another.", 409);
+      }
+    }
+    next();
+  }
+
+  function rejectGoogleAuthorizationWhenBusy(_req: Request, _res: Response, next: NextFunction): void {
+    if (operation === "backup") {
+      throw new AppError("BACKUP_RUNNING", "A backup is already running. Wait for it to finish.", 409);
+    }
+    if (operation === "auth") {
+      throw new AppError("AUTH_BUSY", "Google authorization is changing. Wait for it to finish, then try again.", 409);
+    }
+    if (operation === "inventory") {
+      throw new AppError("INVENTORY_BUSY", "Playlists are being read. Wait for discovery to finish, then try again.", 409);
+    }
+    if (operation === "sync") {
+      throw new AppError("SYNC_BUSY", "A synchronization operation is already running. Wait for it to finish, then try again.", 409);
+    }
+    next();
+  }
+
+  function limitGoogleAuthorizationStarts(req: Request, res: Response, next: NextFunction): void {
+    const current = session(req, res);
+    const now = Date.now();
+    for (const [key, value] of authStarts) {
+      if (value.resetAt <= now) authStarts.delete(key);
+    }
+    const key = current.id;
+    const attempt = authStarts.get(key);
+    if (attempt === undefined || attempt.resetAt <= now) {
+      authStarts.set(key, { count: 1, resetAt: now + AUTH_START_WINDOW_MS });
+      next();
+      return;
+    }
+    if (attempt.count >= AUTH_START_LIMIT) {
+      throw new AppError("AUTH_RATE_LIMITED", "Too many Google authorization attempts. Wait a few minutes, then try again.", 429);
+    }
+    attempt.count += 1;
+    next();
   }
 
   app.disable("x-powered-by");
@@ -152,14 +332,19 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
     next();
   });
 
-  app.post("/api/auth/connect", async (req, res) => {
+  app.post("/api/auth/connect", rejectGoogleAuthorizationWhenBusy, rejectGoogleAuthorizationInDemo, rejectPendingGoogleAuthorization, limitGoogleAuthorizationStarts, async (req, res) => {
     const release = reserve("auth");
     try {
-      if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
-      const current = session(req, res);
-      const pending = await auth.begin();
-      current.oauth = { state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
-      res.json({ url: pending.url });
+      await beginGoogleAuthorization(req, res, "read");
+    } finally {
+      release();
+    }
+  });
+
+  app.post("/api/auth/connect-write", rejectGoogleAuthorizationWhenBusy, rejectGoogleAuthorizationInDemo, rejectPendingGoogleAuthorization, limitGoogleAuthorizationStarts, async (req, res) => {
+    const release = reserve("auth");
+    try {
+      await beginGoogleAuthorization(req, res, "write");
     } finally {
       release();
     }
@@ -191,8 +376,13 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
           throw new AppError("INVALID_AUTH_CODE", "Google did not return a valid authorization code.", 400);
         }
         current.oauth = null;
-        await auth.complete(code, pending.codeVerifier);
-        res.redirect("/?connected=1");
+        if (pending.kind === "write") {
+          await auth.completeWrite(code, pending.codeVerifier);
+          res.redirect("/?writeConnected=1");
+        } else {
+          await auth.complete(code, pending.codeVerifier);
+          res.redirect("/?connected=1");
+        }
       } finally {
         release();
       }
@@ -208,7 +398,17 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
     try {
       if (config.demo) throw new AppError("DEMO_MODE", "Demo mode has no Google connection to disconnect.", 400);
       for (const current of sessions.values()) current.oauth = null;
-      await auth.disconnect();
+      // Revoke both the read-only and the separately-consented write-scope credential so
+      // Disconnect actually removes all Google access this app holds, not just the backup
+      // connection. Attempt both even if one fails, so a failure in either scope is reported
+      // and neither credential is silently left behind because the other one errored first.
+      const [readResult, writeResult] = await Promise.allSettled([auth.disconnect(), auth.disconnectWrite()]);
+      const failure = readResult.status === "rejected" ? readResult.reason
+        : writeResult.status === "rejected" ? writeResult.reason : null;
+      if (failure !== null) {
+        throw failure instanceof AppError ? failure
+          : new AppError("GOOGLE_DISCONNECT_LOCAL_FAILED", "Google disconnect did not complete for all credentials.", 500);
+      }
       res.json({ ok: true });
     } finally {
       release();
@@ -234,6 +434,153 @@ export function createApp({ config, auth, provider, backupRunner = runBackup }: 
     await retention.check();
     const backups = await listBackups(config.backupDirectory);
     res.json({ backups: backups.filter((backup) => Date.parse(backupExpiresAt(backup.startedAt)) > Date.now()) });
+  });
+
+  function syncService(): SyncIntegration {
+    if (!sync) {
+      throw new AppError("SYNC_UNAVAILABLE", "Synchronization is not configured. A direct Spotify and YouTube Music sync service is required; no remote changes were made.", 501);
+    }
+    return sync;
+  }
+
+  app.get("/api/sync", async (_req, res) => {
+    res.json(toSyncView(await syncService().state()));
+  });
+
+  app.get("/api/sync/discover/:provider", async (req, res) => {
+    const provider = req.params["provider"];
+    if (provider !== "youtube" && provider !== "spotify") {
+      throw new AppError("INVALID_SYNC_QUERY", "The provider must be youtube or spotify.", 400);
+    }
+    const release = reserve("inventory");
+    try {
+      res.json({ playlists: await syncService().discover(provider) });
+    } finally {
+      release();
+    }
+  });
+
+  app.get("/api/sync/removals", async (req, res) => {
+    const service = syncService();
+    const pairId = req.query["pairId"];
+    const platform = req.query["platform"];
+    const playlistId = req.query["playlistId"];
+    const itemIdentity = req.query["itemIdentity"];
+    const direction = req.query["direction"];
+    const outcome = req.query["outcome"];
+    const limit = req.query["limit"];
+    if (pairId !== undefined && (typeof pairId !== "string" || !pairId.trim() || pairId.length > 200)) {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional pair ID must be a single non-empty value.", 400);
+    }
+    if (platform !== undefined && (typeof platform !== "string" || !["youtube", "spotify"].includes(platform))) {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional platform must be youtube or spotify.", 400);
+    }
+    if (playlistId !== undefined && (typeof playlistId !== "string" || !playlistId.trim() || playlistId.length > 200)) {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional playlist ID must be a single non-empty value.", 400);
+    }
+    if (itemIdentity !== undefined && (typeof itemIdentity !== "string" || !itemIdentity.trim() || itemIdentity.length > 200)) {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional track identity search must be non-empty text of at most 200 characters.", 400);
+    }
+    if (direction !== undefined && direction !== "left-to-right" && direction !== "right-to-left") {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional direction must be left-to-right or right-to-left.", 400);
+    }
+    if (outcome !== undefined && outcome !== "success" && outcome !== "failed" && outcome !== "unknown") {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional outcome must be success, failed, or unknown.", 400);
+    }
+    let parsedLimit: number = DEFAULT_REMOVAL_SEARCH_LIMIT;
+    if (limit !== undefined) {
+      if (typeof limit !== "string" || !/^[1-9][0-9]{0,3}$/.test(limit) || Number(limit) > 1000) {
+        throw new AppError("INVALID_SYNC_QUERY", "The optional limit must be a whole number between 1 and 1000.", 400);
+      }
+      parsedLimit = Number(limit);
+    }
+    res.json({
+      removals: collectRemovalRecords(await service.state(), {
+        ...(pairId === undefined ? {} : { pairId: (pairId as string).trim() }),
+        ...(platform === undefined ? {} : { platform: platform as ProviderId }),
+        ...(playlistId === undefined ? {} : { playlistId: (playlistId as string).trim() }),
+        ...(itemIdentity === undefined ? {} : { itemIdentity: (itemIdentity as string).trim() }),
+        ...(direction === undefined ? {} : { direction: direction as "left-to-right" | "right-to-left" }),
+        ...(outcome === undefined ? {} : { outcome: outcome as "success" | "failed" | "unknown" }),
+        limit: parsedLimit,
+      }),
+    });
+  });
+
+  app.post("/api/sync/pairs", async (req, res) => {
+    const release = reserve("sync");
+    try {
+      const service = syncService();
+      const body = req.body as { left?: unknown; right?: unknown } | null;
+      const left = readRef(body?.left);
+      const right = readRef(body?.right);
+      if (left.provider === right.provider) {
+        throw new AppError("INVALID_SYNC_PAIR", "A pair requires one Spotify and one YouTube Music playlist.", 400);
+      }
+      const now = new Date().toISOString();
+      res.status(201).json(toSyncView(await service.pair({
+        id: randomUUID(), left, right, enabled: true, createdAt: now, updatedAt: now,
+      })));
+    } finally {
+      release();
+    }
+  });
+
+  app.delete("/api/sync/pairs/:id", async (req, res) => {
+    const release = reserve("sync");
+    try {
+      const service = syncService();
+      const id = req.params["id"];
+      if (!id || !id.trim() || id.length > 200) throw new AppError("INVALID_SYNC_PAIR", "A valid pair ID is required.", 400);
+      res.json(toSyncView(await service.unpair(id.trim())));
+    } finally {
+      release();
+    }
+  });
+
+  app.post("/api/sync/ignored", async (req, res) => {
+    const release = reserve("sync");
+    try {
+      const service = syncService();
+      const body = req.body as { reason?: unknown } | null;
+      const ref = readRef(body);
+      if (body?.reason !== undefined && (typeof body.reason !== "string" || body.reason.length > 500)) {
+        throw new AppError("INVALID_SYNC_IGNORE", "An ignore reason must be text of at most 500 characters.", 400);
+      }
+      res.status(201).json(toSyncView(await service.ignore({
+        ...ref, reason: (body?.reason as string | undefined) ?? "", createdAt: new Date().toISOString(),
+      })));
+    } finally {
+      release();
+    }
+  });
+
+  app.delete("/api/sync/ignored/:provider/:accountId/:playlistId", async (req, res) => {
+    const release = reserve("sync");
+    try {
+      const service = syncService();
+      const ref = readRef({
+        provider: req.params["provider"], accountId: req.params["accountId"], playlistId: req.params["playlistId"],
+      });
+      res.json(toSyncView(await service.unignore(ref)));
+    } finally {
+      release();
+    }
+  });
+
+  app.post("/api/sync/run", async (req, res) => {
+    const release = reserve("sync");
+    try {
+      const service = syncService();
+      const body = req.body as { pairId?: unknown } | null;
+      if (typeof body?.pairId !== "string" || !body.pairId.trim() || body.pairId.length > 200) {
+        throw new AppError("INVALID_SYNC_RUN", "An explicit pair ID is required; unpaired playlists are never mirrored.", 400);
+      }
+      const run = await service.run(body.pairId.trim());
+      res.status(run.status === "running" ? 202 : 200).json({ run });
+    } finally {
+      release();
+    }
   });
 
   app.post("/api/backups", async (_req, res) => {

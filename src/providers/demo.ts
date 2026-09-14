@@ -12,6 +12,10 @@ export class DemoProvider implements PlaylistProvider {
   readonly id = "youtube" as const;
   readonly coverage = "Demo only: synthetic playlists and metadata. No Google account or external API is used.";
 
+  async getAuthenticatedAccountId(): Promise<string> {
+    return "demo-library";
+  }
+
   async listPlaylists(): Promise<Playlist[]> {
     return examples.map((item) => ({
       provider: this.id,

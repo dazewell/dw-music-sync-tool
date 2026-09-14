@@ -66,12 +66,70 @@ invalid Desktop client JSON, replace the file at its configured path and use
 the configured path still requires a server restart. Other status failures remain
 explicit and can be retried after the reported local problem is resolved.
 
+## Connect Spotify
+
+Spotify sync is optional and only needed if you want an explicitly paired
+playlist mirrored to or from Spotify (see [The path to Spotify / YouTube
+sync](#the-path-to-spotify--youtube-sync)). **There is no in-app (web UI)
+Spotify connect flow.** You register your own Spotify app and generate a
+refresh token with the project-native `spotify-auth` command, once, before
+starting this tool.
+
+1. Create an app in the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard).
+   Note its **Client ID** and **Client Secret**.
+2. In the app's settings, add a **Redirect URI** of `http://127.0.0.1:8888/callback`
+   (or your own port; see below). This loopback URI is only used by the
+   `spotify-auth` command below to receive Spotify's redirect after you
+   approve access; this application has no callback endpoint of its own and
+   never receives this redirect.
+3. Copy `.env.example` to `.env` if you have not already, then set:
+
+   ```
+   SPOTIFY_CLIENT_ID=your-client-id
+   SPOTIFY_CLIENT_SECRET=your-client-secret
+   ```
+
+   Leave `SPOTIFY_REFRESH_TOKEN` unset for now; the next step produces it.
+4. Run:
+
+   ```powershell
+   npm run spotify-auth
+   ```
+
+   This runs a local Authorization Code flow with PKCE and a
+   state-protected, loopback-only (`127.0.0.1`) callback listener. It opens
+   your system browser to Spotify's consent screen for exactly the scopes
+   this tool's Spotify provider needs to read and modify your playlists
+   (`playlist-read-private playlist-read-collaborative
+   playlist-modify-public playlist-modify-private`), exchanges the returned
+   code for a refresh token, and atomically writes only
+   `SPOTIFY_REFRESH_TOKEN` into your local, Git-ignored `.env`. The
+   authorization code and short-lived access token are discarded once the
+   exchange succeeds, and no credential value is ever printed to the
+   terminal. Use `--port <number>` if you registered a different Redirect
+   URI port.
+5. Restart the app (`npm start`) so it picks up the new environment. There is
+   no live reload for `.env` changes.
+
+**Never commit, log, paste into an issue/PR, or otherwise expose your Client
+Secret or refresh token.** `.env` is Git-ignored, but that only protects you if
+you never copy the values elsewhere. Treat a refresh token like a password:
+anyone holding it can read and modify your Spotify playlists until it is
+revoked (from your [Spotify account apps](https://www.spotify.com/account/apps/)
+page) or Spotify rotates/expires it. The three `SPOTIFY_*` variables are
+**all-or-nothing**: set every one of them, or leave every one of them unset; a
+partial set fails startup with an explicit configuration error instead of
+running with reduced access. Running `npm run spotify-auth` itself only
+requires `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` to already be set;
+it is what supplies the refresh token to complete the all-or-nothing set.
+
 ## Local files and commands
 
 ```powershell
 npm start                                    # Real account, local web UI
 npm start -- --port 8790                      # Alternate loopback port
 npm run backup                               # Bulk backup with existing authorization
+npm run spotify-auth                         # One-time Spotify PKCE authorization
 npm run backup -- --output D:\Music\Backups    # Choose a local destination
 node dist\cli.js backup --demo                # Synthetic CLI export
 node dist\cli.js --help
@@ -151,6 +209,17 @@ Copy `.env.example` to `.env` to override defaults, or set environment variables
 | `MUSIC_DATA_DIR` | `.local` |
 | `MUSIC_BACKUP_DIR` | `backups` |
 | `GOOGLE_CLIENT_SECRET_FILE` | `.local\client-secret.json` |
+| `SPOTIFY_CLIENT_ID` | unset (direct Spotify sync execution disabled) |
+| `SPOTIFY_CLIENT_SECRET` | unset (direct Spotify sync execution disabled) |
+| `SPOTIFY_REFRESH_TOKEN` | unset (direct Spotify sync execution disabled) |
+
+The three `SPOTIFY_*` variables are optional and must be set together, or all
+left unset; a partial set fails startup with an explicit configuration error.
+There is no in-app (web UI) Spotify connect flow yet, so the refresh token
+must be obtained with `npm run spotify-auth` (see Connect Spotify above) and
+stored only in your local, Git-ignored `.env`. Without
+them, an explicitly paired run whose changed side is Spotify fails closed with
+an actionable `SPOTIFY_NOT_CONFIGURED` error instead of pretending to sync.
 
 Relative paths resolve from the directory where the command runs. Demo mode uses
 a `demo` subdirectory for data and backups so it never uses real Google tokens.
@@ -262,10 +331,14 @@ Takeout import is not implemented.
 ### Quota and common problems
 
 Playlist discovery and item-list requests normally cost **one quota unit per
-page**, up to 50 records per page. No search or write requests are used. Check
-your project's actual quota in Cloud Console. Rate limits and temporary server
-errors use bounded retries; quota exhaustion and authorization problems require
-action, not an infinite retry loop.
+page**, up to 50 records per page; backups never issue search or write
+requests. An explicit sync run additionally issues YouTube `playlistItems`
+insert/delete write requests (each at YouTube's own, separately published
+per-write quota cost) and Spotify API requests, but only for the one paired
+playlist you selected to mirror. Check your project's actual quota in Cloud
+Console. Rate limits and temporary server errors use bounded retries; quota
+exhaustion and authorization problems require action, not an infinite retry
+loop.
 
 | Problem | Recovery |
 | --- | --- |
@@ -279,15 +352,49 @@ action, not an infinite retry loop.
 
 ## The path to Spotify / YouTube sync
 
-This release **does not sync or modify platform playlists**. It establishes a
-provider interface, ordered fingerprints, ambiguity-aware same-name pairing
-logic and baseline change classification. These are the foundation for
-[#1](https://github.com/dazewell/dw-music-sync-tool/issues/1), not a pretend sync button.
+An explicitly paired playlist can be evaluated bidirectionally against the
+real YouTube and Spotify APIs (no Soundiiz), from the web app's sync run
+control, the local API, or the CLI (`sync --pair-left`/`--pair-right`,
+`--ignore`/`--unignore`, `--run`; see `--help`). Pairing, ignoring, ordered
+fingerprints, baseline change classification and plan/apply are implemented in
+`src/core/sync.ts` and `src/core/sync-state.ts`; running a pair re-observes
+both sides fresh and classifies the change (unchanged, one side changed, or
+both sides changed since the last acknowledged baseline).
 
-The next feature should confirm a same-name pair, choose source/destination,
-preview matches and changes, protect the destination with a backup, apply the
-approved plan and verify the result. Timestamps alone cannot determine direction
-or conflicts. Matching tracks across platforms is separate from matching names.
+**Every pair is necessarily cross-provider** (pairing the same provider twice
+is rejected), and **cross-platform recording-identity resolution (matching a
+YouTube video to the equivalent Spotify track) is not implemented yet.**
+Without a verified translation, a source platform's native identifiers (a
+YouTube video ID, a Spotify track URI) cannot be safely written to the other
+platform. So today, a real run always reports `review-required` instead of
+writing anything; no destructive mutation is currently reachable through a
+created pair. This is a deliberate, conservative response to a real risk
+(silently writing an untranslated or wrong identifier to the other platform's
+API), not an oversight, and it is covered by regression tests. Automatic
+mirroring, the durable per-removal audit trail (filterable by pair, platform,
+playlist, track identity, direction and outcome; readable with
+`sync --removals` or `GET /api/sync/removals`) and destination verification
+are implemented and unit-tested against `applySyncPlan` directly, and will
+take effect once cross-platform matching lands. The web dashboard's
+"Auto-pair by name" button discovers playlists on both providers and
+immediately creates a pair for every exact (normalized) title match found on
+both sides; titles with more than one candidate on either side are skipped
+and reported rather than guessed at. There is still no scheduling yet — every
+run (single pair or "Sync all pairs") is triggered manually.
+
+Direct Spotify execution additionally needs `SPOTIFY_CLIENT_ID`,
+`SPOTIFY_CLIENT_SECRET` and `SPOTIFY_REFRESH_TOKEN` (see Configuration above).
+YouTube playlist writes require a separate write-scope Google consent; with the
+server running, POST to `/api/auth/connect-write` from the local app session
+with its CSRF token to open that authorization flow. There is no in-app Spotify
+connect flow yet, so an unconfigured or demo-mode run fails closed with an
+actionable `SPOTIFY_NOT_CONFIGURED` / `YOUTUBE_SYNC_NOT_AVAILABLE` error rather
+than a fake success.
+
+[#1](https://github.com/dazewell/dw-music-sync-tool/issues/1) still calls for
+richer review UI (preview before applying), scheduling and Soundiiz as an
+optional alternate executor. Timestamps alone cannot determine direction or
+conflicts; matching tracks across platforms is separate from matching names.
 
 **Research correction:** as checked on September 13, 2026, Soundiiz's live
 [User API documentation](https://soundiiz.com/api/doc) **does document**

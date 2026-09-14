@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { YouTubeProvider } from "../src/providers/youtube.js";
+import { AppError } from "../src/core/errors.js";
 import type { Playlist } from "../src/core/models.js";
 
 const playlist: Playlist = {
@@ -16,7 +17,7 @@ const playlist: Playlist = {
 function apiPlaylist(id = "owned-list", itemCount = 1) {
   return {
     id,
-    snippet: { title: "Owned music", description: "", channelTitle: "Playlist curator" },
+    snippet: { title: "Owned music", description: "", channelId: "Playlist curator", channelTitle: "Playlist curator" },
     contentDetails: { itemCount },
     status: { privacyStatus: "private" },
   };
@@ -40,6 +41,12 @@ function apiItem(position = 0, videoId = `video-${position}`, title = `Track ${p
 
 function json(body: unknown, status = 200, headers?: HeadersInit): Response {
   return new Response(JSON.stringify(body), { status, headers });
+}
+
+/** A channels.list response for getAuthenticatedAccountId(), matching the shared `playlist`
+ * fixture's owner by default so write-scope tests aren't rejected by the write-account check. */
+function channelsResponse(id = "Playlist curator"): Response {
+  return json({ items: [{ id }] });
 }
 
 function fixture(responses: Response[]) {
@@ -106,6 +113,27 @@ describe("YouTubeProvider official read-only coverage", () => {
     expect(new URL(String(fetcher.mock.calls[0]?.[0])).searchParams.get("mine")).toBe("true");
     expect(new URL(String(fetcher.mock.calls[1]?.[0])).searchParams.get("pageToken")).toBe("lists-next");
     expect(new URL(String(fetcher.mock.calls[3]?.[0])).searchParams.get("pageToken")).toBe("items-50");
+  });
+
+  it("uses the stable channel ID as the playlist owner instead of the mutable channel title, when present", async () => {
+    const { provider } = fixture([json({
+      items: [{
+        ...apiPlaylist(),
+        snippet: { title: "Owned music", description: "", channelId: "UC-stable-id", channelTitle: "Playlist curator" },
+      }],
+    })]);
+    const [listed] = await provider.listPlaylists();
+    expect(listed?.owner).toBe("UC-stable-id");
+  });
+
+  it("fails closed when the API omits channelId, instead of falling back to the mutable channel title", async () => {
+    const { provider } = fixture([json({
+      items: [{
+        ...apiPlaylist(),
+        snippet: { title: "Owned music", description: "", channelTitle: "Playlist curator" },
+      }],
+    })]);
+    await expect(provider.listPlaylists()).rejects.toMatchObject({ code: "YOUTUBE_RESPONSE_INVALID" });
   });
 
   it("keeps owner channel names only in provider metadata, never as recording artist", async () => {
@@ -317,6 +345,20 @@ describe("YouTubeProvider official read-only coverage", () => {
   });
 });
 
+describe("YouTubeProvider.getAuthenticatedAccountId", () => {
+  it("returns the authenticated channel id", async () => {
+    const { provider, fetcher } = fixture([json({ items: [{ id: "channel-1" }], pageInfo: { totalResults: 1 } })]);
+    await expect(provider.getAuthenticatedAccountId()).resolves.toBe("channel-1");
+    const [url] = fetcher.mock.calls[0]!;
+    expect(new URL(url as string | URL).searchParams.get("mine")).toBe("true");
+  });
+
+  it("fails closed when YouTube returns no authenticated channel", async () => {
+    const { provider } = fixture([json({ items: [], pageInfo: { totalResults: 0 } })]);
+    await expect(provider.getAuthenticatedAccountId()).rejects.toMatchObject({ code: "YOUTUBE_RESPONSE_INVALID" });
+  });
+});
+
 describe("YouTubeProvider failures and retry policy", () => {
   it("fails quota 403 terminally and redacts API messages", async () => {
     const { provider, fetcher, sleep } = fixture([json({
@@ -462,6 +504,14 @@ describe("YouTubeProvider failures and retry policy", () => {
     expect(String(error)).not.toContain("secret");
   });
 
+  it("preserves a specific AppError thrown by the token supplier instead of masking it", async () => {
+    const tokenFailure = new YouTubeProvider(async () => {
+      throw new AppError("GOOGLE_WRITE_NOT_CONNECTED", "Connect write access before syncing.", 401);
+    });
+    await expect(tokenFailure.listPlaylists()).rejects.toMatchObject({ code: "GOOGLE_WRITE_NOT_CONNECTED" });
+  });
+
+
   it("bounds a hung request and aborts its fetch signal", async () => {
     vi.useFakeTimers();
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => new Promise<Response>(() => {}));
@@ -470,5 +520,157 @@ describe("YouTubeProvider failures and retry policy", () => {
     await vi.advanceTimersByTimeAsync(20_001);
     await assertion;
     expect(fetcher.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+  });
+});
+
+
+describe("YouTubeProvider.replacePlaylist write-scope safety", () => {
+  const target: Playlist = { ...playlist, itemCount: 1 };
+  const newEntry = {
+    id: "new", position: 0, mediaId: "new-video", title: "New", artist: null, album: null,
+    url: null, availability: "available" as const, addedAt: null, providerData: {},
+  };
+
+  it("fails closed without attempting any request when no write-scope credential is configured", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher });
+    await expect(provider.replacePlaylist(target, [newEntry])).rejects.toMatchObject({ code: "YOUTUBE_WRITE_NOT_AUTHORIZED" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("still rejects unavailable entries before any write is attempted", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    const unavailable = { ...newEntry, mediaId: null, availability: "unavailable" as const };
+    await expect(provider.replacePlaylist(target, [unavailable])).rejects.toMatchObject({ code: "YOUTUBE_ENTRY_UNSUPPORTED" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unavailable entry that still retains a video ID, instead of writing a private/deleted placeholder", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    const staleUnavailable = { ...newEntry, mediaId: "stale-video", availability: "unavailable" as const };
+    await expect(provider.replacePlaylist(target, [staleUnavailable])).rejects.toMatchObject({ code: "YOUTUBE_ENTRY_UNSUPPORTED" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the write-authorized account does not match the account this playlist belongs to", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(channelsResponse("a-different-channel"));
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    await expect(provider.replacePlaylist(target, [newEntry])).rejects.toMatchObject({ code: "YOUTUBE_WRITE_ACCOUNT_MISMATCH" });
+    // Only the account check happened; no read of the playlist itself, insert, or delete was ever issued.
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed when the destination changed since the expected snapshot was observed", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(channelsResponse());
+    // A different playlist-item id (item-9 instead of item-0) means the fresh read's fingerprint
+    // will never match a snapshot id computed from a single "item-0" entry.
+    fetcher.mockResolvedValueOnce(json({ items: [{ ...apiItem(0, "old-video"), id: "item-9" }], pageInfo: { totalResults: 1 } }));
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    await expect(provider.replacePlaylist(target, [newEntry], "stale-snapshot")).rejects.toMatchObject({ code: "YOUTUBE_STALE_PLAYLIST" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("proceeds when the expected snapshot id matches the destination's current fingerprint", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    const { playlist: observed } = await provider.getPlaylist(target);
+    fetcher.mockResolvedValueOnce(channelsResponse());
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ id: "inserted-1" }));
+    fetcher.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await expect(provider.replacePlaylist(target, [newEntry], observed.snapshotId)).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(5);
+  });
+
+  it("includes part=snippet on every insert and authenticates mutations with the write-scope token", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(channelsResponse());
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ id: "inserted-1" }));
+    fetcher.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const writeSupplier = vi.fn(async () => "write-token");
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: writeSupplier });
+    await provider.replacePlaylist(target, [newEntry]);
+
+    const [insertUrl, insertInit] = fetcher.mock.calls[2]!;
+    expect(new URL(insertUrl as string | URL).searchParams.get("part")).toBe("snippet");
+    expect((insertInit as RequestInit).headers).toMatchObject({ Authorization: "Bearer write-token", "Content-Type": "application/json" });
+    expect(JSON.parse((insertInit as RequestInit).body as string)).toMatchObject({
+      snippet: { playlistId: "owned-list", resourceId: { kind: "youtube#video", videoId: "new-video" } },
+    });
+
+    const [deleteUrl, deleteInit] = fetcher.mock.calls[3]!;
+    expect((deleteInit as RequestInit).method).toBe("DELETE");
+    expect((deleteInit as RequestInit).headers).toMatchObject({ Authorization: "Bearer write-token" });
+    expect(new URL(deleteUrl as string | URL).searchParams.get("id")).toBe("item-0");
+    expect(writeSupplier).toHaveBeenCalled();
+  });
+
+  it("inserts new entries before deleting previous ones, so a failed insert leaves the playlist intact", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(channelsResponse());
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ error: "insert failed" }, 500));
+    const provider = new YouTubeProvider(async () => "read-token", {
+      fetch: fetcher, writeAccessToken: async () => "write-token", sleep: vi.fn(async () => {}),
+    });
+    const error = await provider.replacePlaylist(target, [newEntry]).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "YOUTUBE_MUTATION_FAILED" });
+    // Only the account check, the fresh read, and the failed insert happened; no DELETE of the previous items was ever issued.
+    expect(fetcher).toHaveBeenCalledTimes(3);
+    expect(fetcher.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "DELETE")).toBe(false);
+  });
+
+  it("does not automatically retry a rate-limited or 5xx insert", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(channelsResponse());
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ error: "rate limited" }, 429));
+    const sleep = vi.fn(async () => {});
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token", sleep });
+    const error = await provider.replacePlaylist(target, [newEntry]).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "YOUTUBE_MUTATION_FAILED" });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not automatically retry a rate-limited or 5xx delete", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(channelsResponse());
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ id: "inserted-1" }));
+    fetcher.mockResolvedValueOnce(json({ error: "busy" }, 503));
+    const sleep = vi.fn(async () => {});
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token", sleep });
+    const error = await provider.replacePlaylist(target, [newEntry]).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "YOUTUBE_MUTATION_FAILED" });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it("rejects an unconfirmed insert response instead of silently assuming success", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(channelsResponse());
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ notAnId: true }));
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    const error = await provider.replacePlaylist(target, [newEntry]).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "YOUTUBE_INSERT_UNCONFIRMED" });
+    expect(fetcher.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "DELETE")).toBe(false);
+  });
+
+  it("still retries transient failures for ordinary reads (listPlaylists/getPlaylist)", async () => {
+    const { provider, sleep, fetcher } = fixture([
+      json({ error: "busy" }, 503),
+      json({ items: [] }),
+    ]);
+    expect(await provider.listPlaylists()).toEqual([]);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 });
