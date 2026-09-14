@@ -5,7 +5,7 @@ import type { AppConfig } from "../config.js";
 import { listBackups, readManifest, resolveBackupFile, runBackup } from "../core/backup.js";
 import { backupExpiresAt } from "../core/retention.js";
 import { AppError, errorMessage } from "../core/errors.js";
-import type { PlaylistProvider, ProviderId } from "../core/models.js";
+import type { PlaylistProvider, ProviderId, Playlist } from "../core/models.js";
 import type { SyncIgnore, SyncPair, SyncPairRef, SyncRemovalAudit } from "../core/sync.js";
 import type { SyncRun, SyncState } from "../core/sync-state.js";
 import type { BackupJob, StatusResponse } from "../shared/api.js";
@@ -45,6 +45,8 @@ export interface SyncIntegration {
   ignore(ignore: SyncIgnore): Promise<SyncState>;
   unignore(ref: SyncPairRef): Promise<SyncState>;
   run(pairId: string): Promise<SyncRun>;
+  /** Lists real playlists currently visible to the given provider, for a picker UI. */
+  discover(provider: ProviderId): Promise<Playlist[]>;
 }
 
 const RECENT_RUNS = 20;
@@ -429,6 +431,14 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
 
   app.get("/api/sync", async (_req, res) => {
     res.json(toSyncView(await syncService().state()));
+  });
+
+  app.get("/api/sync/discover/:provider", async (req, res) => {
+    const provider = req.params["provider"];
+    if (provider !== "youtube" && provider !== "spotify") {
+      throw new AppError("INVALID_SYNC_QUERY", "The provider must be youtube or spotify.", 400);
+    }
+    res.json({ playlists: await syncService().discover(provider) });
   });
 
   app.get("/api/sync/removals", async (req, res) => {

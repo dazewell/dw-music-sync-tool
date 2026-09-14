@@ -170,6 +170,7 @@ Direction: seed895a4aee / candidate4, mixing-desk studio console.
             <label for="sync-pair">Pair to synchronize</label>
             <select id="sync-pair" disabled></select>
             <button id="sync-now" class="primary-button" type="button" disabled>Sync Pair</button>
+            <button id="auto-pair-by-name" class="secondary-button" type="button" disabled>Auto-pair by name</button>
           </div>
         </div>
         <div id="sync-feedback" class="table-feedback" role="status" aria-live="polite">Checking sync service…</div>
@@ -187,10 +188,8 @@ Direction: seed895a4aee / candidate4, mixing-desk studio console.
                 <option value="spotify">Spotify</option>
                 <option value="youtube">YouTube Music</option>
               </select>
-              <label for="ignore-account">Account ID</label>
-              <input id="ignore-account" name="ignore-account" autocomplete="off" required>
-              <label for="ignore-playlist">Playlist ID</label>
-              <input id="ignore-playlist" name="ignore-playlist" autocomplete="off" required>
+              <label for="ignore-playlist">Playlist</label>
+              <select id="ignore-playlist" name="ignore-playlist" required></select>
               <label for="ignore-reason">Reason (optional)</label>
               <input id="ignore-reason" name="ignore-reason" autocomplete="off" maxlength="500">
               <button class="secondary-button" type="submit">Ignore playlist</button>
@@ -198,25 +197,22 @@ Direction: seed895a4aee / candidate4, mixing-desk studio console.
           </section>
           <section aria-labelledby="pair-form-title">
             <h3 id="pair-form-title">Manage a pair</h3>
+            <p>Pick real playlists discovered from your connected accounts; no IDs to type.</p>
             <form id="pair-form" class="sync-form">
               <label for="pair-left-provider">First platform</label>
               <select id="pair-left-provider" name="pair-left-provider">
                 <option value="spotify">Spotify</option>
                 <option value="youtube">YouTube Music</option>
               </select>
-              <label for="pair-left-account">First account ID</label>
-              <input id="pair-left-account" name="pair-left-account" autocomplete="off" required>
-              <label for="pair-left-playlist">First playlist ID</label>
-              <input id="pair-left-playlist" name="pair-left-playlist" autocomplete="off" required>
+              <label for="pair-left-playlist">First playlist</label>
+              <select id="pair-left-playlist" name="pair-left-playlist" required></select>
               <label for="pair-right-provider">Second platform</label>
               <select id="pair-right-provider" name="pair-right-provider">
                 <option value="youtube">YouTube Music</option>
                 <option value="spotify">Spotify</option>
               </select>
-              <label for="pair-right-account">Second account ID</label>
-              <input id="pair-right-account" name="pair-right-account" autocomplete="off" required>
-              <label for="pair-right-playlist">Second playlist ID</label>
-              <input id="pair-right-playlist" name="pair-right-playlist" autocomplete="off" required>
+              <label for="pair-right-playlist">Second playlist</label>
+              <select id="pair-right-playlist" name="pair-right-playlist" required></select>
               <button class="secondary-button" type="submit">Save pair</button>
             </form>
           </section>

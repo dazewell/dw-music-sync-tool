@@ -321,15 +321,21 @@ test("explicit pairs stay selectable and drive the manual mirror trigger", async
     removals: [],
   };
   await page.route("**/api/sync", async (route) => { await route.fulfill({ json: state }); });
+  await page.route("**/api/sync/discover/youtube", async (route) => {
+    await route.fulfill({ json: { playlists: [{ provider: "youtube", id: "yt-1", title: "Road Trip", description: "", url: "https://example.test/yt-1", owner: "My Channel", itemCount: 5, visibility: "private" }] } });
+  });
+  await page.route("**/api/sync/discover/spotify", async (route) => {
+    await route.fulfill({ json: { playlists: [{ provider: "spotify", id: "sp-1", title: "Road Trip", description: "", url: "https://example.test/sp-1", owner: "Me", itemCount: 5, visibility: "private" }] } });
+  });
   const triggered: unknown[] = [];
   await page.route("**/api/sync/run", async (route) => {
     triggered.push(route.request().postDataJSON());
     await route.fulfill({ json: { run: { ...state.runs[0], status: "complete", message: "Mirrored verified changes." } } });
   });
   await page.goto(serverUrl);
-  await expect(page.locator("#sync-pairs")).toContainText("YouTube Music yt-1 ↔ Spotify sp-1");
+  await expect(page.locator("#sync-pairs")).toContainText('YouTube Music "Road Trip" ↔ Spotify "Road Trip"');
   await expect(page.locator("#sync-pairs .badge")).toHaveText("Active");
-  await expect(page.locator("#sync-ignored")).toContainText("Spotify sp-9");
+  await expect(page.locator("#sync-ignored")).toContainText('Spotify "sp-9"');
   await expect(page.locator("#sync-ignored .badge")).toHaveText("Ignored");
   await page.getByText("Recent sync runs", { exact: true }).click();
   await expect(page.locator("#sync-logs")).toContainText("One mirrored removal failed.");
@@ -337,6 +343,45 @@ test("explicit pairs stay selectable and drive the manual mirror trigger", async
   await page.getByRole("button", { name: "Sync Pair", exact: true }).click();
   await expect(page.locator("#notice")).toContainText("Synchronization completed.");
   expect(triggered).toEqual([{ pairId: "pair-1" }]);
+});
+test("the playlist pickers offer real titles to choose, and auto-pair by name creates exact matches while skipping ambiguous titles", async ({ page, serverUrl }) => {
+  const state = { pairs: [], ignores: [], runs: [], removals: [] };
+  const youtubePlaylists = [
+    { provider: "youtube", id: "yt-road", title: "Road Trip", description: "", url: "https://example.test/yt-road", owner: "My Channel", itemCount: 5, visibility: "private" },
+    { provider: "youtube", id: "yt-gym-a", title: "Gym", description: "", url: "https://example.test/yt-gym-a", owner: "My Channel", itemCount: 5, visibility: "private" },
+    { provider: "youtube", id: "yt-gym-b", title: "Gym", description: "", url: "https://example.test/yt-gym-b", owner: "My Channel", itemCount: 5, visibility: "private" },
+    { provider: "youtube", id: "yt-solo", title: "Only On YouTube", description: "", url: "https://example.test/yt-solo", owner: "My Channel", itemCount: 5, visibility: "private" },
+  ];
+  const spotifyPlaylists = [
+    { provider: "spotify", id: "sp-road", title: "Road Trip", description: "", url: "https://example.test/sp-road", owner: "Me", itemCount: 5, visibility: "private" },
+    { provider: "spotify", id: "sp-gym-a", title: "Gym", description: "", url: "https://example.test/sp-gym-a", owner: "Me", itemCount: 5, visibility: "private" },
+  ];
+  const created: unknown[] = [];
+  await page.route("**/api/sync", async (route) => { await route.fulfill({ json: state }); });
+  await page.route("**/api/sync/discover/youtube", async (route) => { await route.fulfill({ json: { playlists: youtubePlaylists } }); });
+  await page.route("**/api/sync/discover/spotify", async (route) => { await route.fulfill({ json: { playlists: spotifyPlaylists } }); });
+  await page.route("**/api/sync/pairs", async (route) => {
+    if (route.request().method() !== "POST") { await route.fallback(); return; }
+    const body = route.request().postDataJSON();
+    created.push(body);
+    const pair = { id: `pair-${created.length}`, ...body, enabled: true, createdAt: "2026-09-14T00:00:00.000Z", updatedAt: "2026-09-14T00:00:00.000Z" };
+    state.pairs = [...state.pairs, pair] as never;
+    await route.fulfill({ status: 201, json: state });
+  });
+  await page.goto(serverUrl);
+  const form = page.locator("#pair-form");
+  const firstPlaylistSelect = form.getByLabel("First playlist", { exact: true });
+  await expect(async () => {
+    expect(await firstPlaylistSelect.locator("option").allTextContents())
+      .toEqual(["Choose a playlist…", "Road Trip (5)", "Gym (5)"]);
+  }).toPass();
+  await page.getByRole("button", { name: "Auto-pair by name", exact: true }).click();
+  await expect(page.locator("#notice")).toContainText("Auto-paired 1 playlist by matching name.");
+  await expect(page.locator("#notice")).toContainText('Skipped 1 ambiguous title: Gym.');
+  expect(created).toEqual([{
+    left: { provider: "youtube", accountId: "My Channel", playlistId: "yt-road" },
+    right: { provider: "spotify", accountId: "Me", playlistId: "sp-road" },
+  }]);
 });
 test("ignoring a playlist submits the ignore form and reflects it in the ignored list", async ({ page, serverUrl }) => {
   const initialState = {
@@ -347,6 +392,9 @@ test("ignoring a playlist submits the ignore form and reflects it in the ignored
   };
   let ignored: unknown[] = [];
   await page.route("**/api/sync", async (route) => { await route.fulfill({ json: initialState }); });
+  await page.route("**/api/sync/discover/spotify", async (route) => {
+    await route.fulfill({ json: { playlists: [{ provider: "spotify", id: "sp-42", title: "Duplicate mix", description: "", url: "https://example.test/sp-42", owner: "acct-1", itemCount: 8, visibility: "private" }] } });
+  });
   await page.route("**/api/sync/ignored", async (route) => {
     if (route.request().method() !== "POST") { await route.fallback(); return; }
     ignored.push(route.request().postDataJSON());
@@ -361,11 +409,10 @@ test("ignoring a playlist submits the ignore form and reflects it in the ignored
   await page.goto(serverUrl);
   const form = page.locator("#ignore-form");
   await form.getByLabel("Platform", { exact: true }).selectOption("spotify");
-  await form.getByLabel("Account ID", { exact: true }).fill("acct-1");
-  await form.getByLabel("Playlist ID", { exact: true }).fill("sp-42");
+  await form.getByLabel("Playlist", { exact: true }).selectOption("sp-42");
   await form.getByLabel("Reason (optional)").fill("Duplicate mix");
   await form.getByRole("button", { name: "Ignore playlist", exact: true }).click();
-  await expect(page.locator("#sync-ignored")).toContainText("Spotify sp-42");
+  await expect(page.locator("#sync-ignored")).toContainText('Spotify "Duplicate mix"');
   await expect(page.locator("#sync-ignored")).toContainText("Duplicate mix");
   expect(ignored).toEqual([{ provider: "spotify", accountId: "acct-1", playlistId: "sp-42", reason: "Duplicate mix" }]);
 });

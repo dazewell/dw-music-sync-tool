@@ -15,7 +15,7 @@ import { YouTubeProvider } from "./providers/youtube.js";
 import { acquireRuntimeLocks } from "./runtime-lock.js";
 import { SyncStateStore } from "./core/sync-state.js";
 import { collectRemovalRecords, createApp, type SyncIntegration, type SyncPairRef } from "./server/app.js";
-import { executeSyncRun, type SyncExecutorProviders } from "./services/sync-executor.js";
+import { discoverPlaylists, executeSyncRun, type SyncExecutorProviders } from "./services/sync-executor.js";
 import { RetentionController } from "./services/retention.js";
 
 const help = `Music library - local playlist backups
@@ -92,6 +92,7 @@ function createSyncIntegration(config: AppConfig, providers: SyncExecutorProvide
       state.ignores.splice(index, 1);
     }),
     run: (pairId) => executeSyncRun(store, providers, pairId),
+    discover: (id) => discoverPlaylists(providers, id),
   };
 }
 

@@ -112,6 +112,15 @@ async function syncFixture() {
       await store.finishRun(started.id, "complete", "Mirrored verified changes.");
       return { ...started, status: "complete", completedAt: new Date().toISOString(), message: "Mirrored verified changes." };
     },
+    discover: async (provider) => {
+      if (provider === "spotify") {
+        throw new AppError("SPOTIFY_NOT_CONFIGURED", "Direct Spotify synchronization is not configured.", 501);
+      }
+      return [{
+        provider: "youtube", id: "yt-1", title: "Road Trip", description: "", url: "https://example.test/yt-1",
+        owner: "Test Channel", itemCount: 3, visibility: "private",
+      }];
+    },
   };
   return { integration, store, runId: run.id };
 }
@@ -142,6 +151,20 @@ describe("loopback server", () => {
     expect(restored.body.ignores).toHaveLength(0);
     expect((await fixture.store.read()).runs).toHaveLength(2);
     await browser.post("/api/sync/run").set("Host", host).send({ pairId: "pair-1" }).expect(403);
+  });
+
+  it("lists real playlists for a picker instead of requiring hand-typed IDs, and rejects an unknown provider", async () => {
+    const fixture = await syncFixture();
+    const { browser, host } = await setup(true, undefined, fixture.integration);
+    const youtube = await browser.get("/api/sync/discover/youtube").set("Host", host).expect(200);
+    expect(youtube.body.playlists).toEqual([{
+      provider: "youtube", id: "yt-1", title: "Road Trip", description: "", url: "https://example.test/yt-1",
+      owner: "Test Channel", itemCount: 3, visibility: "private",
+    }]);
+    const spotify = await browser.get("/api/sync/discover/spotify").set("Host", host).expect(501);
+    expect(spotify.body.error.code).toBe("SPOTIFY_NOT_CONFIGURED");
+    const invalid = await browser.get("/api/sync/discover/soundcloud").set("Host", host).expect(400);
+    expect(invalid.body.error.code).toBe("INVALID_SYNC_QUERY");
   });
 
   it("refuses to mirror without an explicit pair and rejects same-platform pairs", async () => {

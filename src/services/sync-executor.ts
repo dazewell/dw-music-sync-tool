@@ -1,5 +1,5 @@
 import { AppError } from "../core/errors.js";
-import type { PlaylistMutation, PlaylistProvider, ProviderId } from "../core/models.js";
+import type { Playlist, PlaylistMutation, PlaylistProvider, ProviderId } from "../core/models.js";
 import { applySyncPlan, planBidirectionalSync, type SyncPairRef } from "../core/sync.js";
 import type { SyncRun, SyncStateStore } from "../core/sync-state.js";
 
@@ -31,6 +31,17 @@ function requireProvider(providers: SyncExecutorProviders, id: ProviderId): Muta
     "Direct YouTube synchronization is not available in this mode. Connect a real Google account (not demo mode), then retry. No remote changes were made.",
     501,
   );
+}
+
+/**
+ * Lists the real playlists currently visible to an authenticated provider, so
+ * pairing/ignoring can be driven by picking from real discovery instead of
+ * hand-typed account/playlist IDs. Fails closed the same way a mutation would
+ * if that platform is not actually configured right now.
+ */
+export async function discoverPlaylists(providers: SyncExecutorProviders, id: ProviderId): Promise<Playlist[]> {
+  const provider = requireProvider(providers, id);
+  return provider.listPlaylists();
 }
 
 async function observe(provider: MutablePlaylistProvider, ref: SyncPairRef) {

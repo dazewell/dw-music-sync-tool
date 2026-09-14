@@ -87,6 +87,7 @@ const ui = {
   historyFeedback: element("history-feedback"),
   historyList: element("history-list"),
   syncNow: element<HTMLButtonElement>("sync-now"),
+  autoPairByName: element<HTMLButtonElement>("auto-pair-by-name"),
   syncFeedback: element("sync-feedback"),
   syncPairs: element("sync-pairs"),
   syncIgnored: element("sync-ignored"),
@@ -95,15 +96,12 @@ const ui = {
   syncPairSelect: element<HTMLSelectElement>("sync-pair"),
   pairForm: element<HTMLFormElement>("pair-form"),
   pairLeftProvider: element<HTMLSelectElement>("pair-left-provider"),
-  pairLeftAccount: element<HTMLInputElement>("pair-left-account"),
-  pairLeftPlaylist: element<HTMLInputElement>("pair-left-playlist"),
+  pairLeftPlaylist: element<HTMLSelectElement>("pair-left-playlist"),
   pairRightProvider: element<HTMLSelectElement>("pair-right-provider"),
-  pairRightAccount: element<HTMLInputElement>("pair-right-account"),
-  pairRightPlaylist: element<HTMLInputElement>("pair-right-playlist"),
+  pairRightPlaylist: element<HTMLSelectElement>("pair-right-playlist"),
   ignoreForm: element<HTMLFormElement>("ignore-form"),
   ignoreProvider: element<HTMLSelectElement>("ignore-provider"),
-  ignoreAccount: element<HTMLInputElement>("ignore-account"),
-  ignorePlaylist: element<HTMLInputElement>("ignore-playlist"),
+  ignorePlaylist: element<HTMLSelectElement>("ignore-playlist"),
   ignoreReason: element<HTMLInputElement>("ignore-reason"),
   removalFeedback: element("removal-feedback"),
   removalTableWrap: element("removal-table-wrap"),
@@ -149,6 +147,9 @@ let sync: SyncState | null = null;
 let syncLoading = false;
 let syncError: string | null = null;
 let syncBusy = false;
+const discovered: Record<Platform, Playlist[] | null> = { youtube: null, spotify: null };
+const discoveredLoading: Record<Platform, boolean> = { youtube: false, spotify: false };
+const discoveredError: Record<Platform, string | null> = { youtube: null, spotify: null };
 let removals: SyncRemovalRecord[] = [];
 let removalsLoaded = false;
 let removalsLoading = false;
@@ -586,6 +587,11 @@ function platformLabel(providerId: Platform): string {
   return providerId === "youtube" ? "YouTube Music" : "Spotify";
 }
 
+/** The real playlist title for a stored reference, when discovery has loaded it; falls back to the raw ID. */
+function playlistTitle(ref: SyncRef): string {
+  return discovered[ref.provider]?.find((item) => item.id === ref.playlistId)?.title ?? ref.playlistId;
+}
+
 function directionLabel(record: SyncRemovalRecord): string {
   return record.sourcePlatform
     ? `${platformLabel(record.sourcePlatform)} → ${platformLabel(record.platform)}`
@@ -597,7 +603,7 @@ function outcomeLabel(outcome: SyncRemovalRecord["outcome"]): string {
 }
 
 function pairLabel(pair: SyncPair): string {
-  return `${platformLabel(pair.left.provider)} ${pair.left.playlistId} ↔ ${platformLabel(pair.right.provider)} ${pair.right.playlistId}`;
+  return `${platformLabel(pair.left.provider)} "${playlistTitle(pair.left)}" ↔ ${platformLabel(pair.right.provider)} "${playlistTitle(pair.right)}"`;
 }
 
 function renderRemovals(): void {
@@ -698,6 +704,48 @@ async function loadRemovals(): Promise<void> {
 }
 
 
+function populatePlaylistSelect(select: HTMLSelectElement, provider: Platform): void {
+  const previous = select.value;
+  const list = discovered[provider] ?? [];
+  select.replaceChildren();
+  const placeholder = document.createElement("option");
+  placeholder.value = "";
+  placeholder.textContent = discoveredLoading[provider]
+    ? "Loading playlists…"
+    : discoveredError[provider]
+      ? "Could not load playlists"
+      : list.length === 0 ? "No playlists found" : "Choose a playlist…";
+  select.append(placeholder);
+  for (const item of list) {
+    const option = document.createElement("option");
+    option.value = item.id;
+    option.dataset.owner = item.owner;
+    option.textContent = item.itemCount === null ? item.title : `${item.title} (${item.itemCount})`;
+    select.append(option);
+  }
+  if (list.some((item) => item.id === previous)) select.value = previous;
+}
+
+/** Loads real playlists for a provider once (cached), so pickers never require a hand-typed ID. */
+async function ensureDiscovered(provider: Platform): Promise<Playlist[]> {
+  if (discovered[provider] || discoveredLoading[provider]) return discovered[provider] ?? [];
+  discoveredLoading[provider] = true;
+  discoveredError[provider] = null;
+  renderSync();
+  try {
+    const response = await request<{ playlists: Playlist[] }>(`/api/sync/discover/${provider}`);
+    discovered[provider] = response.playlists;
+    return response.playlists;
+  } catch (error) {
+    discoveredError[provider] = message(error);
+    discovered[provider] = [];
+    return [];
+  } finally {
+    discoveredLoading[provider] = false;
+    if (!disposed) renderSync();
+  }
+}
+
 function renderSync(): void {
   const available = sync !== null;
   const pairs = sync?.pairs ?? [];
@@ -719,6 +767,15 @@ function renderSync(): void {
   if (pairs.some((pair) => pair.id === selected)) ui.syncPairSelect.value = selected;
   ui.syncPairSelect.disabled = syncBusy || syncLoading || !available || pairs.length === 0;
   ui.syncNow.disabled = ui.syncPairSelect.disabled;
+  ui.autoPairByName.disabled = syncBusy || syncLoading || !available;
+  if (available) {
+    void ensureDiscovered(ui.pairLeftProvider.value as Platform);
+    void ensureDiscovered(ui.pairRightProvider.value as Platform);
+    void ensureDiscovered(ui.ignoreProvider.value as Platform);
+  }
+  populatePlaylistSelect(ui.pairLeftPlaylist, ui.pairLeftProvider.value as Platform);
+  populatePlaylistSelect(ui.pairRightPlaylist, ui.pairRightProvider.value as Platform);
+  populatePlaylistSelect(ui.ignorePlaylist, ui.ignoreProvider.value as Platform);
   ui.pairForm.querySelectorAll("input, select, button").forEach((control) => {
     (control as HTMLInputElement | HTMLSelectElement | HTMLButtonElement).disabled = syncBusy || syncLoading || !available;
   });
@@ -739,7 +796,7 @@ function renderSync(): void {
   if (pairs.length === 0) ui.syncPairs.append(text("p", "No pairs have been confirmed.", "sync-empty"));
   ui.syncIgnored.replaceChildren();
   for (const item of sync?.ignores ?? []) {
-    const row = text("p", `${platformLabel(item.provider)} ${item.playlistId}`, "sync-record");
+    const row = text("p", `${platformLabel(item.provider)} "${playlistTitle(item)}"`, "sync-record");
     row.append(text("span", "Ignored", "badge"));
     if (item.reason) row.append(text("span", item.reason, "playlist-owner"));
     const restore = text("button", "Unignore", "text-button") as HTMLButtonElement;
@@ -845,15 +902,28 @@ async function unignore(ref: SyncRef): Promise<void> {
   finally { syncBusy = false; if (!disposed) renderSync(); }
 }
 
+/** Builds a sync reference from a provider/playlist picker pair, or null while nothing is chosen yet. */
+function refFromPicker(providerSelect: HTMLSelectElement, playlistSelect: HTMLSelectElement): SyncRef | null {
+  const option = playlistSelect.selectedOptions[0];
+  if (!option || !option.value) return null;
+  return {
+    provider: providerSelect.value as Platform,
+    // Only one account per provider is connected today; the playlist's own owner
+    // identifies it without asking the user to type an account ID by hand.
+    accountId: option.dataset.owner?.trim() || "default",
+    playlistId: option.value,
+  };
+}
+
 async function saveIgnore(event: SubmitEvent): Promise<void> {
   event.preventDefault();
   if (ui.ignoreForm.querySelector(":invalid")) return;
-  const ignore = {
-    provider: ui.ignoreProvider.value as Platform,
-    accountId: ui.ignoreAccount.value.trim(),
-    playlistId: ui.ignorePlaylist.value.trim(),
-    reason: ui.ignoreReason.value.trim(),
-  };
+  const ref = refFromPicker(ui.ignoreProvider, ui.ignorePlaylist);
+  if (!ref) {
+    notify("Choose a playlist to ignore.", "error");
+    return;
+  }
+  const ignore = { ...ref, reason: ui.ignoreReason.value.trim() };
   syncBusy = true;
   renderSync();
   try {
@@ -868,16 +938,12 @@ async function saveIgnore(event: SubmitEvent): Promise<void> {
 async function savePair(event: SubmitEvent): Promise<void> {
   event.preventDefault();
   if (ui.pairForm.querySelector(":invalid")) return;
-  const left: SyncRef = {
-    provider: ui.pairLeftProvider.value as Platform,
-    accountId: ui.pairLeftAccount.value.trim(),
-    playlistId: ui.pairLeftPlaylist.value.trim(),
-  };
-  const right: SyncRef = {
-    provider: ui.pairRightProvider.value as Platform,
-    accountId: ui.pairRightAccount.value.trim(),
-    playlistId: ui.pairRightPlaylist.value.trim(),
-  };
+  const left = refFromPicker(ui.pairLeftProvider, ui.pairLeftPlaylist);
+  const right = refFromPicker(ui.pairRightProvider, ui.pairRightPlaylist);
+  if (!left || !right) {
+    notify("Choose a playlist on both sides before saving a pair.", "error");
+    return;
+  }
   if (left.provider === right.provider) {
     notify("A pair needs one Spotify playlist and one YouTube Music playlist.", "error");
     return;
@@ -892,6 +958,77 @@ async function savePair(event: SubmitEvent): Promise<void> {
   } catch (error) { notify(`Could not save the pair. ${message(error)}`, "error"); }
   finally { syncBusy = false; if (!disposed) renderSync(); }
 }
+
+/** Groups playlists by a normalized title, so a title with more than one candidate is
+ * treated as ambiguous rather than guessed at. */
+function groupByTitle(list: readonly Playlist[]): Map<string, Playlist[]> {
+  const groups = new Map<string, Playlist[]>();
+  for (const item of list) {
+    const key = item.title.trim().toLowerCase();
+    if (!key) continue;
+    const bucket = groups.get(key);
+    if (bucket) bucket.push(item); else groups.set(key, [item]);
+  }
+  return groups;
+}
+
+/**
+ * Immediately creates a pair for every playlist whose title matches exactly (case-insensitive)
+ * across both platforms, skipping playlists that are already paired or ignored. A title with
+ * more than one candidate on either side is ambiguous and is skipped, not guessed at.
+ */
+async function autoPairByName(): Promise<void> {
+  if (!sync || ui.autoPairByName.disabled) return;
+  syncBusy = true;
+  renderSync();
+  try {
+    const [youtube, spotify] = await Promise.all([
+      (async () => { discovered.youtube = null; return ensureDiscovered("youtube"); })(),
+      (async () => { discovered.spotify = null; return ensureDiscovered("spotify"); })(),
+    ]);
+    const taken = new Set([
+      ...sync.pairs.flatMap((pair) => [`${pair.left.provider}:${pair.left.playlistId}`, `${pair.right.provider}:${pair.right.playlistId}`]),
+      ...sync.ignores.map((item) => `${item.provider}:${item.playlistId}`),
+    ]);
+    const available = (list: readonly Playlist[]) => list.filter((item) => !taken.has(`${item.provider}:${item.id}`));
+    const youtubeByTitle = groupByTitle(available(youtube));
+    const spotifyByTitle = groupByTitle(available(spotify));
+    let created = 0;
+    const ambiguous: string[] = [];
+    for (const [title, youtubeMatches] of youtubeByTitle) {
+      const spotifyMatches = spotifyByTitle.get(title);
+      if (!spotifyMatches) continue;
+      if (youtubeMatches.length > 1 || spotifyMatches.length > 1) {
+        ambiguous.push(youtubeMatches[0]!.title);
+        continue;
+      }
+      const left: SyncRef = { provider: "youtube", accountId: youtubeMatches[0]!.owner.trim() || "default", playlistId: youtubeMatches[0]!.id };
+      const right: SyncRef = { provider: "spotify", accountId: spotifyMatches[0]!.owner.trim() || "default", playlistId: spotifyMatches[0]!.id };
+      try {
+        sync = await request<SyncState>("/api/sync/pairs", "POST", { left, right });
+        removals = sync.removals ?? removals;
+        created += 1;
+      } catch (error) {
+        notify(`Could not auto-pair "${youtubeMatches[0]!.title}". ${message(error)}`, "error");
+      }
+    }
+    if (created === 0 && ambiguous.length === 0) {
+      notify("No matching playlist names were found to auto-pair.", "info");
+    } else {
+      notify(
+        `Auto-paired ${created} playlist${created === 1 ? "" : "s"} by matching name.`
+          + (ambiguous.length ? ` Skipped ${ambiguous.length} ambiguous title${ambiguous.length === 1 ? "" : "s"}: ${ambiguous.join(", ")}.` : ""),
+        created > 0 ? "success" : "info",
+      );
+    }
+  } catch (error) {
+    notify(`Could not auto-pair playlists. ${message(error)}`, "error");
+  } finally {
+    syncBusy = false;
+    if (!disposed) renderSync();
+  }
+}
+
 
 async function loadInventory(): Promise<void> {
   if (inventoryLoading || !status?.connected || running() || !jobKnown) return;
@@ -1224,8 +1361,12 @@ ui.recheckRetention.addEventListener("click", () => { void recheckRetention(); }
 ui.search.addEventListener("input", renderInventory);
 ui.retryJob.addEventListener("click", () => { void loadCurrentJob(); });
 ui.syncNow.addEventListener("click", () => { void syncNow(); });
+ui.autoPairByName.addEventListener("click", () => { void autoPairByName(); });
 ui.pairForm.addEventListener("submit", (event) => { void savePair(event); });
 ui.ignoreForm.addEventListener("submit", (event) => { void saveIgnore(event); });
+ui.pairLeftProvider.addEventListener("change", renderSync);
+ui.pairRightProvider.addEventListener("change", renderSync);
+ui.ignoreProvider.addEventListener("change", renderSync);
 ui.refreshRemovals.addEventListener("click", () => { void loadRemovals(); });
 ui.removalFilters.addEventListener("submit", (event) => { event.preventDefault(); void loadRemovals(); });
 ui.removalFiltersClear.addEventListener("click", () => { ui.removalFilters.reset(); void loadRemovals(); });
