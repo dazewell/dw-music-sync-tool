@@ -54,10 +54,22 @@ async function observe(provider: MutablePlaylistProvider, ref: SyncPairRef) {
       404,
     );
   }
-  // A playlist ID alone is not sufficient: after switching the configured account, a fresh
-  // discovery can still return a followed/collaborative playlist that happens to share the same
-  // ID under a different owner. Verify the discovered owner still matches the account the pair
-  // was created against before reading or mutating anything.
+  // A playlist's owner field identifies who owns the *playlist*, not who is currently
+  // authenticated: a provider whose discovery can surface followed/collaborative playlists
+  // (Spotify) could still list a playlist owned by the account the pair was created for, even
+  // after the configured credential was switched to a different account that merely has access
+  // to it. Verify the actually-authenticated account id directly, not just the playlist's owner.
+  const authenticatedAccountId = (await provider.getAuthenticatedAccountId()).trim() || "default";
+  if (authenticatedAccountId !== ref.accountId) {
+    throw new AppError(
+      "SYNC_PLAYLIST_ACCOUNT_MISMATCH",
+      `The configured ${ref.provider} credential is no longer the account this pair was created for; it may belong to a different or switched account.`,
+      409,
+    );
+  }
+  // Defense in depth: also confirm the playlist's own owner field matches, in case a provider's
+  // discovery can return a playlist under `ref.playlistId` that is not actually owned by the
+  // authenticated account despite the account-id check above.
   const discoveredAccountId = playlist.owner.trim() || "default";
   if (discoveredAccountId !== ref.accountId) {
     throw new AppError(

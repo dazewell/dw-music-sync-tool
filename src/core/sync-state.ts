@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { z } from "zod";
 import { AppError } from "./errors.js";
-import type { SyncIgnore, SyncPair, SyncBaseline, SyncRemovalAudit, SyncRemovalAuditSink } from "./sync.js";
+import type { SyncIgnore, SyncPair, SyncPairRef, SyncBaseline, SyncRemovalAudit, SyncRemovalAuditSink } from "./sync.js";
 import { replaceFile } from "./replace-file.js";
 
 export interface SyncRun {
@@ -139,6 +139,25 @@ export class SyncStateStore implements SyncRemovalAuditSink {
         if (matches(existing.left) || matches(existing.right)) existing.enabled = false;
       }
       if (!state.ignores.some(item => item.provider === ignore.provider && item.accountId === ignore.accountId && item.playlistId === ignore.playlistId)) state.ignores.push(ignore);
+    });
+  }
+
+  async unignore(ref: SyncPairRef): Promise<SyncState> {
+    return this.update(state => {
+      const matches = (candidate: SyncPair["left"]) =>
+        candidate.provider === ref.provider && candidate.accountId === ref.accountId && candidate.playlistId === ref.playlistId;
+      const index = state.ignores.findIndex(item => item.provider === ref.provider && item.accountId === ref.accountId && item.playlistId === ref.playlistId);
+      if (index < 0) throw new AppError("SYNC_IGNORE_NOT_FOUND", "That playlist is not ignored.", 404);
+      state.ignores.splice(index, 1);
+      // Re-enable any pair that `ignore()` disabled for this playlist. The other side of the
+      // pair may still be ignored independently, so only flip pairs where neither side is.
+      for (const existing of state.pairs) {
+        if (!existing.enabled && (matches(existing.left) || matches(existing.right))) {
+          const stillIgnored = (side: SyncPair["left"]) =>
+            state.ignores.some(item => item.provider === side.provider && item.accountId === side.accountId && item.playlistId === side.playlistId);
+          if (!stillIgnored(existing.left) && !stillIgnored(existing.right)) existing.enabled = true;
+        }
+      }
     });
   }
 

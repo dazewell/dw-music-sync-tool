@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { AppError } from "../core/errors.js";
 import type { Playlist, PlaylistContents, PlaylistEntry, PlaylistMutation, PlaylistProvider } from "../core/models.js";
@@ -22,6 +23,7 @@ const playlistSchema = z.object({
   contentDetails: z.object({ itemCount: count }),
   status: status.optional(),
 });
+const channelSchema = z.object({ id: nonempty });
 
 const itemSchema = z.object({
   id: nonempty,
@@ -130,6 +132,14 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
     }));
   }
 
+  /** Fetches the id of the channel the current access token is actually authenticated as. */
+  async getAuthenticatedAccountId(): Promise<string> {
+    const { items } = await this.pages("channels", { part: "id", mine: "true", maxResults: "1" }, channelSchema);
+    const channel = items[0];
+    if (!channel) throw new AppError("YOUTUBE_RESPONSE_INVALID", "YouTube did not return the authenticated channel id.", 502);
+    return channel.id;
+  }
+
   async getPlaylist(playlist: Playlist): Promise<PlaylistContents> {
     if (playlist.provider !== this.id || !playlist.id) {
       throw new AppError("YOUTUBE_PLAYLIST_INVALID", "A YouTube playlist is required.", 400);
@@ -161,10 +171,15 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
     if (entries.some((entry) => entry.mediaId === null)) {
       warnings.push("Some entries have no video ID in the API response; the entries were preserved without a media link.");
     }
-    return { playlist, entries, warnings };
+    // YouTube has no native snapshot/etag concept for a playlist's ordered item list. Derive one
+    // from the ordered playlist-item IDs so a concurrent edit between this observation and a
+    // later write can be detected the same way Spotify's snapshot_id is used, instead of a write
+    // blindly deleting whatever this fresh read finds (which could include items added since).
+    const snapshotId = createHash("sha256").update(JSON.stringify(entries.map((entry) => entry.id))).digest("hex");
+    return { playlist: { ...playlist, snapshotId }, entries, warnings };
   }
 
-  async replacePlaylist(playlist: Playlist, entries: readonly PlaylistEntry[]): Promise<void> {
+  async replacePlaylist(playlist: Playlist, entries: readonly PlaylistEntry[], expectedSnapshotId?: string): Promise<void> {
     if (playlist.provider !== this.id || !playlist.id) {
       throw new AppError("YOUTUBE_PLAYLIST_INVALID", "A YouTube playlist is required.", 400);
     }
@@ -181,6 +196,13 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
       throw new AppError("YOUTUBE_ENTRY_UNSUPPORTED", "Unavailable entries cannot be written to YouTube without a video ID.", 409);
     }
     const current = await this.getPlaylist(playlist);
+    // A fresh read here only supplies IDs for the later deletes; without comparing it against
+    // what was actually observed when the sync plan was built, a concurrent edit to the
+    // destination (e.g. a manually added video) between planning and this write would be
+    // silently deleted along with the previous entries. Fail closed instead.
+    if (expectedSnapshotId !== undefined && current.playlist.snapshotId !== expectedSnapshotId) {
+      throw new AppError("YOUTUBE_STALE_PLAYLIST", "The YouTube playlist changed before the sync could be applied.", 409);
+    }
     // Insert the new entries before removing the previous ones. If insertion fails partway
     // (network error, quota, malformed response) the previous playlist entries are still
     // intact instead of already deleted; nothing is lost, and the failure is explicit.

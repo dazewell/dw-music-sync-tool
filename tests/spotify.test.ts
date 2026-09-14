@@ -196,6 +196,24 @@ describe("SpotifyProvider.replacePlaylist", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("refuses to delete a current entry that has a dangling uri but is marked unavailable", async () => {
+    const { provider, fetcher } = fixture([
+      json({ snapshot_id: "snap-1" }),
+      // track.id is null (so getPlaylist marks this "unavailable") but track.uri is still present -
+      // exactly the case the current-entries preflight must reject before any DELETE is issued.
+      json({
+        items: [{
+          added_at: "2026-01-01T00:00:00Z", is_local: false,
+          track: { type: "track", id: null, uri: "spotify:track:ghost", name: "Ghost" },
+        }],
+        next: null,
+      }),
+    ]);
+    await expect(provider.replacePlaylist(playlist, [entry("spotify:track:new", "new")]))
+      .rejects.toMatchObject({ code: "SPOTIFY_ENTRY_UNSUPPORTED" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("rejects an empty playlist id instead of issuing a request to a malformed URL", async () => {
     const { provider, fetcher } = fixture([]);
     await expect(provider.replacePlaylist({ ...playlist, id: "" }, [entry("spotify:track:new", "new")]))
@@ -241,6 +259,31 @@ describe("SpotifyProvider.listPlaylists", () => {
       url: "https://open.spotify.com/playlist/playlist-2", owner: "user-1", itemCount: 0, visibility: "public",
     }]);
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed instead of defaulting a missing owner id to an unverified placeholder", async () => {
+    const { provider, fetcher } = fixture([
+      json({
+        items: [{ id: "playlist-3", name: "Ownerless Playlist", tracks: { total: 0 } }],
+        next: null,
+      }),
+    ]);
+    await expect(provider.listPlaylists()).rejects.toMatchObject({ code: "SPOTIFY_RESPONSE_INVALID" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("SpotifyProvider.getAuthenticatedAccountId", () => {
+  it("returns the id of the account the refresh token is actually authenticated as", async () => {
+    const { provider, fetcher } = fixture([json({ id: "authenticated-user" })]);
+    await expect(provider.getAuthenticatedAccountId()).resolves.toBe("authenticated-user");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(String(fetcher.mock.calls[0]![0])).toBe("https://api.spotify.com/v1/me");
+  });
+
+  it("fails closed when Spotify does not return an authenticated account id", async () => {
+    const { provider } = fixture([json({})]);
+    await expect(provider.getAuthenticatedAccountId()).rejects.toMatchObject({ code: "SPOTIFY_RESPONSE_INVALID" });
   });
 });
 

@@ -36,6 +36,11 @@ export interface PlaylistProvider {
   readonly coverage: string;
   listPlaylists(): Promise<Playlist[]>;
   getPlaylist(playlist: Playlist): Promise<PlaylistContents>;
+  /** The account id of the credential currently authenticated with this provider - not a
+   * playlist's `owner` field, which (for providers that can discover followed/collaborative
+   * playlists, e.g. Spotify) may not reflect who is actually authenticated right now. Used to
+   * verify a sync pair still matches the configured credential before reading or writing. */
+  getAuthenticatedAccountId(): Promise<string>;
 }
 
 export interface PlaylistMutation {

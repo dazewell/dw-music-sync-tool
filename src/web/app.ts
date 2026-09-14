@@ -156,6 +156,12 @@ const discoveredError: Record<Platform, string | null> = { youtube: null, spotif
 // clearing the cache while the initial picker load is still pending) awaits the same
 // request instead of getting an empty placeholder result back.
 const discoveredRequest: Record<Platform, Promise<Playlist[]> | null> = { youtube: null, spotify: null };
+// Serializes discovery requests across providers: the server holds a single global
+// "inventory" reservation, so two concurrent discover calls for different providers would
+// otherwise race for it and the loser would get INVENTORY_BUSY, which ensureDiscovered would
+// then cache as a (wrong) empty result. Chaining every request through this promise means
+// only one discovery request is ever in flight at a time, matching the server's real capacity.
+let discoveryQueue: Promise<void> = Promise.resolve();
 let removals: SyncRemovalRecord[] = [];
 let removalsLoaded = false;
 let removalsLoading = false;
@@ -739,7 +745,10 @@ async function ensureDiscovered(provider: Platform): Promise<Playlist[]> {
   discoveredLoading[provider] = true;
   discoveredError[provider] = null;
   renderSync();
-  const requestPromise = (async () => {
+  // Wait for any discovery already queued for another provider before issuing this one, so
+  // concurrent discover calls never race for the server's single global inventory reservation.
+  const previousInQueue = discoveryQueue;
+  const requestPromise = previousInQueue.then(async () => {
     try {
       const response = await request<{ playlists: Playlist[] }>(`/api/sync/discover/${provider}`);
       discovered[provider] = response.playlists;
@@ -753,7 +762,10 @@ async function ensureDiscovered(provider: Platform): Promise<Playlist[]> {
       discoveredRequest[provider] = null;
       if (!disposed) renderSync();
     }
-  })();
+  });
+  // Keep the queue alive regardless of this request's outcome, so one provider's failure
+  // never blocks the next queued discovery for a different provider.
+  discoveryQueue = requestPromise.then(() => undefined, () => undefined);
   discoveredRequest[provider] = requestPromise;
   return requestPromise;
 }

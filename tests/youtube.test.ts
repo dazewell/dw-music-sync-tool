@@ -335,6 +335,20 @@ describe("YouTubeProvider official read-only coverage", () => {
   });
 });
 
+describe("YouTubeProvider.getAuthenticatedAccountId", () => {
+  it("returns the authenticated channel id", async () => {
+    const { provider, fetcher } = fixture([json({ items: [{ id: "channel-1" }], pageInfo: { totalResults: 1 } })]);
+    await expect(provider.getAuthenticatedAccountId()).resolves.toBe("channel-1");
+    const [url] = fetcher.mock.calls[0]!;
+    expect(new URL(url as string | URL).searchParams.get("mine")).toBe("true");
+  });
+
+  it("fails closed when YouTube returns no authenticated channel", async () => {
+    const { provider } = fixture([json({ items: [], pageInfo: { totalResults: 0 } })]);
+    await expect(provider.getAuthenticatedAccountId()).rejects.toMatchObject({ code: "YOUTUBE_RESPONSE_INVALID" });
+  });
+});
+
 describe("YouTubeProvider failures and retry policy", () => {
   it("fails quota 403 terminally and redacts API messages", async () => {
     const { provider, fetcher, sleep } = fixture([json({
@@ -528,6 +542,28 @@ describe("YouTubeProvider.replacePlaylist write-scope safety", () => {
     const staleUnavailable = { ...newEntry, mediaId: "stale-video", availability: "unavailable" as const };
     await expect(provider.replacePlaylist(target, [staleUnavailable])).rejects.toMatchObject({ code: "YOUTUBE_ENTRY_UNSUPPORTED" });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the destination changed since the expected snapshot was observed", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    // A different playlist-item id (item-9 instead of item-0) means the fresh read's fingerprint
+    // will never match a snapshot id computed from a single "item-0" entry.
+    fetcher.mockResolvedValueOnce(json({ items: [{ ...apiItem(0, "old-video"), id: "item-9" }], pageInfo: { totalResults: 1 } }));
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    await expect(provider.replacePlaylist(target, [newEntry], "stale-snapshot")).rejects.toMatchObject({ code: "YOUTUBE_STALE_PLAYLIST" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("proceeds when the expected snapshot id matches the destination's current fingerprint", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    const { playlist: observed } = await provider.getPlaylist(target);
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ id: "inserted-1" }));
+    fetcher.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    await expect(provider.replacePlaylist(target, [newEntry], observed.snapshotId)).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(4);
   });
 
   it("includes part=snippet on every insert and authenticates mutations with the write-scope token", async () => {

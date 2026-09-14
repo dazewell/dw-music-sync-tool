@@ -110,6 +110,58 @@ describe("playlist names and pairing", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it("re-enables a pair that ignore() disabled, once unignore() is called for the same playlist", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "music-sync-unignore-"));
+    try {
+      const store = new SyncStateStore(path.join(directory, "sync-state.json"));
+      const left = { provider: "youtube" as const, accountId: "acct", playlistId: "yt-1" };
+      const right = { provider: "spotify" as const, accountId: "acct", playlistId: "sp-1" };
+      await store.pair({
+        id: "pair-1", left, right, enabled: true,
+        createdAt: "2026-09-13T20:00:00.000Z", updatedAt: "2026-09-13T20:00:00.000Z",
+      });
+      await store.ignore({ ...left, reason: "Duplicate", createdAt: "2026-09-13T20:00:00.000Z" });
+      expect((await store.read()).pairs.find((item) => item.id === "pair-1")?.enabled).toBe(false);
+
+      const state = await store.unignore(left);
+      expect(state.ignores).toHaveLength(0);
+      expect(state.pairs.find((item) => item.id === "pair-1")?.enabled).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a pair disabled after unignore() when the other side is still separately ignored", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "music-sync-unignore-both-"));
+    try {
+      const store = new SyncStateStore(path.join(directory, "sync-state.json"));
+      const left = { provider: "youtube" as const, accountId: "acct", playlistId: "yt-1" };
+      const right = { provider: "spotify" as const, accountId: "acct", playlistId: "sp-1" };
+      await store.pair({
+        id: "pair-1", left, right, enabled: true,
+        createdAt: "2026-09-13T20:00:00.000Z", updatedAt: "2026-09-13T20:00:00.000Z",
+      });
+      await store.ignore({ ...left, reason: "", createdAt: "2026-09-13T20:00:00.000Z" });
+      await store.ignore({ ...right, reason: "", createdAt: "2026-09-13T20:00:00.000Z" });
+
+      const state = await store.unignore(left);
+      expect(state.pairs.find((item) => item.id === "pair-1")?.enabled).toBe(false);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects unignoring a playlist that is not currently ignored", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "music-sync-unignore-missing-"));
+    try {
+      const store = new SyncStateStore(path.join(directory, "sync-state.json"));
+      await expect(store.unignore({ provider: "youtube", accountId: "acct", playlistId: "yt-1" }))
+        .rejects.toMatchObject({ code: "SYNC_IGNORE_NOT_FOUND" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("stable ordered fingerprints", () => {

@@ -17,6 +17,7 @@ import { SyncStateStore } from "./core/sync-state.js";
 import { collectRemovalRecords, createApp, type SyncIntegration, type SyncPairRef } from "./server/app.js";
 import { discoverPlaylists, executeSyncRun, type SyncExecutorProviders } from "./services/sync-executor.js";
 import { RetentionController } from "./services/retention.js";
+import { updateEnvRefreshToken } from "./spotify-auth-cli.js";
 
 const help = `Music library - local playlist backups
 
@@ -85,12 +86,7 @@ function createSyncIntegration(config: AppConfig, providers: SyncExecutorProvide
       state.pairs.splice(index, 1);
     }),
     ignore: (ignore) => store.ignore(ignore),
-    unignore: (ref) => store.update((state) => {
-      const index = state.ignores.findIndex((item) => item.provider === ref.provider
-        && item.accountId === ref.accountId && item.playlistId === ref.playlistId);
-      if (index < 0) throw new AppError("SYNC_IGNORE_NOT_FOUND", "That playlist is not ignored.", 404);
-      state.ignores.splice(index, 1);
-    }),
+    unignore: (ref) => store.unignore(ref),
     run: (pairId) => executeSyncRun(store, providers, pairId),
     discover: (id) => discoverPlaylists(providers, id),
   };
@@ -168,7 +164,14 @@ async function main(): Promise<void> {
   const provider = config.demo
     ? new DemoProvider()
     : new YouTubeProvider(() => auth.getAccessToken(), { writeAccessToken: () => auth.getWriteAccessToken() });
-  const spotifyAuth = config.spotify ? new SpotifyAuth(config.spotify) : null;
+  const spotifyAuth = config.spotify
+    ? new SpotifyAuth({
+      ...config.spotify,
+      // Keep a rotated refresh token usable across restarts by persisting it to the same
+      // .env file process.loadEnvFile() reads at startup, mirroring `spotify-auth`'s writer.
+      onRefreshTokenRotated: (refreshToken) => updateEnvRefreshToken(path.resolve(process.cwd(), ".env"), refreshToken),
+    })
+    : null;
   const syncProviders: SyncExecutorProviders = {
     youtube: config.demo ? null : (provider as YouTubeProvider),
     spotify: spotifyAuth ? new SpotifyProvider(() => spotifyAuth.getAccessToken()) : null,

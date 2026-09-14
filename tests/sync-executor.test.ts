@@ -30,6 +30,9 @@ class FakeProvider implements PlaylistProvider, PlaylistMutation {
   async listPlaylists(): Promise<Playlist[]> {
     return this.playlists;
   }
+  async getAuthenticatedAccountId(): Promise<string> {
+    return "default";
+  }
   async getPlaylist(playlist: Playlist): Promise<PlaylistContents> {
     return { playlist, entries: this.contents.get(playlist.id) ?? [], warnings: [] };
   }

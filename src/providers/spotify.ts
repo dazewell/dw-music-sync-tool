@@ -38,6 +38,7 @@ const playlistPageSchema = z.object({
   next: z.string().url().nullable().optional(),
 });
 const snapshotSchema = z.object({ snapshot_id: z.string().min(1) });
+const meSchema = z.object({ id: z.string().min(1) });
 
 /** Summarizes the first few schema validation issues so a shape mismatch is diagnosable
  * from the error message alone, instead of a bare "invalid response" with no detail. */
@@ -86,16 +87,33 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
       if (!page.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", `Spotify returned an invalid playlist page (${describeIssues(page)}).`, 502);
       for (const item of page.data.items) {
         const raw = item;
+        // A playlist's owner is the only signal used to verify it still belongs to the
+        // configured account before a sync pair is allowed to read or write it (see
+        // services/sync-executor.ts). A missing or empty owner id must never silently
+        // fall back to a placeholder value that could coincidentally match an account id;
+        // fail closed instead so an ambiguous identity is never treated as verified.
+        if (!raw.owner?.id) {
+          throw new AppError("SPOTIFY_RESPONSE_INVALID", `Spotify returned playlist "${raw.id}" without an owner id; its account identity cannot be verified.`, 502);
+        }
         result.push({
           provider: this.id, id: raw.id, title: raw.name, description: raw.description ?? "",
           url: raw.external_urls?.spotify ?? `https://open.spotify.com/playlist/${encodeURIComponent(raw.id)}`,
-          owner: raw.owner?.id ?? "", itemCount: raw.tracks?.total ?? null,
+          owner: raw.owner.id, itemCount: raw.tracks?.total ?? null,
           visibility: raw.collaborative ? "unknown" : raw.public ? "public" : "private",
         });
       }
       next = page.data.next ? requireApiUrl(page.data.next) : null;
     }
     return result;
+  }
+
+  /** Fetches the id of the account the current refresh token is actually authenticated as -
+   * not a playlist's owner field, which can belong to a different account for a followed or
+   * collaborative playlist Spotify still includes in discovery. */
+  async getAuthenticatedAccountId(): Promise<string> {
+    const parsed = meSchema.safeParse(await this.request(`${API_ROOT}me`));
+    if (!parsed.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", `Spotify did not return the authenticated account id (${describeIssues(parsed)}).`, 502);
+    return parsed.data.id;
   }
 
   /** Fetches the playlist's current snapshot_id from a fresh read, independent of any cached value. */
@@ -171,14 +189,17 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
       throw new AppError("SPOTIFY_STALE_PLAYLIST", "The Spotify playlist changed before the sync could be applied.", 409);
     }
     // getPlaylist deliberately preserves local files/episodes as unaddressable placeholders
-    // (no spotify:track URI). They cannot be targeted by a DELETE by URI, so silently skipping
-    // them here would leave them behind while everything else is deleted and re-inserted,
-    // producing a mixed/duplicated playlist that only surfaces as a failure later, after the
-    // destructive request already ran. Fail closed before issuing any request instead.
-    if (current.entries.some(entry => typeof entry.providerData.uri !== "string")) {
+    // (no spotify:track URI), and also marks a track "unavailable" when Spotify returns a
+    // track object without a resolvable id (still carrying a URI). Neither can be trusted to
+    // delete-and-replace correctly: a local file/episode has no URI to target at all, and an
+    // "unavailable" entry's stale URI may no longer address the item actually occupying that
+    // position. Silently proceeding with either would leave the playlist inconsistent (or
+    // delete/replace the wrong item) after the destructive request already ran. Fail closed
+    // before issuing any request instead.
+    if (current.entries.some(entry => typeof entry.providerData.uri !== "string" || entry.availability === "unavailable")) {
       throw new AppError(
         "SPOTIFY_ENTRY_UNSUPPORTED",
-        "The current Spotify playlist has a local file or episode that cannot be addressed by a track URI; remove or resolve it manually before syncing this playlist.",
+        "The current Spotify playlist has a local file, episode, or unavailable track that cannot be safely addressed by a track URI; remove or resolve it manually before syncing this playlist.",
         409,
       );
     }

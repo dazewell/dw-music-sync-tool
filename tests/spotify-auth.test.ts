@@ -36,4 +36,32 @@ describe("SpotifyAuth", () => {
     const auth = new SpotifyAuth({ ...options, fetch: fetchMock as unknown as typeof fetch });
     await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "SPOTIFY_AUTH_NETWORK" });
   });
+
+  it("uses a rotated refresh token in-process on the next refresh, instead of retrying with the invalidated original", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(200, { access_token: "token-1", expires_in: 1, refresh_token: "rotated-token" }))
+      .mockResolvedValueOnce(jsonResponse(200, { access_token: "token-2", expires_in: 3600 }));
+    const auth = new SpotifyAuth({ ...options, fetch: fetchMock as unknown as typeof fetch });
+    await expect(auth.getAccessToken()).resolves.toBe("token-1");
+    await expect(auth.getAccessToken()).resolves.toBe("token-2");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondBody = new URLSearchParams((fetchMock.mock.calls[1]![1] as RequestInit).body as string);
+    expect(secondBody.get("refresh_token")).toBe("rotated-token");
+  });
+
+  it("hands a rotated refresh token to the onRefreshTokenRotated callback for durable persistence", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(200, { access_token: "token-1", expires_in: 3600, refresh_token: "rotated-token" }));
+    const onRefreshTokenRotated = vi.fn(async () => {});
+    const auth = new SpotifyAuth({ ...options, fetch: fetchMock as unknown as typeof fetch, onRefreshTokenRotated });
+    await auth.getAccessToken();
+    expect(onRefreshTokenRotated).toHaveBeenCalledWith("rotated-token");
+  });
+
+  it("falls back to a console warning when no rotation callback is configured", async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(200, { access_token: "token-1", expires_in: 3600, refresh_token: "rotated-token" }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const auth = new SpotifyAuth({ ...options, fetch: fetchMock as unknown as typeof fetch });
+    await auth.getAccessToken();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("rotated refresh token"));
+  });
 });
