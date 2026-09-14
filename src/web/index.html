@@ -1,0 +1,169 @@
+<!doctype html>
+<!--
+THESIS: A studio console for preserving a music library, not a dashboard for measuring it.
+OWN-WORLD: A slate masthead frames a cool-gray work surface; an orderly playlist ledger
+sits beside a persistent backup readout. Blue marks the one consequential action.
+STORY: Connect read-only, inspect the official API's inventory, back up everything it
+exposes, and inspect the local record—including failures.
+FIRST VIEWPORT: Account status, coverage, playlist table, Back up all, and adjacent
+progress are visible together. No invented library data or decorative metrics.
+FORM: Compact system typography, ruled rows, quiet surfaces, square-leaning controls,
+and a single progress transition. On narrow screens the readout follows the library.
+Direction: seed895a4aee / candidate4, mixing-desk studio console.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#253348">
+    <meta name="description" content="Read-only, local playlist metadata backups using the official YouTube API.">
+    <title>Music library — Local backups</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to workspace</a>
+    <header class="masthead">
+      <div class="masthead-inner">
+        <a class="brand" href="/" aria-label="Music library home">Music library<span>Local backups</span></a>
+        <div class="account">
+          <span class="connection-state" id="connection-state">Checking connection…</span>
+          <button class="header-button" id="connect-button" type="button" disabled>Connect Google</button>
+          <button class="header-button" id="disconnect-button" type="button" hidden>Disconnect</button>
+        </div>
+      </div>
+    </header>
+
+    <main id="workspace" class="workspace" tabindex="-1">
+      <div id="demo-notice" class="demo-notice" hidden>
+        <strong>Demo workspace.</strong> All playlists and backup results here are synthetic. No Google account is connected.
+      </div>
+      <div id="notice" class="notice" role="status" aria-live="polite" hidden>
+        <p id="notice-message"></p>
+        <button id="retry-status" class="text-button" type="button" hidden>Retry connection check</button>
+        <button id="dismiss-notice" class="text-button" type="button">Dismiss</button>
+      </div>
+      <noscript><p class="notice">JavaScript is required to connect your account and run backups. Enable it, then reload this page.</p></noscript>
+
+      <section class="workspace-heading" aria-labelledby="page-title">
+        <div>
+          <h1 id="page-title">Your playlist backups</h1>
+          <p>Keep an ordered, local record of your playlists. Metadata only—not audio.</p>
+        </div>
+        <div class="backup-action">
+          <button class="primary-button" id="backup-button" type="button" aria-describedby="backup-action-note" disabled>Back up all</button>
+          <span id="backup-action-note">Checking your workspace…</span>
+        </div>
+      </section>
+
+      <section id="connection-guide" class="connection-guide" aria-labelledby="connection-guide-title" hidden>
+        <div>
+          <h2 id="connection-guide-title">Connect Google to get started</h2>
+          <p id="connection-guide-copy">Authorize read-only access to the playlists your account owns. This tool cannot change your library.</p>
+          <div id="connection-error" class="inline-warning" role="alert" hidden></div>
+        </div>
+        <div id="setup-steps" hidden>
+          <ol>
+            <li>In Google Cloud, enable the <strong>YouTube Data API v3</strong> and create an OAuth client with application type <strong>Desktop app</strong>.</li>
+            <li>Save the downloaded client JSON locally as <code>.local\client-secret.json</code>, or set <code>GOOGLE_CLIENT_SECRET_FILE</code> to its path.</li>
+            <li>After saving or replacing the file, use <strong>Recheck connection</strong> below. If you changed the configured file path, restart the local server with <code>npm start</code> first. See <code>README.md</code> for complete setup and test-user instructions.</li>
+          </ol>
+          <p class="fine-print">Keep the client secret on your machine. There is no secret-entry field in this interface.</p>
+        </div>
+        <p class="redirect-line">Current loopback callback: <code id="redirect-uri">Checking…</code></p>
+        <button id="recheck-connection" class="text-button" type="button">Recheck connection</button>
+      </section>
+
+      <div class="console">
+        <section class="library" aria-labelledby="library-title">
+          <div class="section-heading">
+            <div>
+              <h2 id="library-title">YouTube playlists</h2>
+              <p id="inventory-summary">Checking your account…</p>
+            </div>
+            <button id="refresh-library" class="secondary-button" type="button" disabled>Refresh library</button>
+          </div>
+          <div class="coverage-note">
+            <strong>Owned playlists, official API only.</strong>
+            <p id="coverage-copy">Owned YouTube playlists may include non-music videos. Saved third-party lists, system playlists, Music likes, and uploads aren't covered.</p>
+          </div>
+          <div class="library-toolbar">
+            <label for="playlist-search">Find a playlist</label>
+            <input id="playlist-search" type="search" placeholder="Search playlist titles" autocomplete="off" disabled aria-describedby="search-help">
+            <p id="search-help">Search only changes this view. Back up all always fetches the full, current API inventory.</p>
+          </div>
+          <div id="library-feedback" class="table-feedback" role="status" aria-live="polite">Loading your workspace…</div>
+          <div id="playlist-table-wrap" class="table-scroll" role="region" aria-label="Playlist inventory" tabindex="0" hidden>
+            <table>
+              <caption class="visually-hidden">Account-owned playlists available through the official API</caption>
+              <thead>
+                <tr><th scope="col">Playlist</th><th scope="col" class="number-column">Items</th><th scope="col">Visibility</th></tr>
+              </thead>
+              <tbody id="playlist-rows"></tbody>
+            </table>
+          </div>
+          <div class="library-footer">
+            <span id="visible-count">No inventory loaded</span>
+            <span>Read-only access</span>
+          </div>
+          <details class="technical-details">
+            <summary>What the backup preserves</summary>
+            <div class="details-body">
+              <p><strong>JSON is the authoritative archive.</strong> It preserves playlist metadata, ordered entries, provider details, and availability information returned by the API.</p>
+              <p>CSV is a readable table. M3U8 contains available source links, not downloaded music. Unavailable entries and missing details are retained or reported where the API exposes them; no format can restore information the API withholds.</p>
+              <p>Each run creates a new local backup; earlier exports are kept until their 30-day expiry. Partial results and warnings remain visible in backup history until then.</p>
+              <p>API metadata is subject to Google retention and refresh policies; see <code>README.md</code> before keeping long-term archives.</p>
+            </div>
+          </details>
+        </section>
+
+        <aside class="backup-panel" aria-label="Backup progress and history">
+          <section class="current-backup" aria-labelledby="current-backup-title">
+            <div class="section-heading">
+              <h2 id="current-backup-title">Backup readout</h2>
+              <span id="job-badge" class="badge">Checking</span>
+            </div>
+            <h3 id="job-title">Checking for an active backup…</h3>
+            <p id="job-description" class="muted">You can leave this page while the local server is running.</p>
+            <div id="job-progress-wrap" hidden>
+              <label class="progress-label" for="job-progress" id="job-progress-label">Preparing backup</label>
+              <progress id="job-progress" class="visually-hidden" max="1" aria-labelledby="job-progress-label"></progress>
+              <div id="progress-track" class="progress-track" aria-hidden="true"><div id="progress-fill" class="progress-fill"></div></div>
+              <p id="job-playlist" class="current-playlist"></p>
+            </div>
+            <p id="job-totals" class="job-totals" hidden></p>
+            <p id="job-warning" class="inline-warning" role="status" aria-live="polite" hidden></p>
+            <button id="retry-job" class="text-button" type="button" hidden>Check backup status</button>
+            <p id="job-announcement" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></p>
+            <div class="destination">
+              <span>Saved on this machine</span>
+              <code id="backup-directory">Checking local destination…</code>
+              <p id="retention-notice" class="retention-note">Managed exports are automatically removed 30 days after each run while the app is running. A stopped app cannot enforce this schedule. Downloaded copies are not managed.</p>
+              <p id="retention-last-check" class="retention-check">Checking automatic cleanup status…</p>
+              <div id="retention-warning" class="inline-warning" role="alert" hidden>
+                <p id="retention-error"></p>
+                <p class="retention-recovery">Check local file permissions or review files in affected backup folders.</p>
+              </div>
+              <button id="recheck-retention" class="text-button" type="button" disabled>Recheck cleanup</button>
+            </div>
+          </section>
+
+          <section class="backup-history" aria-labelledby="history-title">
+            <div class="section-heading">
+              <h2 id="history-title">Backup history</h2>
+              <button id="refresh-history" class="text-button" type="button" disabled>Refresh history</button>
+            </div>
+            <p id="history-feedback" class="history-feedback" role="status" aria-live="polite">Loading past backups…</p>
+            <div id="history-list"></div>
+          </section>
+        </aside>
+      </div>
+
+      <footer class="workspace-footer">
+        <p>Files stay local. Account authorization is read-only.</p>
+        <p><strong>Spotify sync</strong> <span class="future-label">Future · not available</span></p>
+      </footer>
+    </main>
+  </body>
+</html>

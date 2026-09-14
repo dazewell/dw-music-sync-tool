@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-09-13T18:27:03.862Z",
+  "title": "Design System: Music library",
+  "extensions": {
+    "colorMeta": {
+      "blue": {
+        "role": "primary",
+        "displayName": "Console blue",
+        "tonalRamp": ["oklch(15% 0.1850 262.38)", "oklch(26.43% 0.1850 262.38)", "oklch(37.86% 0.1850 262.38)", "oklch(49.29% 0.1850 262.38)", "oklch(60.71% 0.1850 262.38)", "oklch(72.14% 0.1850 262.38)", "oklch(83.57% 0.1850 262.38)", "oklch(95% 0.1850 262.38)"]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Slate ink",
+        "tonalRamp": ["oklch(15% 0.0421 258.30)", "oklch(26.43% 0.0421 258.30)", "oklch(37.86% 0.0421 258.30)", "oklch(49.29% 0.0421 258.30)", "oklch(60.71% 0.0421 258.30)", "oklch(72.14% 0.0421 258.30)", "oklch(83.57% 0.0421 258.30)", "oklch(95% 0.0421 258.30)"]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Secondary slate",
+        "tonalRamp": ["oklch(15% 0.0354 254.47)", "oklch(26.43% 0.0354 254.47)", "oklch(37.86% 0.0354 254.47)", "oklch(49.29% 0.0354 254.47)", "oklch(60.71% 0.0354 254.47)", "oklch(72.14% 0.0354 254.47)", "oklch(83.57% 0.0354 254.47)", "oklch(95% 0.0354 254.47)"]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Rule gray",
+        "tonalRamp": ["oklch(15% 0.0145 254.61)", "oklch(26.43% 0.0145 254.61)", "oklch(37.86% 0.0145 254.61)", "oklch(49.29% 0.0145 254.61)", "oklch(60.71% 0.0145 254.61)", "oklch(72.14% 0.0145 254.61)", "oklch(83.57% 0.0145 254.61)", "oklch(95% 0.0145 254.61)"]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Working white",
+        "tonalRamp": ["oklch(15% 0.0000 0.00)", "oklch(26.43% 0.0000 0.00)", "oklch(37.86% 0.0000 0.00)", "oklch(49.29% 0.0000 0.00)", "oklch(60.71% 0.0000 0.00)", "oklch(72.14% 0.0000 0.00)", "oklch(83.57% 0.0000 0.00)", "oklch(95% 0.0000 0.00)"]
+      },
+      "workspace": {
+        "role": "neutral",
+        "displayName": "Cool workspace",
+        "tonalRamp": ["oklch(15% 0.0063 255.48)", "oklch(26.43% 0.0063 255.48)", "oklch(37.86% 0.0063 255.48)", "oklch(49.29% 0.0063 255.48)", "oklch(60.71% 0.0063 255.48)", "oklch(72.14% 0.0063 255.48)", "oklch(83.57% 0.0063 255.48)", "oklch(95% 0.0063 255.48)"]
+      },
+      "masthead": {
+        "role": "neutral",
+        "displayName": "Masthead slate",
+        "tonalRamp": ["oklch(15% 0.0422 258.30)", "oklch(26.43% 0.0422 258.30)", "oklch(37.86% 0.0422 258.30)", "oklch(49.29% 0.0422 258.30)", "oklch(60.71% 0.0422 258.30)", "oklch(72.14% 0.0422 258.30)", "oklch(83.57% 0.0422 258.30)", "oklch(95% 0.0422 258.30)"]
+      }
+    },
+    "typographyMeta": {
+      "headline": { "displayName": "Page headline", "purpose": "Fluid page heading." },
+      "title": { "displayName": "Section title", "purpose": "Compact section headings." },
+      "body": { "displayName": "System body", "purpose": "Inherited system font and line height; local sizes remain component-specific." },
+      "control": { "displayName": "Control label", "purpose": "Default semibold button text." },
+      "label": { "displayName": "Compact label", "purpose": "Search label, record titles and disclosure text." },
+      "mono": { "displayName": "Technical value", "purpose": "Filesystem paths and code values." }
+    },
+    "shadows": [
+      { "name": "primary-action", "value": "0 2px 3px rgb(24 52 94 / 12%)", "purpose": "Small static shadow beneath the primary action." },
+      { "name": "console-enclosure", "value": "0 3px 8px rgb(35 51 76 / 4%)", "purpose": "Quiet separation of the shared console from the workspace." }
+    ],
+    "motion": [
+      { "name": "progress-transition", "value": "transform 650ms cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Progress fill only; removed under prefers-reduced-motion: reduce." }
+    ],
+    "breakpoints": [
+      { "name": "compact-console-max", "value": "1050px" },
+      { "name": "stacked-console-max", "value": "800px" },
+      { "name": "mobile-max", "value": "520px" },
+      { "name": "wide-workspace-min", "value": "1600px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The consequential backup action; full-width on small screens.",
+      "html": "<button class=\"ds-primary\" type=\"button\">Back up all</button>",
+      "css": ".ds-primary { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.875rem; font-weight: 600; line-height: 1.5; border-radius: 5px; background: var(--blue, #245bcc); color: #fff; border: 1px solid var(--blue, #245bcc); padding: 12px 26px; min-height: 46px; box-shadow: 0 2px 3px rgb(24 52 94 / 12%); cursor: pointer; } .ds-primary:hover:not(:disabled) { background: #1949ab; border-color: #1949ab; } .ds-primary:focus-visible { outline: 3px solid #1d62dd; outline-offset: 4px; } .ds-primary:disabled { cursor: not-allowed; opacity: 0.53; } @media (max-width: 520px) { .ds-primary { width: 100%; } }"
+    },
+    {
+      "name": "Secondary button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Outlined refresh action without primary emphasis.",
+      "html": "<button class=\"ds-secondary\" type=\"button\">Refresh library</button>",
+      "css": ".ds-secondary { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.875rem; font-weight: 600; line-height: 1.5; border-radius: 5px; background: #fff; color: #35465b; border: 1px solid #aebaca; padding: 8px 13px; min-height: 38px; cursor: pointer; } .ds-secondary:hover:not(:disabled) { background: #f0f4fa; border-color: #7d8da4; } .ds-secondary:focus-visible { outline: 3px solid #1d62dd; outline-offset: 4px; } .ds-secondary:disabled { cursor: not-allowed; opacity: 0.53; } @media (max-width: 520px) { .ds-secondary { font-size: 0.77rem; padding: 8px 10px; flex-shrink: 0; } }"
+    },
+    {
+      "name": "Header button",
+      "kind": "button",
+      "refersTo": "button-header",
+      "description": "Account action on the dark masthead.",
+      "html": "<div class=\"ds-header-surface\"><button class=\"ds-header-button\" type=\"button\">Connect YouTube</button></div>",
+      "css": ".ds-header-surface { background: #253348; padding: 16px 40px; } .ds-header-button { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.875rem; font-weight: 600; line-height: 1.5; border-radius: 5px; padding: 8px 13px; border: 1px solid #758398; color: #f0f5ff; background: transparent; cursor: pointer; } .ds-header-button:hover:not(:disabled) { background: #35465f; } .ds-header-button:focus-visible { outline: 3px solid #a8cbff; outline-offset: 4px; } .ds-header-button:disabled { cursor: not-allowed; opacity: 0.53; }"
+    },
+    {
+      "name": "Text button",
+      "kind": "button",
+      "refersTo": "button-text",
+      "description": "Underlined, low-emphasis retry or dismissal action.",
+      "html": "<button class=\"ds-text-button\" type=\"button\">Check backup status</button>",
+      "css": ".ds-text-button { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.875rem; font-weight: 600; line-height: 1.5; border-radius: 5px; background: transparent; border: 0; color: #2156b4; padding: 5px 0; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; } .ds-text-button:hover:not(:disabled) { color: #12377d; } .ds-text-button:focus-visible { outline: 3px solid #1d62dd; outline-offset: 4px; } .ds-text-button:disabled { cursor: not-allowed; opacity: 0.53; }"
+    },
+    {
+      "name": "Playlist search",
+      "kind": "input",
+      "refersTo": "input-search",
+      "description": "Labeled search with persistent scope clarification.",
+      "html": "<div class=\"ds-search\"><label for=\"ds-playlist-search\">Find a playlist</label><input id=\"ds-playlist-search\" type=\"search\" placeholder=\"Search playlist titles\" autocomplete=\"off\" aria-describedby=\"ds-search-help\"><p id=\"ds-search-help\">Search only changes this view. Back up all always fetches the full, current API inventory.</p></div>",
+      "css": ".ds-search { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.5; color: var(--ink, #263449); } .ds-search label { display: block; font-size: 0.81rem; font-weight: 600; margin-bottom: 7px; } .ds-search input { box-sizing: border-box; width: 100%; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.875rem; line-height: 1.5; padding: 10px 12px; border: 1px solid #aebaca; border-radius: 5px; background: #fff; color: var(--ink, #263449); min-height: 42px; } .ds-search input::placeholder { color: #667389; opacity: 1; } .ds-search input:disabled { background: #f4f6f9; } .ds-search input:focus-visible { outline: 3px solid #1d62dd; outline-offset: 4px; } .ds-search p { margin: 8px 0 0; max-width: 72ch; font-size: 0.75rem; color: var(--muted, #58677a); }"
+    },
+    {
+      "name": "Masthead home link",
+      "kind": "nav",
+      "description": "Slate framing and compact brand hierarchy, without extra navigation chrome.",
+      "html": "<header class=\"ds-masthead\"><div class=\"ds-masthead-inner\"><a class=\"ds-brand\" href=\"/\" aria-label=\"Music library home\">Music library<span>Local backups</span></a></div></header>",
+      "css": ".ds-masthead { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.5; background: #253348; color: #edf3fd; } .ds-masthead-inner { box-sizing: border-box; max-width: 1480px; min-height: 76px; padding: 16px 40px; margin: auto; display: flex; align-items: center; justify-content: space-between; gap: 20px; } .ds-brand { display: flex; align-items: baseline; gap: 16px; color: #fff; font-weight: 650; font-size: 1.15rem; text-decoration: none; letter-spacing: -0.02em; } .ds-brand:hover { color: #fff; } .ds-brand:focus-visible { outline: 3px solid #a8cbff; outline-offset: 4px; } .ds-brand span { color: #bac9df; font-weight: 400; font-size: 0.8rem; letter-spacing: 0; } @media (max-width: 1050px) { .ds-masthead-inner { padding-inline: 24px; } } @media (max-width: 800px) { .ds-masthead-inner { flex-wrap: wrap; gap: 14px; } .ds-brand span { display: none; } } @media (max-width: 520px) { .ds-masthead-inner { padding: 15px 18px; } .ds-brand { width: 100%; } .ds-brand span { display: inline; } }"
+    },
+    {
+      "name": "Outcome badges",
+      "kind": "chip",
+      "refersTo": "badge",
+      "description": "Noninteractive labels; color reinforces the written state.",
+      "html": "<span class=\"ds-badge\">Ready</span> <span class=\"ds-badge\" data-state=\"running\">In progress</span> <span class=\"ds-badge\" data-state=\"complete\">Complete</span> <span class=\"ds-badge\" data-state=\"partial\">Partial</span> <span class=\"ds-badge\" data-state=\"interrupted\">Interrupted</span> <span class=\"ds-badge\" data-state=\"failed\">Failed</span>",
+      "css": ".ds-badge { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.5; display: inline-block; border-radius: 4px; padding: 3px 7px; font-size: 0.69rem; font-weight: 600; color: #536277; background: #e7ecf2; white-space: nowrap; } .ds-badge[data-state='running'] { color: #214f9c; background: #e1eafb; } .ds-badge[data-state='complete'] { color: #285f46; background: #dfefe5; } .ds-badge[data-state='partial'], .ds-badge[data-state='interrupted'] { color: #805318; background: #faedcf; } .ds-badge[data-state='failed'] { color: #913b3e; background: #f8e4e4; }"
+    },
+    {
+      "name": "Console enclosure",
+      "kind": "card",
+      "refersTo": "console",
+      "description": "Shared working enclosure, not a repeated elevated-card grid.",
+      "html": "<div class=\"ds-console\"><section class=\"ds-library\"><h2>YouTube playlists</h2></section><aside class=\"ds-readout\" aria-label=\"Backup progress and history\"><h2>Backup readout</h2></aside></div>",
+      "css": ".ds-console { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.5; color: var(--ink, #263449); display: grid; grid-template-columns: minmax(0, 1.8fr) minmax(340px, 1fr); border: 1px solid #cbd4df; border-radius: 6px; background: var(--surface, #fff); overflow: clip; box-shadow: 0 3px 8px rgb(35 51 76 / 4%); } .ds-console h2 { margin: 0; text-wrap: balance; font-size: 1.05rem; font-weight: 650; line-height: 1.35; letter-spacing: -0.01em; } .ds-library { min-width: 0; padding: 25px 26px 19px; } .ds-readout { min-width: 0; background: #f8fafc; border-left: 1px solid #cbd4df; padding: 25px 24px 22px; } @media (max-width: 1050px) { .ds-console { grid-template-columns: minmax(0, 1.45fr) minmax(305px, 1fr); } .ds-library, .ds-readout { padding-inline: 20px; } } @media (max-width: 800px) { .ds-console { grid-template-columns: minmax(0, 1fr); } .ds-readout { border-left: 0; border-top: 1px solid #cbd4df; } } @media (max-width: 520px) { .ds-library { padding-inline: 16px; } .ds-readout { padding-inline: 18px; } }"
+    },
+    {
+      "name": "Discovery progress",
+      "kind": "custom",
+      "description": "The built indeterminate discovery state; a static segment, with a native accessible progress element.",
+      "html": "<div class=\"ds-progress\"><label class=\"ds-progress-label\" for=\"ds-job-progress\" id=\"ds-job-label\">Discovering account-owned playlists</label><progress id=\"ds-job-progress\" class=\"ds-visually-hidden\" max=\"1\" aria-labelledby=\"ds-job-label\"></progress><div class=\"ds-progress-track\" data-indeterminate=\"true\" aria-hidden=\"true\"><div class=\"ds-progress-fill\"></div></div></div>",
+      "css": ".ds-progress { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; line-height: 1.5; } .ds-progress-label { display: block; margin: 20px 0 9px; font-size: 0.79rem; color: #43546b; font-variant-numeric: tabular-nums; } .ds-visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; } .ds-progress-track { height: 8px; border-radius: 2px; overflow: hidden; background: #dce3ed; } .ds-progress-fill { height: 100%; background: #245bcc; transform: scaleX(var(--progress, 0)); transform-origin: left; transition: transform 650ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-progress-track[data-indeterminate='true'] .ds-progress-fill { transform: scaleX(0.12); } @media (prefers-reduced-motion: reduce) { .ds-progress-fill { transition: none; } }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Studio console",
+    "overview": "A practical, compact workspace: slate framing, cool-gray surroundings and quiet white working surfaces. Restrained blue identifies action and progress; ruled records and visible state carry the interface rather than decoration.\n\nThis records the built system in `src\\web\\styles.css`, `src\\web\\index.html` and `src\\web\\app.ts`, informed by `PRODUCT.md`. The user-approved direction is corroborated by the HTML contract (`seed895a4aee / candidate4`). Measurements below describe this implementation, not a universal template for future surfaces.",
+    "keyCharacteristics": [
+      "Compact system typography with explicit hierarchy.",
+      "Cool neutral surfaces, ruled records and restrained blue emphasis.",
+      "Square-leaning controls and low, quiet elevation.",
+      "Visible progress, textual outcomes and inspectable details."
+    ],
+    "rules": [
+      { "name": "The Written State Rule", "body": "Color accompanies a visible state label; it never replaces the outcome text.", "section": "colors" },
+      { "name": "The Readable Record Rule", "body": "Keep titles and paths wrapping, supporting metadata subordinate, and numeric columns aligned.", "section": "typography" }
+    ],
+    "dos": [
+      "**Do** pair semantic color with explicit state text.",
+      "**Do** retain visible keyboard focus, native disclosures and the labeled progress element.",
+      "**Do** preserve wrapping for record titles and paths, and tabular alignment for counts.",
+      "**Do** use tonal surfaces and rules to separate working regions."
+    ],
+    "donts": [
+      "**Don't** replace real records or progress with invented metrics or unlabeled decoration.",
+      "**Don't** flatten partial, interrupted and failed results into a generic success treatment.",
+      "**Don't** remove progress information when reducing motion."
+    ]
+  }
+}
