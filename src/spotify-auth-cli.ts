@@ -40,10 +40,15 @@ function isMissing(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
-function defaultOpenBrowser(url: string): void {
+export function defaultOpenBrowser(url: string): void {
   const platform = process.platform;
-  const command = platform === "win32" ? "cmd" : platform === "darwin" ? "open" : "xdg-open";
-  const args = platform === "win32" ? ["/c", "start", "", url] : [url];
+  // On Windows, `cmd /c start "" <url>` passes the URL through cmd.exe's own command-line
+  // parser, which treats an unquoted `&` as a command separator - silently truncating this
+  // tool's authorize URL (which always has several `&`-separated query parameters) after the
+  // first one. rundll32's URL protocol handler opens the default browser without going
+  // through cmd.exe at all, so the URL reaches it as a single, untouched argument.
+  const command = platform === "win32" ? "rundll32" : platform === "darwin" ? "open" : "xdg-open";
+  const args = platform === "win32" ? ["url.dll,FileProtocolHandler", url] : [url];
   try {
     const child = spawn(command, args, { stdio: "ignore", detached: true, windowsHide: true });
     child.on("error", () => {});

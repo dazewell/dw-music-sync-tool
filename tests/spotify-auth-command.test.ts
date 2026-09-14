@@ -5,7 +5,15 @@ import http from "node:http";
 import path from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { runSpotifyAuth, updateEnvRefreshToken } from "../src/spotify-auth-cli.js";
+import { defaultOpenBrowser, runSpotifyAuth, updateEnvRefreshToken } from "../src/spotify-auth-cli.js";
+
+const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }));
+// Keep execFile (used by the CLI entry point tests below, which spawn a real subprocess)
+// while replacing only spawn, which defaultOpenBrowser uses to launch the system browser.
+vi.mock("node:child_process", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("node:child_process")>()),
+  spawn: spawnMock,
+}));
 
 const execute = promisify(execFile);
 const directories: string[] = [];
@@ -123,6 +131,24 @@ describe("runSpotifyAuth", () => {
       envPath, port: 0, clientId: "abc", clientSecret: "def",
       fetch: fetchMock as unknown as typeof fetch, openBrowser, log: () => {},
     })).rejects.toMatchObject({ code: "SPOTIFY_AUTH_TOKEN_INVALID" });
+  });
+});
+
+describe("defaultOpenBrowser", () => {
+  it("on win32, opens the URL without going through cmd.exe's start command", () => {
+    if (process.platform !== "win32") return;
+    spawnMock.mockReset();
+    const fake = { on: () => fake, unref: () => {} };
+    spawnMock.mockReturnValue(fake);
+    // cmd.exe's `start` parses an unquoted `&` in the URL as a command separator, which
+    // would truncate this tool's multi-parameter authorize URL after the first `&`.
+    // rundll32's URL handler receives the URL as a single, untouched argument instead.
+    const url = "https://accounts.spotify.com/authorize?client_id=abc&response_type=code&state=xyz";
+    defaultOpenBrowser(url);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const [command, args] = spawnMock.mock.calls[0]!;
+    expect(command).toBe("rundll32");
+    expect(args).toEqual(["url.dll,FileProtocolHandler", url]);
   });
 });
 
