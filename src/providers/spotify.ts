@@ -152,7 +152,7 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
     // Validate every target-native URI before any destructive request is issued: an unsupported
     // entry must never leave the playlist partially or fully emptied.
     const uris = entries.map(entry => typeof entry.providerData.uri === "string" ? entry.providerData.uri : null);
-    if (uris.some(uri => uri === null || !uri.startsWith("spotify:track:"))) {
+    if (uris.some(uri => uri === null || !/^spotify:track:[A-Za-z0-9]+$/.test(uri))) {
       throw new AppError("SPOTIFY_ENTRY_UNSUPPORTED", "Every synchronized entry needs an explicit Spotify track URI.", 409);
     }
     const validatedUris = uris as string[];

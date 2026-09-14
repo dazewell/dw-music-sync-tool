@@ -1,7 +1,7 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { Playlist, PlaylistContents, PlaylistEntry, ProviderId } from "../src/core/models.js";
 import {
   applySyncPlan,
@@ -321,6 +321,29 @@ describe("common sync baseline comparison", () => {
       const recovered = await reporter.read();
       expect(recovered.runs.find(item => item.id === run.id)?.status).toBe("review-required");
       expect(recovered.baselines["pair-1"]).toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("claims a run as active before persisting it", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "music-sync-start-race-"));
+    try {
+      const store = new SyncStateStore(path.join(directory, "sync-state.json"));
+      await store.update((state) => {
+        state.baselines["pair-1"] = { sourceFingerprint: "left", targetFingerprint: "right" };
+      });
+      const update = store.update.bind(store);
+      vi.spyOn(store, "update").mockImplementationOnce(async (mutator) => {
+        const state = await update(mutator);
+        const concurrentRead = await store.read();
+        expect(concurrentRead.runs.at(-1)?.status).toBe("running");
+        expect(concurrentRead.baselines["pair-1"]).toEqual({ sourceFingerprint: "left", targetFingerprint: "right" });
+        return state;
+      });
+
+      const run = await store.startRun("pair-1");
+      expect((await store.peek()).runs.find(item => item.id === run.id)?.status).toBe("running");
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

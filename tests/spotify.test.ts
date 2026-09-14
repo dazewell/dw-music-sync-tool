@@ -114,6 +114,13 @@ describe("SpotifyProvider.replacePlaylist", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("rejects an empty Spotify track identifier before any write", async () => {
+    const { provider, fetcher } = fixture([]);
+    await expect(provider.replacePlaylist(playlist, [entry("spotify:track:", "empty")]))
+      .rejects.toMatchObject({ code: "SPOTIFY_ENTRY_UNSUPPORTED" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("compares the freshly reread snapshot id, not a caller-supplied or stale one", async () => {
     const { provider, fetcher } = fixture([
       json({ snapshot_id: "snap-current" }),

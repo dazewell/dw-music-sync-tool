@@ -144,14 +144,19 @@ export class SyncStateStore implements SyncRemovalAuditSink {
 
   async startRun(pairId: string): Promise<SyncRun> {
     const run: SyncRun = { id: randomUUID(), pairId, status: "running", startedAt: new Date().toISOString(), completedAt: null, message: null, removals: [] };
-    await this.update(state => {
-      if (state.runs.some(item => item.pairId === pairId && item.status === "running" && this.activeRuns.has(item.id))) {
-        throw new AppError("SYNC_RUN_ACTIVE", "A synchronization run for this pair is already active; reconcile it before retrying.", 409);
-      }
-      state.runs.push(run);
-    });
     this.activeRuns.add(run.id);
-    return run;
+    try {
+      await this.update(state => {
+        if (state.runs.some(item => item.pairId === pairId && item.status === "running" && this.activeRuns.has(item.id))) {
+          throw new AppError("SYNC_RUN_ACTIVE", "A synchronization run for this pair is already active; reconcile it before retrying.", 409);
+        }
+        state.runs.push(run);
+      });
+      return run;
+    } catch (error) {
+      this.activeRuns.delete(run.id);
+      throw error;
+    }
   }
 
   async recordRemovalAudits(runId: string, audits: readonly SyncRemovalAudit[]): Promise<void> {
