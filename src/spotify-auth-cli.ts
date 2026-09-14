@@ -202,22 +202,31 @@ export async function updateEnvRefreshToken(envPath: string, refreshToken: strin
   }
   const line = `SPOTIFY_REFRESH_TOKEN=${refreshToken}`;
   const pattern = /^#?[ \t]*SPOTIFY_REFRESH_TOKEN[ \t]*=.*$/m;
+  // Use a replacer function, not the raw string form: String.prototype.replace treats
+  // "$"-sequences (e.g. "$&", "$'", "$1") in a string replacement specially, which would
+  // silently corrupt a refresh token containing one of those sequences.
   const updated = pattern.test(text)
-    ? text.replace(pattern, line)
+    ? text.replace(pattern, () => line)
     : `${text.length > 0 && !text.endsWith("\n") ? `${text}\n` : text}${line}\n`;
   const directory = path.dirname(envPath);
   const temp = path.join(directory, `.env.${randomBytes(8).toString("hex")}.tmp`);
-  const handle = await open(temp, "wx", 0o600);
+  let created = false;
   try {
-    await handle.writeFile(updated, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
+    const handle = await open(temp, "wx", 0o600);
+    created = true;
+    try {
+      await handle.writeFile(updated, "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await replaceFile(temp, envPath);
   } catch (error) {
-    await unlink(temp).catch(() => {});
+    // Clean up the temp file for any failure in the write-and-replace sequence, not just a
+    // failed replaceFile, so a failed authorization never leaves a credential-bearing artifact
+    // (e.g. a failed writeFile/sync that still left a partially-written temp file) behind. Only
+    // unlink a file this call actually created; an "wx" open failure means nothing was written.
+    if (created) await unlink(temp).catch(() => {});
     throw new AppError("SPOTIFY_AUTH_ENV_WRITE_FAILED", "The refresh token could not be saved to .env. Check file permissions and retry.", 500);
   }
 }

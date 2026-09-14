@@ -214,6 +214,16 @@ describe("updateEnvRefreshToken", () => {
     await updateEnvRefreshToken(envPath, "rotated-value");
     expect(await readFile(envPath, "utf8")).toBe("SPOTIFY_CLIENT_ID=abc\nSPOTIFY_REFRESH_TOKEN=rotated-value\nSPOTIFY_CLIENT_SECRET=def\n");
   });
+
+  it("inserts a token containing a $-sequence literally instead of letting String.replace interpret it", async () => {
+    const directory = await tempDir();
+    const envPath = path.join(directory, ".env");
+    await writeFile(envPath, "SPOTIFY_REFRESH_TOKEN=old-value\n", "utf8");
+    // "$&" and "$'" are special in String.prototype.replace's replacement-string form; a token
+    // containing them must be written byte-for-byte, not expanded/interpreted.
+    await updateEnvRefreshToken(envPath, "token-with-$&-and-$'-sequences");
+    expect(await readFile(envPath, "utf8")).toBe("SPOTIFY_REFRESH_TOKEN=token-with-$&-and-$'-sequences\n");
+  });
 });
 
 describe("spotify-auth CLI entry point", () => {

@@ -154,12 +154,14 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
   }
 
   async replacePlaylist(playlist: Playlist, entries: readonly PlaylistEntry[], expectedSnapshotId?: string): Promise<void> {
-    if (playlist.provider !== this.id) throw new AppError("SPOTIFY_PLAYLIST_INVALID", "A Spotify playlist is required.", 400);
+    if (playlist.provider !== this.id || !playlist.id) throw new AppError("SPOTIFY_PLAYLIST_INVALID", "A Spotify playlist is required.", 400);
     // Validate every target-native URI before any destructive request is issued: an unsupported
-    // entry must never leave the playlist partially or fully emptied.
+    // entry must never leave the playlist partially or fully emptied. An entry marked unavailable
+    // (no resolvable track id) can still carry a stale/unaddressable uri in providerData, so the
+    // availability marker must be checked explicitly and not just the uri's presence/shape.
     const uris = entries.map(entry => typeof entry.providerData.uri === "string" ? entry.providerData.uri : null);
-    if (uris.some(uri => uri === null || !/^spotify:track:[A-Za-z0-9]+$/.test(uri))) {
-      throw new AppError("SPOTIFY_ENTRY_UNSUPPORTED", "Every synchronized entry needs an explicit Spotify track URI.", 409);
+    if (entries.some((entry, index) => entry.availability === "unavailable" || uris[index] === null || !/^spotify:track:[A-Za-z0-9]+$/.test(uris[index]!))) {
+      throw new AppError("SPOTIFY_ENTRY_UNSUPPORTED", "Every synchronized entry needs an available Spotify track with an explicit URI.", 409);
     }
     const validatedUris = uris as string[];
     // Re-read the playlist and its snapshot fresh; a cached/passed-in snapshot cannot protect
@@ -187,14 +189,26 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
       // Spotify's removal endpoint accepts at most 100 track objects per request, and each
       // successful removal returns a fresh snapshot_id that the next batch must use, or the
       // API rejects it as stale. Chunk removals and carry the returned snapshot forward.
+      //
+      // Batches are processed from the end of the list backward: removing a batch shifts every
+      // remaining track at a lower position down by that batch's size, which would silently
+      // invalidate a later batch's already-computed `positions` if we removed low-to-high.
+      // Removing high-to-low means every not-yet-processed batch's positions are still accurate
+      // when its turn comes, since only tracks *after* it in the list have been removed so far.
       let snapshotId = current.playlist.snapshotId;
-      for (let index = 0; index < tracks.length; index += 100) {
+      const chunks: Array<{ uri: string; positions: number[] }[]> = [];
+      for (let index = 0; index < tracks.length; index += 100) chunks.push(tracks.slice(index, index + 100));
+      for (let chunkIndex = chunks.length - 1; chunkIndex >= 0; chunkIndex--) {
         const body = await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items`, {
           method: "DELETE",
-          body: JSON.stringify({ tracks: tracks.slice(index, index + 100), snapshot_id: snapshotId }),
+          body: JSON.stringify({ tracks: chunks[chunkIndex], snapshot_id: snapshotId }),
         });
         const parsed = snapshotSchema.safeParse(body);
-        if (parsed.success) snapshotId = parsed.data.snapshot_id;
+        // A successful deletion must return a fresh snapshot id; continuing with a stale one
+        // risks the next batch (or a subsequent stale-playlist check) operating on an
+        // unconfirmed destructive result. Fail closed instead of silently keeping the old value.
+        if (!parsed.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", `Spotify did not return a fresh snapshot id after removing playlist items (${describeIssues(parsed)}).`, 502);
+        snapshotId = parsed.data.snapshot_id;
       }
     }
     for (let index = 0; index < validatedUris.length; index += 100) {

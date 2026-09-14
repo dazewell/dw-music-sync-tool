@@ -54,6 +54,16 @@ const test = base.extend<{ serverUrl: string; demoMode: boolean; auth: Synthetic
           auth.connected = true;
           auth.error = null;
         },
+        beginWrite: async () => {
+          requireRealMode();
+          return {
+            url: `${config.baseUrl}/auth/google/write-callback?state=synthetic-write-state&code=synthetic-write-code`,
+            state: "synthetic-write-state", codeVerifier: "synthetic-write-verifier",
+          };
+        },
+        completeWrite: async () => {
+          requireRealMode();
+        },
         disconnect: async () => {
           requireRealMode();
           auth.connected = false;

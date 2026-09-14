@@ -137,7 +137,7 @@ describe("SpotifyProvider.replacePlaylist", () => {
     const { provider, fetcher } = fixture([
       json({ snapshot_id: "snap-1" }),
       json({ items: [trackItem("spotify:track:old", "Old")], next: null }),
-      json({}),
+      json({ snapshot_id: "snap-2" }),
       json({}),
     ]);
     await provider.replacePlaylist(playlist, [entry("spotify:track:new", "new")]);
@@ -149,7 +149,7 @@ describe("SpotifyProvider.replacePlaylist", () => {
     expect(postBody).toMatchObject({ uris: ["spotify:track:new"] });
   });
 
-  it("chunks a delete of more than 100 current tracks and carries the returned snapshot id forward", async () => {
+  it("chunks a delete of more than 100 current tracks from the end backward and carries the returned snapshot id forward", async () => {
     const trackCount = 150;
     const items = Array.from({ length: trackCount }, (_, index) => trackItem(`spotify:track:old-${index}`, `Old ${index}`, index));
     const { provider, fetcher } = fixture([
@@ -161,22 +161,53 @@ describe("SpotifyProvider.replacePlaylist", () => {
     ]);
     await provider.replacePlaylist(playlist, [entry("spotify:track:new", "new")]);
     const methods = fetcher.mock.calls.map(([, init]) => (init as RequestInit | undefined)?.method ?? "GET");
-    // Two GETs to read the playlist, two chunked DELETEs (100 + 50), then one POST insert.
+    // Two GETs to read the playlist, two chunked DELETEs (50 + 100), then one POST insert.
     expect(methods).toEqual(["GET", "GET", "DELETE", "DELETE", "POST"]);
     const firstDeleteBody = JSON.parse((fetcher.mock.calls[2]![1] as RequestInit).body as string);
     const secondDeleteBody = JSON.parse((fetcher.mock.calls[3]![1] as RequestInit).body as string);
-    expect(firstDeleteBody.tracks).toHaveLength(100);
+    // The first batch removed must be the *last* 50 tracks (positions 100-149): removing the
+    // highest positions first means every remaining batch's already-computed positions stay
+    // accurate, since only tracks after it in the list have been removed so far.
+    expect(firstDeleteBody.tracks).toHaveLength(50);
+    expect(firstDeleteBody.tracks[0]).toMatchObject({ positions: [100] });
     expect(firstDeleteBody.snapshot_id).toBe("snap-1");
-    expect(secondDeleteBody.tracks).toHaveLength(50);
+    expect(secondDeleteBody.tracks).toHaveLength(100);
+    expect(secondDeleteBody.tracks[0]).toMatchObject({ positions: [0] });
     // The second batch must use the snapshot returned by the first, not the original read.
     expect(secondDeleteBody.snapshot_id).toBe("snap-2");
+  });
+
+  it("fails closed instead of silently keeping a stale snapshot when a delete response omits snapshot_id", async () => {
+    const { provider, fetcher } = fixture([
+      json({ snapshot_id: "snap-1" }),
+      json({ items: [trackItem("spotify:track:old", "Old")], next: null }),
+      json({ error: "unexpected shape" }),
+    ]);
+    await expect(provider.replacePlaylist(playlist, [entry("spotify:track:new", "new")]))
+      .rejects.toMatchObject({ code: "SPOTIFY_RESPONSE_INVALID" });
+    // No insert should be attempted after an unconfirmed destructive result.
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it("rejects an unavailable entry with a dangling uri instead of writing it as playable", async () => {
+    const { provider, fetcher } = fixture([]);
+    const unavailable = entry("spotify:track:ghost", "ghost", "unavailable");
+    await expect(provider.replacePlaylist(playlist, [unavailable])).rejects.toMatchObject({ code: "SPOTIFY_ENTRY_UNSUPPORTED" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty playlist id instead of issuing a request to a malformed URL", async () => {
+    const { provider, fetcher } = fixture([]);
+    await expect(provider.replacePlaylist({ ...playlist, id: "" }, [entry("spotify:track:new", "new")]))
+      .rejects.toMatchObject({ code: "SPOTIFY_PLAYLIST_INVALID" });
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it("surfaces a partial failure explicitly when the insert fails after the delete succeeded", async () => {
     const { provider, fetcher } = fixture([
       json({ snapshot_id: "snap-1" }),
       json({ items: [trackItem("spotify:track:old", "Old")], next: null }),
-      json({}),
+      json({ snapshot_id: "snap-2" }),
       json({ error: "server error" }, 500),
     ]);
     await expect(provider.replacePlaylist(playlist, [entry("spotify:track:new", "new")]))
