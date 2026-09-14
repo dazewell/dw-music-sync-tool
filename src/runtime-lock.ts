@@ -115,7 +115,8 @@ export async function acquireRuntimeLock(directory: string): Promise<() => Promi
       if (hasCode(error, "ENOENT")) return;
       if (hasCode(error, "ENOTEMPTY") || hasCode(error, "EEXIST")) {
         const current = await lstat(filename, { bigint: true });
-        if (current.dev !== identity.dev || current.ino !== identity.ino) return;
+        // Inode numbers are reused, so creation time also distinguishes a successor directory.
+        if (current.dev !== identity.dev || current.ino !== identity.ino || current.birthtimeNs !== identity.birthtimeNs) return;
         throw new AppError("LOCK_CHANGED", "Unexpected files remain in the runtime lock directory; they were preserved.");
       }
       throw error;

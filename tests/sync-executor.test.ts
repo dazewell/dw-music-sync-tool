@@ -139,6 +139,35 @@ describe("executeSyncRun", () => {
     expect(run.removals).toEqual([expect.objectContaining({ itemIdentity: "media:b", outcome: "success", direction: "left-to-right" })]);
   });
 
+  it("stores a left/right oriented baseline after a right-to-left run so the next run is unchanged", async () => {
+    const store = await makeStore();
+    await store.pair({
+      id: "pair-1",
+      left: { provider: "youtube", accountId: "acct", playlistId: "yt-1" },
+      right: { provider: "spotify", accountId: "acct", playlistId: "sp-1" },
+      enabled: true, createdAt: now, updatedAt: now,
+    });
+    const left = [entry("l-a", "a"), entry("l-b", "b")];
+    const oldRight = [entry("r-a", "a"), entry("r-b", "b")];
+    const newRight = [entry("r-a", "a")];
+    await store.update((state) => {
+      state.baselines["pair-1"] = {
+        sourceFingerprint: fingerprintPlaylist("youtube", left),
+        targetFingerprint: fingerprintPlaylist("spotify", oldRight),
+      };
+    });
+    const youtube = new FakeProvider("youtube", [playlist("yt-1", "youtube")], new Map([["yt-1", left]]));
+    const spotify = new FakeProvider("spotify", [playlist("sp-1", "spotify")], new Map([["sp-1", newRight]]));
+    const first = await executeSyncRun(store, { youtube, spotify }, "pair-1");
+    expect(first.status).toBe("complete");
+    expect(youtube.replaceCalls).toHaveLength(1);
+    expect(spotify.replaceCalls).toHaveLength(0);
+    const second = await executeSyncRun(store, { youtube, spotify }, "pair-1");
+    expect(second.status).toBe("complete");
+    expect(second.message).toMatch(/no changes were needed/);
+    expect(youtube.replaceCalls).toHaveLength(1);
+  });
+
   it("records a failed run and a failed removal audit when the destination mutation is rejected", async () => {
     const store = await makeStore();
     await store.pair({

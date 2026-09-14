@@ -33,6 +33,21 @@ const playlistPageSchema = z.object({
   })),
   next: z.string().url().nullable().optional(),
 });
+const snapshotSchema = z.object({ snapshot_id: z.string().min(1).optional() });
+
+/** Continuation URLs come from responses; they must never send the token elsewhere. */
+function requireApiUrl(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new AppError("SPOTIFY_RESPONSE_INVALID", "Spotify returned an unusable continuation URL.", 502);
+  }
+  if (!parsed.href.startsWith(API_ROOT)) {
+    throw new AppError("SPOTIFY_RESPONSE_INVALID", "Spotify returned a continuation URL outside the Spotify Web API.", 502);
+  }
+  return parsed.href;
+}
 
 export interface SpotifyProviderOptions {
   fetch?: typeof fetch;
@@ -68,13 +83,22 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
           visibility: raw.collaborative ? "unknown" : raw.public ? "public" : "private",
         });
       }
-      next = page.data.next ?? null;
+      next = page.data.next ? requireApiUrl(page.data.next) : null;
     }
     return result;
   }
 
+  /** Reads the playlist snapshot first, so a later write can fail closed on concurrent changes. */
+  private async readSnapshotId(playlistId: string): Promise<string | undefined> {
+    const parsed = snapshotSchema.safeParse(await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlistId)}?fields=snapshot_id`));
+    if (!parsed.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", "Spotify returned an invalid playlist snapshot.", 502);
+    return parsed.data.snapshot_id;
+  }
+
   async getPlaylist(playlist: Playlist): Promise<PlaylistContents> {
     if (playlist.provider !== this.id || !playlist.id) throw new AppError("SPOTIFY_PLAYLIST_INVALID", "A Spotify playlist is required.", 400);
+    const snapshotId = await this.readSnapshotId(playlist.id);
+    const observed: Playlist = snapshotId === undefined ? playlist : { ...playlist, snapshotId };
     const entries: PlaylistEntry[] = [];
     let next: string | null = `${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items?limit=50&fields=items(added_at,track(id,uri,name,artists,album,external_urls,duration_ms,external_ids)),next,total`;
     const seen = new Set<string>();
@@ -95,19 +119,20 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
           providerData: track ? { uri: track.uri, isrc: track.external_ids?.isrc, durationMs: track.duration_ms } : {},
         });
       }
-      next = page.data.next ?? null;
+      next = page.data.next ? requireApiUrl(page.data.next) : null;
     }
-    return { playlist, entries, warnings: entries.some(entry => entry.availability === "unavailable") ? ["Unavailable Spotify items were preserved."] : [] };
+    return { playlist: observed, entries, warnings: entries.some(entry => entry.availability === "unavailable") ? ["Unavailable Spotify items were preserved."] : [] };
   }
 
   async replacePlaylist(playlist: Playlist, entries: readonly PlaylistEntry[], expectedSnapshotId?: string): Promise<void> {
     if (playlist.provider !== this.id) throw new AppError("SPOTIFY_PLAYLIST_INVALID", "A Spotify playlist is required.", 400);
     const current = await this.getPlaylist(playlist);
-    if (expectedSnapshotId !== undefined && playlist.snapshotId !== expectedSnapshotId) {
+    const currentSnapshotId = current.playlist.snapshotId;
+    if (expectedSnapshotId !== undefined && currentSnapshotId !== expectedSnapshotId) {
       throw new AppError("SPOTIFY_STALE_PLAYLIST", "The Spotify playlist changed before the sync could be applied.", 409);
     }
     const tracks = current.entries.map((entry, position) => ({ uri: typeof entry.providerData.uri === "string" ? entry.providerData.uri : null, positions: [position] })).filter(track => track.uri);
-    if (tracks.length) await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items`, { method: "DELETE", body: JSON.stringify({ tracks, snapshot_id: expectedSnapshotId ?? playlist.snapshotId }) });
+    if (tracks.length) await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items`, { method: "DELETE", body: JSON.stringify({ tracks, snapshot_id: currentSnapshotId }) });
     const uris = entries.map(entry => entry.providerData.uri).filter((uri): uri is string => typeof uri === "string" && uri.startsWith("spotify:track:"));
     if (uris.length !== entries.length) throw new AppError("SPOTIFY_ENTRY_UNSUPPORTED", "Every synchronized entry needs an explicit Spotify track URI.", 409);
     for (let index = 0; index < uris.length; index += 100) {

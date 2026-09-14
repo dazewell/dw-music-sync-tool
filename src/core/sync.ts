@@ -73,7 +73,9 @@ export function fingerprintPlaylist(provider: ProviderId, entries: readonly Play
 export type SyncComparison = "unchanged" | "source-changed" | "target-changed" | "conflict" | "uninitialized";
 
 export interface SyncBaseline {
+  /** Fingerprint of the pair's left side at the last verified sync. */
   sourceFingerprint: string;
+  /** Fingerprint of the pair's right side at the last verified sync. */
   targetFingerprint: string;
 }
 
@@ -241,10 +243,13 @@ export async function applySyncPlan(
       throw new AppError("SYNC_VERIFY_FAILED", "The destination did not match the planned ordered result; no new baseline was recorded.", 502);
     }
     await recordAudits("success", null);
-    return {
-      sourceFingerprint: fingerprintPlaylist(plan.source.playlist.provider, plan.source.entries),
-      targetFingerprint: fingerprintPlaylist(verified.playlist.provider, verified.entries),
-    };
+    const sourceFingerprint = fingerprintPlaylist(plan.source.playlist.provider, plan.source.entries);
+    const targetFingerprint = fingerprintPlaylist(verified.playlist.provider, verified.entries);
+    // A baseline is always stored in left/right pair order, so a right-to-left
+    // run is not later mistaken for a change on both sides.
+    return direction === "left-to-right"
+      ? { sourceFingerprint, targetFingerprint }
+      : { sourceFingerprint: targetFingerprint, targetFingerprint: sourceFingerprint };
   } catch (error) {
     const message = error instanceof AppError ? error.message : "The destination mutation failed.";
     await recordAudits("failed", message);
