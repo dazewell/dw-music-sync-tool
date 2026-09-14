@@ -66,6 +66,65 @@ invalid Desktop client JSON, replace the file at its configured path and use
 the configured path still requires a server restart. Other status failures remain
 explicit and can be retried after the reported local problem is resolved.
 
+## Connect Spotify
+
+Spotify sync is optional and only needed if you want an explicitly paired
+playlist mirrored to or from Spotify (see [The path to Spotify / YouTube
+sync](#the-path-to-spotify--youtube-sync)). **There is no in-app Spotify
+connect flow.** You register your own Spotify app and generate a refresh
+token out-of-band, once, before starting this tool.
+
+1. Create an app in the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard).
+   Note its **Client ID** and **Client Secret**.
+2. In the app's settings, add a **Redirect URI** you control, for example
+   `http://127.0.0.1:8888/callback`. This URI is only used by the one-time
+   authorization script in step 3 below (an Authorization Code flow) to
+   receive Spotify's redirect after you approve access; this application has
+   no callback endpoint of its own and never receives this redirect.
+3. Run a one-time Authorization Code flow (any script or tool you trust, not
+   provided by this project) that:
+   - Sends you to Spotify's `/authorize` endpoint with your Client ID, the
+     redirect URI from step 2, and exactly the scopes this tool's Spotify
+     provider needs to read and modify your playlists:
+     `playlist-read-private playlist-read-collaborative
+     playlist-modify-public playlist-modify-private`.
+   - Captures the `code` Spotify sends to your redirect URI after you approve.
+   - Exchanges that code at Spotify's `/api/token` endpoint (using your
+     Client ID and Client Secret) for an access token and, importantly, a
+     **refresh token**.
+   - Discard the authorization code and short-lived access token once this
+     exchange succeeds; only the refresh token needs to be kept.
+4. Copy `.env.example` to `.env` if you have not already, then set all three
+   variables together:
+
+   ```
+   SPOTIFY_CLIENT_ID=your-client-id
+   SPOTIFY_CLIENT_SECRET=your-client-secret
+   SPOTIFY_REFRESH_TOKEN=the-refresh-token-from-step-3
+   ```
+
+5. Restart the app (`npm start`) so it picks up the new environment. There is
+   no live reload for `.env` changes.
+
+**Never commit, log, paste into an issue/PR, or otherwise expose your Client
+Secret or refresh token.** `.env` is Git-ignored, but that only protects you if
+you never copy the values elsewhere. Treat a refresh token like a password:
+anyone holding it can read and modify your Spotify playlists until it is
+revoked (from your [Spotify account apps](https://www.spotify.com/account/apps/)
+page) or Spotify rotates/expires it. The three `SPOTIFY_*` variables are
+**all-or-nothing**: set every one of them, or leave every one of them unset; a
+partial set fails startup with an explicit configuration error instead of
+running with reduced access.
+
+Configuring these variables does more than enable read access: once a pair is
+run, this tool can **mirror deletions bidirectionally** between YouTube and
+Spotify for that pair, including removing tracks from your real Spotify
+playlist. Every mirrored deletion is written to a durable, per-removal audit
+log (readable with `sync --removals` or `GET /api/sync/removals`) so removed
+items are never silently lost, but the removal itself still happens against
+the live Spotify API. Only pair and run playlists you intend to keep in sync,
+and review the audit log if a mirrored removal looks unexpected.
+
 ## Local files and commands
 
 ```powershell
