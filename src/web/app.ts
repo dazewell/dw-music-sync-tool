@@ -87,6 +87,7 @@ const ui = {
   historyFeedback: element("history-feedback"),
   historyList: element("history-list"),
   syncNow: element<HTMLButtonElement>("sync-now"),
+  syncAllPairs: element<HTMLButtonElement>("sync-all-pairs"),
   autoPairByName: element<HTMLButtonElement>("auto-pair-by-name"),
   syncFeedback: element("sync-feedback"),
   syncPairs: element("sync-pairs"),
@@ -767,6 +768,7 @@ function renderSync(): void {
   if (pairs.some((pair) => pair.id === selected)) ui.syncPairSelect.value = selected;
   ui.syncPairSelect.disabled = syncBusy || syncLoading || !available || pairs.length === 0;
   ui.syncNow.disabled = ui.syncPairSelect.disabled;
+  ui.syncAllPairs.disabled = syncBusy || syncLoading || !available || pairs.filter((pair) => pair.enabled).length === 0;
   ui.autoPairByName.disabled = syncBusy || syncLoading || !available;
   if (available) {
     void ensureDiscovered(ui.pairLeftProvider.value as Platform);
@@ -875,6 +877,42 @@ async function syncNow(): Promise<void> {
     notify(runDidNotStart(error)
       ? `Synchronization did not start. ${message(error)}`
       : `Synchronization failed. ${message(error)} The outcome was recorded; check Recent sync runs.`, "error");
+    await loadSync();
+  } finally {
+    syncBusy = false;
+    if (!disposed) renderSync();
+  }
+}
+
+/**
+ * Runs every enabled pair one at a time (never in parallel, to stay gentle on both providers'
+ * rate limits) and reports a single aggregate summary. Each pair's outcome is independent: one
+ * pair failing never stops or skips the rest.
+ */
+async function syncAllPairs(): Promise<void> {
+  if (ui.syncAllPairs.disabled || !sync) return;
+  const pairs = sync.pairs.filter((pair) => pair.enabled);
+  if (pairs.length === 0) return;
+  syncBusy = true;
+  renderSync();
+  let completed = 0;
+  const failures: string[] = [];
+  try {
+    for (const pair of pairs) {
+      try {
+        const response = await request<{ run: SyncRun }>("/api/sync/run", "POST", { pairId: pair.id });
+        if (response.run.status === "complete") completed += 1;
+        else failures.push(`${pairLabel(pair)}: ${response.run.status}`);
+      } catch (error) {
+        failures.push(`${pairLabel(pair)}: ${message(error)}`);
+      }
+    }
+    notify(
+      failures.length === 0
+        ? `Synchronized all ${completed} pair${completed === 1 ? "" : "s"}.`
+        : `Synchronized ${completed} of ${pairs.length} pairs. ${failures.length} failed: ${failures.join("; ")}`,
+      failures.length === 0 ? "success" : "error",
+    );
     await loadSync();
   } finally {
     syncBusy = false;
@@ -1361,6 +1399,7 @@ ui.recheckRetention.addEventListener("click", () => { void recheckRetention(); }
 ui.search.addEventListener("input", renderInventory);
 ui.retryJob.addEventListener("click", () => { void loadCurrentJob(); });
 ui.syncNow.addEventListener("click", () => { void syncNow(); });
+ui.syncAllPairs.addEventListener("click", () => { void syncAllPairs(); });
 ui.autoPairByName.addEventListener("click", () => { void autoPairByName(); });
 ui.pairForm.addEventListener("submit", (event) => { void savePair(event); });
 ui.ignoreForm.addEventListener("submit", (event) => { void saveIgnore(event); });

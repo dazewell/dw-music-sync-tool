@@ -344,6 +344,49 @@ test("explicit pairs stay selectable and drive the manual mirror trigger", async
   await expect(page.locator("#notice")).toContainText("Synchronization completed.");
   expect(triggered).toEqual([{ pairId: "pair-1" }]);
 });
+test("Sync all pairs runs every enabled pair sequentially and reports partial failures without stopping", async ({ page, serverUrl }) => {
+  const pairA = {
+    id: "pair-1",
+    left: { provider: "youtube", accountId: "account-1", playlistId: "yt-1" },
+    right: { provider: "spotify", accountId: "account-1", playlistId: "sp-1" },
+    enabled: true, createdAt: "2026-09-12T17:00:00.000Z", updatedAt: "2026-09-12T17:00:00.000Z",
+  };
+  const pairB = {
+    id: "pair-2",
+    left: { provider: "youtube", accountId: "account-1", playlistId: "yt-2" },
+    right: { provider: "spotify", accountId: "account-1", playlistId: "sp-2" },
+    enabled: true, createdAt: "2026-09-12T17:00:00.000Z", updatedAt: "2026-09-12T17:00:00.000Z",
+  };
+  const state = { pairs: [pairA, pairB], ignores: [], runs: [], removals: [] };
+  await page.route("**/api/sync", async (route) => { await route.fulfill({ json: state }); });
+  await page.route("**/api/sync/discover/youtube", async (route) => {
+    await route.fulfill({ json: { playlists: [
+      { provider: "youtube", id: "yt-1", title: "Road Trip", description: "", url: "https://example.test/yt-1", owner: "My Channel", itemCount: 5, visibility: "private" },
+      { provider: "youtube", id: "yt-2", title: "Gym", description: "", url: "https://example.test/yt-2", owner: "My Channel", itemCount: 3, visibility: "private" },
+    ] } });
+  });
+  await page.route("**/api/sync/discover/spotify", async (route) => {
+    await route.fulfill({ json: { playlists: [
+      { provider: "spotify", id: "sp-1", title: "Road Trip", description: "", url: "https://example.test/sp-1", owner: "Me", itemCount: 5, visibility: "private" },
+      { provider: "spotify", id: "sp-2", title: "Gym", description: "", url: "https://example.test/sp-2", owner: "Me", itemCount: 3, visibility: "private" },
+    ] } });
+  });
+  const triggered: unknown[] = [];
+  await page.route("**/api/sync/run", async (route) => {
+    const body = route.request().postDataJSON() as { pairId: string };
+    triggered.push(body);
+    if (body.pairId === "pair-1") {
+      await route.fulfill({ json: { run: { id: "run-1", pairId: "pair-1", status: "complete", startedAt: "2026-09-14T00:00:00.000Z", completedAt: "2026-09-14T00:01:00.000Z", message: null } } });
+    } else {
+      await route.fulfill({ status: 404, json: { error: { code: "SYNC_PLAYLIST_NOT_FOUND", message: "The paired youtube playlist was not found in a fresh discovery." } } });
+    }
+  });
+  await page.goto(serverUrl);
+  await expect(page.getByRole("button", { name: "Sync all pairs", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "Sync all pairs", exact: true }).click();
+  await expect(page.locator("#notice")).toContainText("Synchronized 1 of 2 pairs. 1 failed");
+  expect(triggered).toEqual([{ pairId: "pair-1" }, { pairId: "pair-2" }]);
+});
 test("the playlist pickers offer real titles to choose, and auto-pair by name creates exact matches while skipping ambiguous titles", async ({ page, serverUrl }) => {
   const state = { pairs: [], ignores: [], runs: [], removals: [] };
   const youtubePlaylists = [

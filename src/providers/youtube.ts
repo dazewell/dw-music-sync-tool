@@ -62,6 +62,12 @@ function pageSchema<T extends z.ZodType>(item: T) {
   });
 }
 
+/** Summarizes the first few schema validation issues so a shape mismatch is diagnosable
+ * from the error message alone, instead of a bare "invalid response" with no detail. */
+function describeIssues(result: z.ZodSafeParseError<unknown>): string {
+  return result.error.issues.slice(0, 3).map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`).join("; ");
+}
+
 type YouTubeItem = z.infer<typeof itemSchema>;
 
 export interface YouTubeProviderOptions {
@@ -247,7 +253,7 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
       if (pageToken !== undefined) url.searchParams.set("pageToken", pageToken);
       const parsed = pageSchema(schema).safeParse(await this.request(url));
       if (!parsed.success) {
-        throw new AppError("YOUTUBE_RESPONSE_INVALID", "YouTube returned an invalid playlist response. No complete backup can be assumed.", 502);
+        throw new AppError("YOUTUBE_RESPONSE_INVALID", `YouTube returned an invalid playlist response (${describeIssues(parsed)}). No complete backup can be assumed.`, 502);
       }
       items.push(...parsed.data.items);
       if (parsed.data.pageInfo !== undefined) totals.push(parsed.data.pageInfo.totalResults);

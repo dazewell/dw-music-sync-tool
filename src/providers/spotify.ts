@@ -39,6 +39,12 @@ const playlistPageSchema = z.object({
 });
 const snapshotSchema = z.object({ snapshot_id: z.string().min(1) });
 
+/** Summarizes the first few schema validation issues so a shape mismatch is diagnosable
+ * from the error message alone, instead of a bare "invalid response" with no detail. */
+function describeIssues(result: z.ZodSafeParseError<unknown>): string {
+  return result.error.issues.slice(0, 3).map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`).join("; ");
+}
+
 /** Continuation URLs come from responses; they must never send the token elsewhere. */
 function requireApiUrl(url: string): string {
   let parsed: URL;
@@ -77,7 +83,7 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
       if (seen.has(next)) throw new AppError("SPOTIFY_PAGINATION_LOOP", "Spotify repeated a continuation URL.", 502);
       seen.add(next);
       const page = playlistPageSchema.safeParse(await this.request(next));
-      if (!page.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", "Spotify returned an invalid playlist page.", 502);
+      if (!page.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", `Spotify returned an invalid playlist page (${describeIssues(page)}).`, 502);
       for (const item of page.data.items) {
         const raw = item;
         result.push({
@@ -97,7 +103,7 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
     const parsed = snapshotSchema.safeParse(
       await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlistId)}?fields=snapshot_id`),
     );
-    if (!parsed.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", "Spotify did not return a playlist snapshot id.", 502);
+    if (!parsed.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", `Spotify did not return a playlist snapshot id (${describeIssues(parsed)}).`, 502);
     return parsed.data.snapshot_id;
   }
 
@@ -111,7 +117,7 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
       if (seen.has(next)) throw new AppError("SPOTIFY_PAGINATION_LOOP", "Spotify repeated a continuation URL.", 502);
       seen.add(next);
       const page = pageSchema.safeParse(await this.request(next));
-      if (!page.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", "Spotify returned an invalid playlist item page.", 502);
+      if (!page.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", `Spotify returned an invalid playlist item page (${describeIssues(page)}).`, 502);
       for (const item of page.data.items) {
         const track = item.track;
         const position = entries.length;
