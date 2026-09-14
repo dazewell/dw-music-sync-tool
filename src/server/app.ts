@@ -199,6 +199,14 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     if (!status.connected) throw new AppError("CONNECT_REQUIRED", "Connect your Google account before reading playlists.", 401);
   }
 
+  async function beginGoogleAuthorization(req: Request, res: Response, kind: NonNullable<BrowserSession["oauth"]>["kind"]): Promise<void> {
+    if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
+    const current = session(req, res);
+    const pending = kind === "write" ? await auth.beginWrite() : await auth.begin();
+    current.oauth = { kind, state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
+    res.json({ url: pending.url });
+  }
+
   app.disable("x-powered-by");
   app.use((req, res, next) => {
     res.set({
@@ -264,11 +272,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
   app.post("/api/auth/connect", async (req, res) => {
     const release = reserve("auth");
     try {
-      if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
-      const current = session(req, res);
-      const pending = await auth.begin();
-      current.oauth = { kind: "read", state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
-      res.json({ url: pending.url });
+      await beginGoogleAuthorization(req, res, "read");
     } finally {
       release();
     }
@@ -277,11 +281,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
   app.post("/api/auth/connect-write", async (req, res) => {
     const release = reserve("auth");
     try {
-      if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
-      const current = session(req, res);
-      const pending = await auth.beginWrite();
-      current.oauth = { kind: "write", state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
-      res.json({ url: pending.url });
+      await beginGoogleAuthorization(req, res, "write");
     } finally {
       release();
     }
