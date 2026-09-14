@@ -375,8 +375,12 @@ mirroring, the durable per-removal audit trail (filterable by pair, platform,
 playlist, track identity, direction and outcome; readable with
 `sync --removals` or `GET /api/sync/removals`) and destination verification
 are implemented and unit-tested against `applySyncPlan` directly, and will
-take effect once cross-platform matching lands. There is also no name-based
-auto-matching or scheduling yet.
+take effect once cross-platform matching lands. The web dashboard's
+"Auto-pair by name" button discovers playlists on both providers and
+immediately creates a pair for every exact (normalized) title match found on
+both sides; titles with more than one candidate on either side are skipped
+and reported rather than guessed at. There is still no scheduling yet — every
+run (single pair or "Sync all pairs") is triggered manually.
 
 Direct Spotify execution additionally needs `SPOTIFY_CLIENT_ID`,
 `SPOTIFY_CLIENT_SECRET` and `SPOTIFY_REFRESH_TOKEN` (see Configuration above).

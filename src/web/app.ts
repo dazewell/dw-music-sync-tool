@@ -1,5 +1,6 @@
 import type { ApiError, BackupJob, StatusResponse } from "../shared/api.js";
 import type { BackupManifest, BackupPlaylistResult, Playlist } from "../core/models.js";
+import { normalizePlaylistName } from "./text-normalize.js";
 
 type Platform = "youtube" | "spotify";
 interface SyncRef { provider: Platform; accountId: string; playlistId: string; }
@@ -998,11 +999,12 @@ async function savePair(event: SubmitEvent): Promise<void> {
 }
 
 /** Groups playlists by a normalized title, so a title with more than one candidate is
- * treated as ambiguous rather than guessed at. */
+ * treated as ambiguous rather than guessed at. Uses the same normalizer as the core
+ * pairing/matching logic so auto-pair recognizes the same titles as equal. */
 function groupByTitle(list: readonly Playlist[]): Map<string, Playlist[]> {
   const groups = new Map<string, Playlist[]>();
   for (const item of list) {
-    const key = item.title.trim().toLowerCase();
+    const key = normalizePlaylistName(item.title);
     if (!key) continue;
     const bucket = groups.get(key);
     if (bucket) bucket.push(item); else groups.set(key, [item]);

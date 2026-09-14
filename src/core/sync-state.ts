@@ -171,13 +171,18 @@ export class SyncStateStore implements SyncRemovalAuditSink {
   }
 
   async finishRun(runId: string, status: SyncRun["status"], message: string | null): Promise<SyncState> {
-    const result = await this.update(state => {
-      const run = state.runs.find(item => item.id === runId);
-      if (!run) throw new AppError("SYNC_RUN_NOT_FOUND", "The sync run does not exist.", 404);
-      run.status = status; run.message = message; run.completedAt = new Date().toISOString();
-    });
-    this.activeRuns.delete(runId);
-    return result;
+    try {
+      return await this.update(state => {
+        const run = state.runs.find(item => item.id === runId);
+        if (!run) throw new AppError("SYNC_RUN_NOT_FOUND", "The sync run does not exist.", 404);
+        run.status = status; run.message = message; run.completedAt = new Date().toISOString();
+      });
+    } finally {
+      // Clear the in-process claim even if persistence failed, so a run that could not be
+      // durably finished is not permanently stuck as "active": read() can still recover it
+      // as review-required, and startRun() will not refuse to start a new run for this pair.
+      this.activeRuns.delete(runId);
+    }
   }
 
   private async write(state: SyncState): Promise<void> {

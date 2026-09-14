@@ -210,10 +210,13 @@ than silently extending the lifetime of API-derived data.
    records. Request only needed read scopes. Surface unreadable or incomplete
    playlists; never represent them as empty.
 2. **Pair and ignore.** Suggest names normalized with Unicode normalization,
-   whitespace collapsing and case folding. A unique name match is a suggestion,
-   not authorization. Show duplicate-name candidates for user choice. Persist
-   stable provider/account/playlist IDs and independent ignore records; names
-   can change without breaking a confirmed pair.
+   whitespace collapsing and case folding (`src/web/text-normalize.ts`). This
+   is implemented: the dashboard's "Auto-pair by name" immediately creates a
+   pair for every unique normalized-name match across both providers — no
+   confirmation step — while a name with more than one candidate on either
+   side is skipped and reported rather than guessed at. Persist stable
+   provider/account/playlist IDs and independent ignore records; names can
+   change without breaking a confirmed pair.
 3. **Choose direction and operation.** Require a source, destination and a
    deliberate add-only versus replace policy. Bidirectional sync is not two
    blind replacement jobs. Confirm deletions, reorder and duplicate semantics.

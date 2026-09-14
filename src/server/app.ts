@@ -438,7 +438,12 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     if (provider !== "youtube" && provider !== "spotify") {
       throw new AppError("INVALID_SYNC_QUERY", "The provider must be youtube or spotify.", 400);
     }
-    res.json({ playlists: await syncService().discover(provider) });
+    const release = reserve("inventory");
+    try {
+      res.json({ playlists: await syncService().discover(provider) });
+    } finally {
+      release();
+    }
   });
 
   app.get("/api/sync/removals", async (req, res) => {

@@ -1,10 +1,9 @@
 import { createHash } from "node:crypto";
 import { AppError } from "./errors.js";
 import type { Playlist, PlaylistContents, PlaylistEntry, PlaylistProvider, ProviderId, PlaylistMutation } from "./models.js";
+import { normalizePlaylistName } from "../web/text-normalize.js";
 
-export function normalizePlaylistName(name: string): string {
-  return name.normalize("NFKC").trim().replace(/\s+/gu, " ").toLowerCase();
-}
+export { normalizePlaylistName };
 
 export interface PlaylistPairCandidate {
   normalizedName: string;
