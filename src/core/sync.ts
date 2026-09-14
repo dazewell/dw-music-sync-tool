@@ -113,7 +113,7 @@ export interface SyncPlan {
   reason: string | null;
 }
 
-export type SyncRemovalOutcome = "success" | "failed";
+export type SyncRemovalOutcome = "success" | "failed" | "unknown";
 
 export interface SyncRemovalAudit {
   pairId: string;
@@ -174,6 +174,14 @@ export function planBidirectionalSync(
     };
   }
 
+  if (left.playlist.provider !== right.playlist.provider) {
+    return {
+      status: "review-required", direction: "none", source: null, target: null, entries: [],
+      additions: 0, removals: 0,
+      reason: "Cross-provider item mapping and target-native translation have not been verified; review the match before making changes.",
+    };
+  }
+
   const source = comparison === "source-changed" ? left : right;
   const target = comparison === "source-changed" ? right : left;
   const sourceMap = mapUnambiguous(source.entries);
@@ -229,27 +237,32 @@ export async function applySyncPlan(
       error,
     })));
   };
+  let verified: PlaylistContents;
   try {
     if (plan.target.playlist.snapshotId === undefined) {
       await targetProvider.replacePlaylist(plan.target.playlist, plan.entries);
     } else {
       await targetProvider.replacePlaylist(plan.target.playlist, plan.entries, plan.target.playlist.snapshotId);
     }
-    const verified = await targetProvider.getPlaylist(plan.target.playlist);
+    verified = await targetProvider.getPlaylist(plan.target.playlist);
     if (verified.entries.length !== plan.entries.length
       || verified.entries.some((entry, index) => playlistEntryIdentity(entry) !== playlistEntryIdentity(plan.entries[index]!))) {
       throw new AppError("SYNC_VERIFY_FAILED", "The destination did not match the planned ordered result; no new baseline was recorded.", 502);
     }
     await recordAudits("success", null);
-    return {
-      sourceFingerprint: fingerprintPlaylist(plan.source.playlist.provider, plan.source.entries),
-      targetFingerprint: fingerprintPlaylist(verified.playlist.provider, verified.entries),
-    };
   } catch (error) {
     const message = error instanceof AppError ? error.message : "The destination mutation failed.";
-    await recordAudits("failed", message);
+    await recordAudits("unknown", message);
     throw error;
   }
+
+  const leftFingerprint = direction === "left-to-right"
+    ? fingerprintPlaylist(plan.source.playlist.provider, plan.source.entries)
+    : fingerprintPlaylist(verified.playlist.provider, verified.entries);
+  const rightFingerprint = direction === "left-to-right"
+    ? fingerprintPlaylist(verified.playlist.provider, verified.entries)
+    : fingerprintPlaylist(plan.source.playlist.provider, plan.source.entries);
+  return { sourceFingerprint: leftFingerprint, targetFingerprint: rightFingerprint };
 }
 
 /** A common baseline stores both platform hashes from the same acknowledged sync. */

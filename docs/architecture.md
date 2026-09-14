@@ -196,10 +196,15 @@ Spotify access is requested for YouTube backup.
 
 ## Planned manual same-name sync
 
-The pure name-pairing and baseline helpers in `src/core/sync.ts` are implemented
-now. Persistent pairing workflows and all remote writes are **future work**.
-Future observation, match and baseline storage must also respect provider
-retention rules rather than silently extending the lifetime of API-derived data.
+The name-pairing and baseline helpers in `src/core/sync.ts` were the design
+starting point. Persistent pairing/ignoring, planning, direct YouTube/Spotify
+provider execution, destination verification and baseline/removal-audit
+persistence are now implemented (`src/core/sync.ts`, `src/core/sync-state.ts`,
+`src/services/sync-executor.ts`). Still-open follow-on work is itemized below
+and in the README: richer preview/review UI before applying, scheduling, and
+cross-platform recording-identity resolution (step 4). Future observation,
+match and baseline storage must also respect provider retention rules rather
+than silently extending the lifetime of API-derived data.
 
 1. **Read-only discovery.** Add Spotify reader and account identity/capability
    records. Request only needed read scopes. Surface unreadable or incomplete
@@ -244,8 +249,16 @@ connects step 6 (approve and execute) to the composition root: an explicit
 fresh discovery (never the just-listed summary), plans against the stored
 baseline with `planBidirectionalSync`, and, when ready, applies and verifies
 through whichever real authenticated `PlaylistProvider & PlaylistMutation` is
-actually wired for the changed side. Triggering a run is the user's approval;
-there is no separate preview/confirm step yet. Every outcome - complete,
+actually wired for the changed side, when the plan reaches `ready`. Triggering
+a run is the user's approval; there is no separate preview/confirm step yet.
+Because every pair is cross-provider and recording-identity resolution (below)
+is not implemented, `planBidirectionalSync` currently returns
+`review-required` for every real pair instead of `ready`, so a run today never
+reaches a destructive `replacePlaylist` call; this is intentional (a
+destination cannot yet be told which native identifier to write) and is
+covered by `tests/sync-executor.test.ts`. The `ready`/`complete` path is
+exercised directly against `applySyncPlan` in `tests/sync.test.ts` and takes
+effect for real pairs once matching lands. Every outcome - complete,
 review-required or failed - is persisted as a `SyncRun`, and every mirrored
 removal is recorded as a durable, per-item audit entry through
 `SyncStateStore`, whether the mutation succeeds or fails. `src/cli.ts` supplies

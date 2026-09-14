@@ -189,9 +189,24 @@ describe("loopback server", () => {
     const limited = await browser.get("/api/sync/removals?limit=1").set("Host", host).expect(200);
     expect(limited.body.removals).toHaveLength(1);
     expect(limited.body.removals[0].pairId).toBe("pair-2");
+    const byPlatform = await browser.get("/api/sync/removals?platform=youtube").set("Host", host).expect(200);
+    expect(byPlatform.body.removals.map((record: SyncRemovalRecord) => record.pairId)).toEqual(["pair-2"]);
+    const byPlaylist = await browser.get("/api/sync/removals?playlistId=sp-1").set("Host", host).expect(200);
+    expect(byPlaylist.body.removals.map((record: SyncRemovalRecord) => record.pairId)).toEqual(["pair-1"]);
+    const byIdentity = await browser.get("/api/sync/removals?itemIdentity=ISRC%3AUSTEST").set("Host", host).expect(200);
+    expect(byIdentity.body.removals.map((record: SyncRemovalRecord) => record.pairId)).toEqual(["pair-2"]);
+    const byDirection = await browser.get("/api/sync/removals?direction=left-to-right").set("Host", host).expect(200);
+    expect(byDirection.body.removals.map((record: SyncRemovalRecord) => record.pairId)).toEqual(["pair-1"]);
+    const byOutcome = await browser.get("/api/sync/removals?outcome=failed").set("Host", host).expect(200);
+    expect(byOutcome.body.removals.map((record: SyncRemovalRecord) => record.pairId)).toEqual(["pair-2"]);
+    const combined = await browser.get("/api/sync/removals?platform=spotify&outcome=success").set("Host", host).expect(200);
+    expect(combined.body.removals).toHaveLength(1);
+    const none = await browser.get("/api/sync/removals?platform=spotify&outcome=failed").set("Host", host).expect(200);
+    expect(none.body.removals).toHaveLength(0);
   });
 
-  it.each(["limit=0", "limit=-1", "limit=abc", "limit=1001", "pairId=", "pairId=a&pairId=b"])(
+  it.each(["limit=0", "limit=-1", "limit=abc", "limit=1001", "pairId=", "pairId=a&pairId=b",
+    "platform=bogus", "playlistId=", "itemIdentity=", "itemIdentity=%20", "direction=bogus", "outcome=bogus"])(
     "rejects the malformed removal audit query %s without reading records",
     async (query) => {
       const fixture = await syncFixture();
@@ -202,6 +217,21 @@ describe("loopback server", () => {
       expect(read).not.toHaveBeenCalled();
     },
   );
+
+  it("normalizes whitespace-padded pair references before persisting them", async () => {
+    const fixture = await syncFixture();
+    const { browser, host, csrf } = await setup(true, undefined, fixture.integration);
+    const created = await browser.post("/api/sync/pairs").set("Host", host).set("X-CSRF-Token", csrf).send({
+      left: { provider: "youtube", accountId: "  account-1  ", playlistId: "  yt-9  " },
+      right: { provider: "spotify", accountId: "account-1", playlistId: "sp-9" },
+    }).expect(201);
+    const stored = created.body.pairs[1];
+    expect(stored.left.accountId).toBe("account-1");
+    expect(stored.left.playlistId).toBe("yt-9");
+    const persisted = (await fixture.store.read()).pairs[1];
+    expect(persisted.left.accountId).toBe("account-1");
+    expect(persisted.left.playlistId).toBe("yt-9");
+  });
 
   it.each([
     ["GOOGLE_TOKEN_INVALID", true, 401, "The local Google token file is malformed. Reconnect Google."],

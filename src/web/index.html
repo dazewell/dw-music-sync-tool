@@ -215,6 +215,37 @@ Direction: seed895a4aee / candidate4, mixing-desk studio console.
           <summary>Removal audit records</summary>
           <div class="details-body">
             <p>Removals are mirrored in both directions. Each attempt is kept as a durable record of the platform changed, the playlist, the provider-native track identity, the direction, the time and the outcome.</p>
+            <form id="removal-filters" class="removal-filters">
+              <label for="removal-filter-platform">Platform
+                <select id="removal-filter-platform" name="removal-filter-platform" disabled>
+                  <option value="">Any platform</option>
+                  <option value="youtube">YouTube Music</option>
+                  <option value="spotify">Spotify</option>
+                </select>
+              </label>
+              <label for="removal-filter-playlist">Playlist ID
+                <input id="removal-filter-playlist" name="removal-filter-playlist" autocomplete="off" disabled>
+              </label>
+              <label for="removal-filter-identity">Track identity
+                <input id="removal-filter-identity" name="removal-filter-identity" autocomplete="off" placeholder="Search track identity" disabled>
+              </label>
+              <label for="removal-filter-direction">Direction
+                <select id="removal-filter-direction" name="removal-filter-direction" disabled>
+                  <option value="">Any direction</option>
+                  <option value="left-to-right">Left to right</option>
+                  <option value="right-to-left">Right to left</option>
+                </select>
+              </label>
+              <label for="removal-filter-outcome">Outcome
+                <select id="removal-filter-outcome" name="removal-filter-outcome" disabled>
+                  <option value="">Any outcome</option>
+                  <option value="success">Removed</option>
+                  <option value="failed">Failed</option>
+                </select>
+              </label>
+              <button class="secondary-button" type="submit">Search</button>
+              <button id="removal-filters-clear" class="text-button" type="button" disabled>Clear filters</button>
+            </form>
             <div class="section-heading">
               <p id="removal-feedback" role="status" aria-live="polite">Checking removal audit records…</p>
               <button id="refresh-removals" class="text-button" type="button" disabled>Refresh Removal Records</button>

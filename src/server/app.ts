@@ -50,16 +50,34 @@ export interface SyncIntegration {
 const RECENT_RUNS = 20;
 const RECENT_REMOVALS = 100;
 
-/** Flattens durable run audits into newest-first removal records. */
+/** Optional filters for the durable removal audit history: safe equality checks
+ * plus a case-insensitive substring search on the provider-native track identity. */
+export interface RemovalRecordQuery {
+  pairId?: string;
+  platform?: ProviderId;
+  playlistId?: string;
+  itemIdentity?: string;
+  direction?: SyncRemovalAudit["direction"];
+  outcome?: SyncRemovalAudit["outcome"];
+  limit?: number;
+}
+
+/** Flattens durable run audits into newest-first removal records, applying any filters. */
 export function collectRemovalRecords(
   state: SyncState,
-  query: { pairId?: string; limit?: number } = {},
+  query: RemovalRecordQuery = {},
 ): SyncRemovalRecord[] {
   const pairs = new Map(state.pairs.map((item) => [item.id, item]));
+  const identitySearch = query.itemIdentity?.toLowerCase();
   const records: SyncRemovalRecord[] = [];
   for (const run of state.runs) {
     for (const audit of run.removals) {
       if (query.pairId !== undefined && audit.pairId !== query.pairId) continue;
+      if (query.platform !== undefined && audit.platform !== query.platform) continue;
+      if (query.playlistId !== undefined && audit.playlistId !== query.playlistId) continue;
+      if (identitySearch !== undefined && !audit.itemIdentity.toLowerCase().includes(identitySearch)) continue;
+      if (query.direction !== undefined && audit.direction !== query.direction) continue;
+      if (query.outcome !== undefined && audit.outcome !== query.outcome) continue;
       const pair = pairs.get(audit.pairId);
       records.push({
         ...audit,
@@ -91,7 +109,9 @@ function readRef(value: unknown): SyncPairRef {
     || typeof ref.playlistId !== "string" || !ref.playlistId.trim() || ref.playlistId.length > 200) {
     throw new AppError("INVALID_SYNC_PAIR", "Each playlist reference requires a provider, account ID and playlist ID.", 400);
   }
-  return { provider: ref.provider as ProviderId, accountId: ref.accountId, playlistId: ref.playlistId };
+  // Persist the normalized value: an accepted whitespace-padded ID must still match
+  // the provider's actual ID, which discovery never returns with padding.
+  return { provider: ref.provider as ProviderId, accountId: ref.accountId.trim(), playlistId: ref.playlistId.trim() };
 }
 
 export interface ServerDependencies {
@@ -339,9 +359,29 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
   app.get("/api/sync/removals", async (req, res) => {
     const service = syncService();
     const pairId = req.query["pairId"];
+    const platform = req.query["platform"];
+    const playlistId = req.query["playlistId"];
+    const itemIdentity = req.query["itemIdentity"];
+    const direction = req.query["direction"];
+    const outcome = req.query["outcome"];
     const limit = req.query["limit"];
     if (pairId !== undefined && (typeof pairId !== "string" || !pairId || pairId.length > 200)) {
       throw new AppError("INVALID_SYNC_QUERY", "The optional pair ID must be a single non-empty value.", 400);
+    }
+    if (platform !== undefined && (typeof platform !== "string" || !["youtube", "spotify"].includes(platform))) {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional platform must be youtube or spotify.", 400);
+    }
+    if (playlistId !== undefined && (typeof playlistId !== "string" || !playlistId || playlistId.length > 200)) {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional playlist ID must be a single non-empty value.", 400);
+    }
+    if (itemIdentity !== undefined && (typeof itemIdentity !== "string" || !itemIdentity.trim() || itemIdentity.length > 200)) {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional track identity search must be non-empty text of at most 200 characters.", 400);
+    }
+    if (direction !== undefined && direction !== "left-to-right" && direction !== "right-to-left") {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional direction must be left-to-right or right-to-left.", 400);
+    }
+    if (outcome !== undefined && outcome !== "success" && outcome !== "failed") {
+      throw new AppError("INVALID_SYNC_QUERY", "The optional outcome must be success or failed.", 400);
     }
     let parsedLimit: number | undefined;
     if (limit !== undefined) {
@@ -352,7 +392,12 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     }
     res.json({
       removals: collectRemovalRecords(await service.state(), {
-        ...(pairId === undefined ? {} : { pairId }),
+        ...(pairId === undefined ? {} : { pairId: pairId as string }),
+        ...(platform === undefined ? {} : { platform: platform as ProviderId }),
+        ...(playlistId === undefined ? {} : { playlistId: playlistId as string }),
+        ...(itemIdentity === undefined ? {} : { itemIdentity: (itemIdentity as string).trim() }),
+        ...(direction === undefined ? {} : { direction: direction as "left-to-right" | "right-to-left" }),
+        ...(outcome === undefined ? {} : { outcome: outcome as "success" | "failed" }),
         ...(parsedLimit === undefined ? {} : { limit: parsedLimit }),
       }),
     });

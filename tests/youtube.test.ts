@@ -472,3 +472,109 @@ describe("YouTubeProvider failures and retry policy", () => {
     expect(fetcher.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
   });
 });
+
+
+describe("YouTubeProvider.replacePlaylist write-scope safety", () => {
+  const target: Playlist = { ...playlist, itemCount: 1 };
+  const newEntry = {
+    id: "new", position: 0, mediaId: "new-video", title: "New", artist: null, album: null,
+    url: null, availability: "available" as const, addedAt: null, providerData: {},
+  };
+
+  it("fails closed without attempting any request when no write-scope credential is configured", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher });
+    await expect(provider.replacePlaylist(target, [newEntry])).rejects.toMatchObject({ code: "YOUTUBE_WRITE_NOT_AUTHORIZED" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("still rejects unavailable entries before any write is attempted", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    const unavailable = { ...newEntry, mediaId: null, availability: "unavailable" as const };
+    await expect(provider.replacePlaylist(target, [unavailable])).rejects.toMatchObject({ code: "YOUTUBE_ENTRY_UNSUPPORTED" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("includes part=snippet on every insert and authenticates mutations with the write-scope token", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ id: "inserted-1" }));
+    fetcher.mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const writeSupplier = vi.fn(async () => "write-token");
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: writeSupplier });
+    await provider.replacePlaylist(target, [newEntry]);
+
+    const [insertUrl, insertInit] = fetcher.mock.calls[1]!;
+    expect(new URL(insertUrl as string | URL).searchParams.get("part")).toBe("snippet");
+    expect((insertInit as RequestInit).headers).toMatchObject({ Authorization: "Bearer write-token", "Content-Type": "application/json" });
+    expect(JSON.parse((insertInit as RequestInit).body as string)).toMatchObject({
+      snippet: { playlistId: "owned-list", resourceId: { kind: "youtube#video", videoId: "new-video" } },
+    });
+
+    const [deleteUrl, deleteInit] = fetcher.mock.calls[2]!;
+    expect((deleteInit as RequestInit).method).toBe("DELETE");
+    expect((deleteInit as RequestInit).headers).toMatchObject({ Authorization: "Bearer write-token" });
+    expect(new URL(deleteUrl as string | URL).searchParams.get("id")).toBe("item-0");
+    expect(writeSupplier).toHaveBeenCalled();
+  });
+
+  it("inserts new entries before deleting previous ones, so a failed insert leaves the playlist intact", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ error: "insert failed" }, 500));
+    const provider = new YouTubeProvider(async () => "read-token", {
+      fetch: fetcher, writeAccessToken: async () => "write-token", sleep: vi.fn(async () => {}),
+    });
+    const error = await provider.replacePlaylist(target, [newEntry]).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "YOUTUBE_MUTATION_FAILED" });
+    // Only the fresh read and the failed insert happened; no DELETE of the previous items was ever issued.
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "DELETE")).toBe(false);
+  });
+
+  it("does not automatically retry a rate-limited or 5xx insert", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ error: "rate limited" }, 429));
+    const sleep = vi.fn(async () => {});
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token", sleep });
+    const error = await provider.replacePlaylist(target, [newEntry]).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "YOUTUBE_MUTATION_FAILED" });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not automatically retry a rate-limited or 5xx delete", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ id: "inserted-1" }));
+    fetcher.mockResolvedValueOnce(json({ error: "busy" }, 503));
+    const sleep = vi.fn(async () => {});
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token", sleep });
+    const error = await provider.replacePlaylist(target, [newEntry]).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "YOUTUBE_MUTATION_FAILED" });
+    expect(sleep).not.toHaveBeenCalled();
+    expect(fetcher).toHaveBeenCalledTimes(3);
+  });
+
+  it("rejects an unconfirmed insert response instead of silently assuming success", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    fetcher.mockResolvedValueOnce(json({ items: [apiItem(0, "old-video")], pageInfo: { totalResults: 1 } }));
+    fetcher.mockResolvedValueOnce(json({ notAnId: true }));
+    const provider = new YouTubeProvider(async () => "read-token", { fetch: fetcher, writeAccessToken: async () => "write-token" });
+    const error = await provider.replacePlaylist(target, [newEntry]).catch((value: unknown) => value);
+    expect(error).toMatchObject({ code: "YOUTUBE_INSERT_UNCONFIRMED" });
+    expect(fetcher.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "DELETE")).toBe(false);
+  });
+
+  it("still retries transient failures for ordinary reads (listPlaylists/getPlaylist)", async () => {
+    const { provider, sleep, fetcher } = fixture([
+      json({ error: "busy" }, 503),
+      json({ items: [] }),
+    ]);
+    expect(await provider.listPlaylists()).toEqual([]);
+    expect(sleep).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+});

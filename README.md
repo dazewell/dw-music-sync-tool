@@ -70,39 +70,44 @@ explicit and can be retried after the reported local problem is resolved.
 
 Spotify sync is optional and only needed if you want an explicitly paired
 playlist mirrored to or from Spotify (see [The path to Spotify / YouTube
-sync](#the-path-to-spotify--youtube-sync)). **There is no in-app Spotify
-connect flow.** You register your own Spotify app and generate a refresh
-token out-of-band, once, before starting this tool.
+sync](#the-path-to-spotify--youtube-sync)). **There is no in-app (web UI)
+Spotify connect flow.** You register your own Spotify app and generate a
+refresh token with the project-native `spotify-auth` command, once, before
+starting this tool.
 
 1. Create an app in the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard).
    Note its **Client ID** and **Client Secret**.
-2. In the app's settings, add a **Redirect URI** you control, for example
-   `http://127.0.0.1:8888/callback`. This URI is only used by the one-time
-   authorization script in step 3 below (an Authorization Code flow) to
-   receive Spotify's redirect after you approve access; this application has
-   no callback endpoint of its own and never receives this redirect.
-3. Run a one-time Authorization Code flow (any script or tool you trust, not
-   provided by this project) that:
-   - Sends you to Spotify's `/authorize` endpoint with your Client ID, the
-     redirect URI from step 2, and exactly the scopes this tool's Spotify
-     provider needs to read and modify your playlists:
-     `playlist-read-private playlist-read-collaborative
-     playlist-modify-public playlist-modify-private`.
-   - Captures the `code` Spotify sends to your redirect URI after you approve.
-   - Exchanges that code at Spotify's `/api/token` endpoint (using your
-     Client ID and Client Secret) for an access token and, importantly, a
-     **refresh token**.
-   - Discard the authorization code and short-lived access token once this
-     exchange succeeds; only the refresh token needs to be kept.
-4. Copy `.env.example` to `.env` if you have not already, then set all three
-   variables together:
+2. In the app's settings, add a **Redirect URI** of `http://127.0.0.1:8888/callback`
+   (or your own port; see below). This loopback URI is only used by the
+   `spotify-auth` command below to receive Spotify's redirect after you
+   approve access; this application has no callback endpoint of its own and
+   never receives this redirect.
+3. Copy `.env.example` to `.env` if you have not already, then set:
 
    ```
    SPOTIFY_CLIENT_ID=your-client-id
    SPOTIFY_CLIENT_SECRET=your-client-secret
-   SPOTIFY_REFRESH_TOKEN=the-refresh-token-from-step-3
    ```
 
+   Leave `SPOTIFY_REFRESH_TOKEN` unset for now; the next step produces it.
+4. Run:
+
+   ```powershell
+   npm run spotify-auth
+   ```
+
+   This runs a local Authorization Code flow with PKCE and a
+   state-protected, loopback-only (`127.0.0.1`) callback listener. It opens
+   your system browser to Spotify's consent screen for exactly the scopes
+   this tool's Spotify provider needs to read and modify your playlists
+   (`playlist-read-private playlist-read-collaborative
+   playlist-modify-public playlist-modify-private`), exchanges the returned
+   code for a refresh token, and atomically writes only
+   `SPOTIFY_REFRESH_TOKEN` into your local, Git-ignored `.env`. The
+   authorization code and short-lived access token are discarded once the
+   exchange succeeds, and no credential value is ever printed to the
+   terminal. Use `--port <number>` if you registered a different Redirect
+   URI port.
 5. Restart the app (`npm start`) so it picks up the new environment. There is
    no live reload for `.env` changes.
 
@@ -114,16 +119,9 @@ revoked (from your [Spotify account apps](https://www.spotify.com/account/apps/)
 page) or Spotify rotates/expires it. The three `SPOTIFY_*` variables are
 **all-or-nothing**: set every one of them, or leave every one of them unset; a
 partial set fails startup with an explicit configuration error instead of
-running with reduced access.
-
-Configuring these variables does more than enable read access: once a pair is
-run, this tool can **mirror deletions bidirectionally** between YouTube and
-Spotify for that pair, including removing tracks from your real Spotify
-playlist. Every mirrored deletion is written to a durable, per-removal audit
-log (readable with `sync --removals` or `GET /api/sync/removals`) so removed
-items are never silently lost, but the removal itself still happens against
-the live Spotify API. Only pair and run playlists you intend to keep in sync,
-and review the audit log if a mirrored removal looks unexpected.
+running with reduced access. Running `npm run spotify-auth` itself only
+requires `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` to already be set;
+it is what supplies the refresh token to complete the all-or-nothing set.
 
 ## Local files and commands
 
@@ -131,6 +129,7 @@ and review the audit log if a mirrored removal looks unexpected.
 npm start                                    # Real account, local web UI
 npm start -- --port 8790                      # Alternate loopback port
 npm run backup                               # Bulk backup with existing authorization
+npm run spotify-auth                         # One-time Spotify PKCE authorization
 npm run backup -- --output D:\Music\Backups    # Choose a local destination
 node dist\cli.js backup --demo                # Synthetic CLI export
 node dist\cli.js --help
@@ -216,9 +215,9 @@ Copy `.env.example` to `.env` to override defaults, or set environment variables
 
 The three `SPOTIFY_*` variables are optional and must be set together, or all
 left unset; a partial set fails startup with an explicit configuration error.
-There is no in-app Spotify connect flow yet, so the refresh token must be
-obtained out-of-band (for example, with Spotify's Authorization Code flow and a
-one-time script) and stored only in your local, Git-ignored `.env`. Without
+There is no in-app (web UI) Spotify connect flow yet, so the refresh token
+must be obtained with `npm run spotify-auth` (see Connect Spotify above) and
+stored only in your local, Git-ignored `.env`. Without
 them, an explicitly paired run whose changed side is Spotify fails closed with
 an actionable `SPOTIFY_NOT_CONFIGURED` error instead of pretending to sync.
 
@@ -332,10 +331,14 @@ Takeout import is not implemented.
 ### Quota and common problems
 
 Playlist discovery and item-list requests normally cost **one quota unit per
-page**, up to 50 records per page. No search or write requests are used. Check
-your project's actual quota in Cloud Console. Rate limits and temporary server
-errors use bounded retries; quota exhaustion and authorization problems require
-action, not an infinite retry loop.
+page**, up to 50 records per page; backups never issue search or write
+requests. An explicit sync run additionally issues YouTube `playlistItems`
+insert/delete write requests (each at YouTube's own, separately published
+per-write quota cost) and Spotify API requests, but only for the one paired
+playlist you selected to mirror. Check your project's actual quota in Cloud
+Console. Rate limits and temporary server errors use bounded retries; quota
+exhaustion and authorization problems require action, not an infinite retry
+loop.
 
 | Problem | Recovery |
 | --- | --- |
@@ -349,19 +352,31 @@ action, not an infinite retry loop.
 
 ## The path to Spotify / YouTube sync
 
-An explicitly paired playlist can now be mirrored bidirectionally through the
-real YouTube and Spotify APIs (no Soundiiz), directly from the web app's sync
-run control. Pairing, ignoring, ordered fingerprints, baseline change
-classification and plan/apply are implemented in `src/core/sync.ts` and
-`src/core/sync-state.ts`; running a pair re-observes both sides fresh, plans
-the changed direction, applies it through the authenticated provider, verifies
-the destination and records a new baseline plus a durable per-removal audit
-entry for every mirrored deletion (readable with `sync --removals` or
-`GET /api/sync/removals`). Only an explicit, already-created pair can be run;
-there is no name-based auto-matching or scheduling yet, and cross-platform
-recording-identity resolution (matching a YouTube video to the equivalent
-Spotify track) remains future work, so a mirrored entry still carries its
-source platform's native identifiers.
+An explicitly paired playlist can be evaluated bidirectionally against the
+real YouTube and Spotify APIs (no Soundiiz), from the web app's sync run
+control, the local API, or the CLI (`sync --pair-left`/`--pair-right`,
+`--ignore`/`--unignore`, `--run`; see `--help`). Pairing, ignoring, ordered
+fingerprints, baseline change classification and plan/apply are implemented in
+`src/core/sync.ts` and `src/core/sync-state.ts`; running a pair re-observes
+both sides fresh and classifies the change (unchanged, one side changed, or
+both sides changed since the last acknowledged baseline).
+
+**Every pair is necessarily cross-provider** (pairing the same provider twice
+is rejected), and **cross-platform recording-identity resolution (matching a
+YouTube video to the equivalent Spotify track) is not implemented yet.**
+Without a verified translation, a source platform's native identifiers (a
+YouTube video ID, a Spotify track URI) cannot be safely written to the other
+platform. So today, a real run always reports `review-required` instead of
+writing anything; no destructive mutation is currently reachable through a
+created pair. This is a deliberate, conservative response to a real risk
+(silently writing an untranslated or wrong identifier to the other platform's
+API), not an oversight, and it is covered by regression tests. Automatic
+mirroring, the durable per-removal audit trail (filterable by pair, platform,
+playlist, track identity, direction and outcome; readable with
+`sync --removals` or `GET /api/sync/removals`) and destination verification
+are implemented and unit-tested against `applySyncPlan` directly, and will
+take effect once cross-platform matching lands. There is also no name-based
+auto-matching or scheduling yet.
 
 Direct Spotify execution additionally needs `SPOTIFY_CLIENT_ID`,
 `SPOTIFY_CLIENT_SECRET` and `SPOTIFY_REFRESH_TOKEN` (see Configuration above);

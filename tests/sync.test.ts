@@ -58,6 +58,33 @@ describe("playlist names and pairing", () => {
     expect(sources).toHaveLength(7);
     expect(targets).toHaveLength(7);
   });
+
+  it("validates complete references in either pair orientation", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "music-sync-pair-"));
+    try {
+      const store = new SyncStateStore(path.join(directory, "sync-state.json"));
+      const pairing = {
+        id: "pair-1",
+        left: { provider: "youtube" as const, accountId: "yt-account", playlistId: "same-id" },
+        right: { provider: "spotify" as const, accountId: "sp-account", playlistId: "same-id" },
+        enabled: true, createdAt: "2026-09-13T20:00:00.000Z", updatedAt: "2026-09-13T20:00:00.000Z",
+      };
+      await store.pair(pairing);
+      await expect(store.pair({
+        ...pairing,
+        id: "pair-reversed",
+        left: pairing.right,
+        right: pairing.left,
+      })).rejects.toMatchObject({ code: "SYNC_PAIR_EXISTS" });
+      await expect(store.pair({
+        ...pairing,
+        id: "pair-different-account",
+        left: { ...pairing.left, accountId: "other-account" },
+      })).rejects.toMatchObject({ code: "SYNC_PAIR_EXISTS" });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("stable ordered fingerprints", () => {
@@ -131,13 +158,13 @@ describe("common sync baseline comparison", () => {
         warnings: [],
       };
       const right: PlaylistContents = {
-        playlist: playlist("right", "right", "spotify"),
+        playlist: playlist("right", "right", "youtube"),
         entries: [entry("a", "a"), entry("b", "b")],
         warnings: [],
       };
       const plan = planBidirectionalSync(left, right, {
         sourceFingerprint: fingerprintPlaylist("youtube", [entry("old", "a"), entry("old-b", "b")]),
-        targetFingerprint: fingerprintPlaylist("spotify", right.entries),
+        targetFingerprint: fingerprintPlaylist("youtube", right.entries),
       });
       const audits: Array<{ outcome: string; itemIdentity: string; error: string | null }> = [];
       const provider = {
@@ -148,7 +175,7 @@ describe("common sync baseline comparison", () => {
         runId: "run-1", pairId: "pair-1",
         sink: { recordRemovalAudits: async (_runId, records) => audits.push(...records.map(record => ({ outcome: record.outcome, itemIdentity: record.itemIdentity, error: record.error }))) },
       })).rejects.toThrow("mutation rejected");
-      expect(audits).toEqual([{ outcome: "failed", itemIdentity: "media:b", error: "The destination mutation failed." }]);
+      expect(audits).toEqual([{ outcome: "unknown", itemIdentity: "media:b", error: "The destination mutation failed." }]);
     });
   });
 
@@ -163,16 +190,51 @@ describe("common sync baseline comparison", () => {
 
     it("mirrors the changed side, including removals and order", () => {
       const left = contents("youtube", ["a", "c"]);
-      const right = contents("spotify", ["a", "b", "c"]);
+      const right = contents("youtube", ["a", "b", "c"]);
       const baseline = {
         sourceFingerprint: fingerprintPlaylist("youtube", contents("youtube", ["a", "b", "c"]).entries),
-        targetFingerprint: fingerprintPlaylist("spotify", right.entries),
+        targetFingerprint: fingerprintPlaylist("youtube", right.entries),
       };
       const plan = planBidirectionalSync(left, right, baseline);
       expect(plan.status).toBe("ready");
       expect(plan.direction).toBe("left-to-right");
       expect(plan.entries.map(item => item.mediaId)).toEqual(["a", "c"]);
       expect(plan.removals).toBe(1);
+    });
+
+    it("returns verified fingerprints in fixed pair-left and pair-right order", async () => {
+      const left = contents("youtube", ["a"]);
+      const right = contents("youtube", ["a", "b"]);
+      const baseline = {
+        sourceFingerprint: fingerprintPlaylist("youtube", left.entries),
+        targetFingerprint: fingerprintPlaylist("youtube", contents("youtube", ["a"]).entries),
+      };
+      const plan = planBidirectionalSync(left, right, baseline);
+      expect(plan.direction).toBe("right-to-left");
+      const result = await applySyncPlan(plan, {
+        id: "youtube", coverage: "",
+        listPlaylists: async () => [],
+        getPlaylist: async (playlist) => ({ playlist, entries: right.entries, warnings: [] }),
+        replacePlaylist: async (_playlist, entries) => {
+          right.entries = entries.map((item, position) => ({ ...item, position }));
+        },
+      });
+      expect(result).toEqual({
+        sourceFingerprint: fingerprintPlaylist("youtube", right.entries),
+        targetFingerprint: fingerprintPlaylist("youtube", right.entries),
+      });
+    });
+
+    it("requires review instead of treating provider-scoped IDs as cross-provider matches", () => {
+      const left = contents("youtube", ["a", "c"]);
+      const right = contents("spotify", ["a", "b", "c"]);
+      const baseline = {
+        sourceFingerprint: fingerprintPlaylist("youtube", contents("youtube", ["a", "b", "c"]).entries),
+        targetFingerprint: fingerprintPlaylist("spotify", right.entries),
+      };
+      const plan = planBidirectionalSync(left, right, baseline);
+      expect(plan.status).toBe("review-required");
+      expect(plan.reason).toMatch(/cross-provider item mapping/i);
     });
 
     it("requires review for both-sided changes and ambiguous identities", () => {
@@ -191,5 +253,25 @@ describe("common sync baseline comparison", () => {
   it("requires an acknowledged common baseline, even when current values match", () => {
     expect(compareFingerprints("same", "same", null)).toBe("uninitialized");
     expect(compareFingerprints("source", "target", undefined)).toBe("uninitialized");
+  });
+
+  it("retires persisted running runs and their baseline before a retry can reuse it", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "music-sync-recovery-"));
+    try {
+      const store = new SyncStateStore(path.join(directory, "sync-state.json"));
+      await store.update((state) => {
+        state.baselines["pair-1"] = { sourceFingerprint: "left", targetFingerprint: "right" };
+      });
+      const run = await store.startRun("pair-1");
+      const recovered = await new SyncStateStore(path.join(directory, "sync-state.json")).read();
+      expect(recovered.baselines["pair-1"]).toBeUndefined();
+      expect(recovered.runs.find(item => item.id === run.id)).toMatchObject({
+        status: "review-required",
+        message: expect.stringMatching(/interrupted/i),
+      });
+      expect(recovered.runs.find(item => item.id === run.id)?.completedAt).not.toBeNull();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

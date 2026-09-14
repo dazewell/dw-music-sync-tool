@@ -49,6 +49,8 @@ const itemSchema = z.object({
   status: status.optional(),
 });
 
+const insertedItemSchema = z.object({ id: nonempty });
+
 function pageSchema<T extends z.ZodType>(item: T) {
   return z.object({
     items: z.array(item),
@@ -65,6 +67,12 @@ type YouTubeItem = z.infer<typeof itemSchema>;
 export interface YouTubeProviderOptions {
   fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Supplies an access token for a separately, explicitly consented write-capable Google
+   * credential. Never derive this from the read-only backup credential: if it is omitted,
+   * every mutating call fails closed before any request is sent.
+   */
+  writeAccessToken?: () => Promise<string>;
 }
 
 export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
@@ -72,6 +80,7 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
   readonly coverage = "Owned playlists exposed by the official YouTube Data API, including non-music videos; not a complete YouTube Music library. Saved third-party playlists and special Music collections (mixes, audio uploads, liked Music) are outside this backup's coverage. Private/deleted entries may have incomplete metadata. Metadata only; no audio downloads.";
   private readonly fetcher: typeof fetch;
   private readonly sleep: (ms: number) => Promise<void>;
+  private readonly writeAccessToken: (() => Promise<string>) | undefined;
 
   constructor(
     private readonly accessToken: () => Promise<string>,
@@ -79,6 +88,7 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
   ) {
     this.fetcher = options.fetch ?? globalThis.fetch;
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.writeAccessToken = options.writeAccessToken;
   }
 
   async listPlaylists(): Promise<Playlist[]> {
@@ -151,18 +161,39 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
     if (playlist.provider !== this.id || !playlist.id) {
       throw new AppError("YOUTUBE_PLAYLIST_INVALID", "A YouTube playlist is required.", 400);
     }
+    // Fail closed before any request: without a separately consented write-capable credential,
+    // no playlist mutation can be authorized by Google, and none is attempted.
+    if (this.writeAccessToken === undefined) {
+      throw new AppError(
+        "YOUTUBE_WRITE_NOT_AUTHORIZED",
+        "YouTube playlist writes require a separately, explicitly authorized write-scope Google credential. Connect write access before syncing changes to YouTube.",
+        403,
+      );
+    }
     if (entries.some(entry => entry.mediaId === null)) {
       throw new AppError("YOUTUBE_ENTRY_UNSUPPORTED", "Unavailable entries cannot be written to YouTube without a video ID.", 409);
     }
     const current = await this.getPlaylist(playlist);
-    for (const entry of current.entries) {
-      await this.request(new URL(`playlistItems?${new URLSearchParams({ id: entry.id }).toString()}`, API_ROOT), { method: "DELETE" });
-    }
+    // Insert the new entries before removing the previous ones. If insertion fails partway
+    // (network error, quota, malformed response) the previous playlist entries are still
+    // intact instead of already deleted; nothing is lost, and the failure is explicit.
+    const insertUrl = new URL(`playlistItems?${new URLSearchParams({ part: "snippet" }).toString()}`, API_ROOT);
     for (const entry of entries) {
-      await this.request(new URL("playlistItems", API_ROOT), {
+      const body = await this.request(insertUrl, {
         method: "POST",
         body: JSON.stringify({ snippet: { playlistId: playlist.id, resourceId: { kind: "youtube#video", videoId: entry.mediaId } } }),
-      });
+      }, "write");
+      const inserted = insertedItemSchema.safeParse(body);
+      if (!inserted.success) {
+        throw new AppError(
+          "YOUTUBE_INSERT_UNCONFIRMED",
+          "YouTube did not confirm the inserted playlist item. The previously existing items were preserved; review the playlist before retrying.",
+          502,
+        );
+      }
+    }
+    for (const entry of current.entries) {
+      await this.request(new URL(`playlistItems?${new URLSearchParams({ id: entry.id }).toString()}`, API_ROOT), { method: "DELETE" }, "write");
     }
   }
 
@@ -214,16 +245,30 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
     return { items, totals };
   }
 
-  private async request(url: URL, init: RequestInit = {}): Promise<unknown> {
+  private async request(url: URL, init: RequestInit = {}, tokenKind: "read" | "write" = "read"): Promise<unknown> {
+    const method = (init.method ?? "GET").toUpperCase();
+    // Automatic retries are safe only for idempotent reads. A lost or transient response to a
+    // non-idempotent playlist insert/delete could otherwise be retried and duplicate or repeat it.
+    const retryable = method === "GET";
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
       let token: string;
       try {
-        token = await this.accessToken();
+        token = tokenKind === "write" ? await this.writeAccessToken!() : await this.accessToken();
       } catch {
-        throw new AppError("YOUTUBE_AUTH_FAILED", "Unable to obtain YouTube access. Check your Google connection and reconnect if needed.", 401);
+        throw new AppError(
+          tokenKind === "write" ? "YOUTUBE_WRITE_AUTH_FAILED" : "YOUTUBE_AUTH_FAILED",
+          "Unable to obtain YouTube access. Check your Google connection and reconnect if needed.",
+          401,
+        );
       }
       if (!token) {
-        throw new AppError("YOUTUBE_AUTH_FAILED", "Connect your Google account before reading YouTube playlists.", 401);
+        throw new AppError(
+          tokenKind === "write" ? "YOUTUBE_WRITE_AUTH_FAILED" : "YOUTUBE_AUTH_FAILED",
+          tokenKind === "write"
+            ? "Connect write-capable Google access before changing YouTube playlists."
+            : "Connect your Google account before reading YouTube playlists.",
+          401,
+        );
       }
       const controller = new AbortController();
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -235,7 +280,12 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
             const fetched = await this.fetcher(url, {
               ...init,
               method: init.method ?? "GET",
-              headers: { Authorization: `Bearer ${token}`, Accept: "application/json", ...(init.headers ?? {}) },
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: "application/json",
+                ...(init.body ? { "Content-Type": "application/json" } : {}),
+                ...(init.headers ?? {}),
+              },
               signal: controller.signal,
               redirect: "error",
             });
@@ -265,7 +315,13 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
       }
       if (response.ok) return body;
       if (response.status === 401) {
-        throw new AppError("YOUTUBE_UNAUTHORIZED", "Google authorization was rejected. Reconnect your Google account, then retry.", 401);
+        throw new AppError(
+          "YOUTUBE_UNAUTHORIZED",
+          tokenKind === "write"
+            ? "Google write authorization was rejected. Reconnect write access, then retry."
+            : "Google authorization was rejected. Reconnect your Google account, then retry.",
+          401,
+        );
       }
       let rateLimited = response.status === 429;
       if (response.status === 403) {
@@ -286,6 +342,13 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
         throw new AppError("YOUTUBE_NOT_FOUND", "The YouTube playlist was not found or is no longer accessible.", 404);
       }
       if (rateLimited || response.status >= 500) {
+        if (!retryable) {
+          throw new AppError(
+            "YOUTUBE_MUTATION_FAILED",
+            "YouTube rate-limited or temporarily failed this playlist write. Automatic retry was skipped because retrying a non-idempotent change could duplicate or repeat it. Check the playlist state, then retry manually.",
+            502,
+          );
+        }
         if (attempt < MAX_RETRIES) {
           const retryAfter = response.headers.get("retry-after");
           const requested = retryAfter === null ? NaN
@@ -313,7 +376,13 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
           503,
         );
       }
-      throw new AppError("YOUTUBE_REQUEST_FAILED", "YouTube could not complete the playlist request. Check your Google connection and retry.", 502);
+      throw new AppError(
+        tokenKind === "write" ? "YOUTUBE_MUTATION_FAILED" : "YOUTUBE_REQUEST_FAILED",
+        tokenKind === "write"
+          ? "YouTube could not complete the playlist write. Check your Google write access and retry."
+          : "YouTube could not complete the playlist request. Check your Google connection and retry.",
+        502,
+      );
     }
     throw new AppError("YOUTUBE_REQUEST_FAILED", "YouTube could not complete the playlist request.", 502);
   }

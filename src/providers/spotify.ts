@@ -3,25 +3,29 @@ import { AppError } from "../core/errors.js";
 import type { Playlist, PlaylistContents, PlaylistEntry, PlaylistMutation, PlaylistProvider } from "../core/models.js";
 
 const API_ROOT = "https://api.spotify.com/v1/";
+// The playlist-items endpoint can return a track, a podcast episode, or a local file under
+// the same "track" key. Episodes/local files are not addressable by spotify:track URIs, so
+// only "name" is guaranteed; every other field is optional and validated defensively.
+const trackSchema = z.object({
+  type: z.string().optional(),
+  id: z.string().nullable().optional(),
+  uri: z.string().nullable().optional(),
+  name: z.string().optional(),
+  artists: z.array(z.object({ name: z.string() })).optional(),
+  album: z.object({ name: z.string() }).optional(),
+  external_urls: z.object({ spotify: z.string() }).optional(),
+  duration_ms: z.number().int().nonnegative().optional(),
+  external_ids: z.object({ isrc: z.string().optional() }).optional(),
+}).nullable();
 const itemSchema = z.object({
   added_at: z.string().nullable().optional(),
-  track: z.object({
-    type: z.literal("track").optional(),
-    id: z.string().nullable().optional(),
-    uri: z.string().nullable().optional(),
-    name: z.string(),
-    artists: z.array(z.object({ name: z.string() })),
-    album: z.object({ name: z.string() }).optional(),
-    external_urls: z.object({ spotify: z.string() }).optional(),
-    duration_ms: z.number().int().nonnegative().optional(),
-    external_ids: z.object({ isrc: z.string().optional() }).optional(),
-  }).nullable(),
+  is_local: z.boolean().optional(),
+  track: trackSchema,
 });
 const pageSchema = z.object({
   items: z.array(itemSchema),
   next: z.string().url().nullable().optional(),
   total: z.number().int().nonnegative().optional(),
-  snapshot_id: z.string().optional(),
 });
 const playlistPageSchema = z.object({
   items: z.array(z.object({
@@ -33,6 +37,7 @@ const playlistPageSchema = z.object({
   })),
   next: z.string().url().nullable().optional(),
 });
+const snapshotSchema = z.object({ snapshot_id: z.string().min(1) });
 
 export interface SpotifyProviderOptions {
   fetch?: typeof fetch;
@@ -73,10 +78,20 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
     return result;
   }
 
+  /** Fetches the playlist's current snapshot_id from a fresh read, independent of any cached value. */
+  private async currentSnapshot(playlistId: string): Promise<string> {
+    const parsed = snapshotSchema.safeParse(
+      await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlistId)}?fields=snapshot_id`),
+    );
+    if (!parsed.success) throw new AppError("SPOTIFY_RESPONSE_INVALID", "Spotify did not return a playlist snapshot id.", 502);
+    return parsed.data.snapshot_id;
+  }
+
   async getPlaylist(playlist: Playlist): Promise<PlaylistContents> {
     if (playlist.provider !== this.id || !playlist.id) throw new AppError("SPOTIFY_PLAYLIST_INVALID", "A Spotify playlist is required.", 400);
+    const snapshotId = await this.currentSnapshot(playlist.id);
     const entries: PlaylistEntry[] = [];
-    let next: string | null = `${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items?limit=50&fields=items(added_at,track(id,uri,name,artists,album,external_urls,duration_ms,external_ids)),next,total`;
+    let next: string | null = `${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items?limit=50&fields=items(added_at,is_local,track(type,id,uri,name,artists,album,external_urls,duration_ms,external_ids)),next,total`;
     const seen = new Set<string>();
     while (next) {
       if (seen.has(next)) throw new AppError("SPOTIFY_PAGINATION_LOOP", "Spotify repeated a continuation URL.", 502);
@@ -86,10 +101,24 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
       for (const item of page.data.items) {
         const track = item.track;
         const position = entries.length;
+        const unsupported = item.is_local === true || (track !== null && track.type !== undefined && track.type !== "track");
+        if (unsupported) {
+          // Local files and podcast episodes cannot be addressed by a spotify:track URI; preserve
+          // them as unavailable placeholders instead of dropping them or failing validation.
+          entries.push({
+            id: `spotify-unsupported-${position}`, position,
+            mediaId: null, title: track?.name ?? "Unsupported Spotify item",
+            artist: track?.artists?.map(artist => artist.name).join(", ") || null,
+            album: track?.album?.name ?? null, url: track?.external_urls?.spotify ?? null,
+            availability: "unavailable", addedAt: item.added_at ?? null,
+            providerData: {},
+          });
+          continue;
+        }
         entries.push({
           id: track?.uri ?? `spotify-unavailable-${position}`, position,
           mediaId: track?.id ?? null, title: track?.name ?? "Unavailable track",
-          artist: track?.artists.map(artist => artist.name).join(", ") || null,
+          artist: track?.artists?.map(artist => artist.name).join(", ") || null,
           album: track?.album?.name ?? null, url: track?.external_urls?.spotify ?? null,
           availability: track?.id ? "available" : "unavailable", addedAt: item.added_at ?? null,
           providerData: track ? { uri: track.uri, isrc: track.external_ids?.isrc, durationMs: track.duration_ms } : {},
@@ -97,21 +126,42 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
       }
       next = page.data.next ?? null;
     }
-    return { playlist, entries, warnings: entries.some(entry => entry.availability === "unavailable") ? ["Unavailable Spotify items were preserved."] : [] };
+    return {
+      playlist: { ...playlist, snapshotId },
+      entries,
+      warnings: entries.some(entry => entry.availability === "unavailable") ? ["Unavailable Spotify items were preserved."] : [],
+    };
   }
 
   async replacePlaylist(playlist: Playlist, entries: readonly PlaylistEntry[], expectedSnapshotId?: string): Promise<void> {
     if (playlist.provider !== this.id) throw new AppError("SPOTIFY_PLAYLIST_INVALID", "A Spotify playlist is required.", 400);
+    // Validate every target-native URI before any destructive request is issued: an unsupported
+    // entry must never leave the playlist partially or fully emptied.
+    const uris = entries.map(entry => typeof entry.providerData.uri === "string" ? entry.providerData.uri : null);
+    if (uris.some(uri => uri === null || !uri.startsWith("spotify:track:"))) {
+      throw new AppError("SPOTIFY_ENTRY_UNSUPPORTED", "Every synchronized entry needs an explicit Spotify track URI.", 409);
+    }
+    const validatedUris = uris as string[];
+    // Re-read the playlist and its snapshot fresh; a cached/passed-in snapshot cannot protect
+    // against a concurrent edit that happened after the caller last observed the playlist.
     const current = await this.getPlaylist(playlist);
-    if (expectedSnapshotId !== undefined && playlist.snapshotId !== expectedSnapshotId) {
+    if (expectedSnapshotId !== undefined && current.playlist.snapshotId !== expectedSnapshotId) {
       throw new AppError("SPOTIFY_STALE_PLAYLIST", "The Spotify playlist changed before the sync could be applied.", 409);
     }
-    const tracks = current.entries.map((entry, position) => ({ uri: typeof entry.providerData.uri === "string" ? entry.providerData.uri : null, positions: [position] })).filter(track => track.uri);
-    if (tracks.length) await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items`, { method: "DELETE", body: JSON.stringify({ tracks, snapshot_id: expectedSnapshotId ?? playlist.snapshotId }) });
-    const uris = entries.map(entry => entry.providerData.uri).filter((uri): uri is string => typeof uri === "string" && uri.startsWith("spotify:track:"));
-    if (uris.length !== entries.length) throw new AppError("SPOTIFY_ENTRY_UNSUPPORTED", "Every synchronized entry needs an explicit Spotify track URI.", 409);
-    for (let index = 0; index < uris.length; index += 100) {
-      await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items`, { method: "POST", body: JSON.stringify({ uris: uris.slice(index, index + 100) }) });
+    const tracks = current.entries
+      .map((entry, position) => ({ uri: typeof entry.providerData.uri === "string" ? entry.providerData.uri : null, positions: [position] }))
+      .filter((track): track is { uri: string; positions: number[] } => track.uri !== null);
+    if (tracks.length) {
+      await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items`, {
+        method: "DELETE",
+        body: JSON.stringify({ tracks, snapshot_id: current.playlist.snapshotId }),
+      });
+    }
+    for (let index = 0; index < validatedUris.length; index += 100) {
+      await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items`, {
+        method: "POST",
+        body: JSON.stringify({ uris: validatedUris.slice(index, index + 100) }),
+      });
     }
   }
 

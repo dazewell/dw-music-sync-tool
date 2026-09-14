@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -872,5 +872,75 @@ describe("credential publication safety", () => {
     expect(await readFile(tokenFile, "utf8")).toBe(source);
     expect(await readFile(join(directory, "external.json"), "utf8")).toBe(source);
     expect((await readdir(join(directory, "private"))).filter(name => name.endsWith(".pending"))).toHaveLength(1);
+  });
+});
+
+
+describe("GoogleAuth explicit write-scope consent", () => {
+  const writeScope = "https://www.googleapis.com/auth/youtube";
+  const freshWriteTokens = () => ({ ...freshTokens(), scope: writeScope });
+  let writeTokenFile: string;
+
+  beforeEach(async () => {
+    writeTokenFile = join(dirname(tokenFile), "token-write.json");
+    await writeFile(credentialsFile, JSON.stringify(config));
+  });
+
+  it("requests the broader write scope on a path fully separate from the read-only token", async () => {
+    const result = await auth.beginWrite();
+    expect(mocks.authUrl).toHaveBeenCalledWith(expect.objectContaining({ scope: [writeScope] }));
+    expect(new URL(result.url).searchParams.get("scope")).toBe(writeScope);
+    await expect(readFile(writeTokenFile)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(readFile(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("persists a completed write consent to its own file, leaving the backup token file untouched", async () => {
+    mocks.getToken.mockResolvedValue({ tokens: freshWriteTokens() });
+    await auth.completeWrite("authorization-code", verifier);
+    expect(JSON.parse(await readFile(writeTokenFile, "utf8"))).toMatchObject({ scope: writeScope });
+    await expect(readFile(tokenFile)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await auth.status()).toEqual({ configured: true, connected: false });
+    expect(await auth.writeStatus()).toEqual({ configured: true, connected: true });
+  });
+
+  it("fails closed when no write consent has ever been granted, even though the backup is connected", async () => {
+    await mkdir(dirname(tokenFile), { recursive: true });
+    await writeFile(tokenFile, JSON.stringify(freshTokens()));
+    await expect(auth.getWriteAccessToken()).rejects.toMatchObject({ code: "GOOGLE_WRITE_NOT_CONNECTED" });
+    expect(await auth.getAccessToken()).toBe("secret-access-token");
+  });
+
+  it("rejects a write-scope token being read back through the read-only accessor", async () => {
+    await mkdir(dirname(writeTokenFile), { recursive: true });
+    await writeFile(writeTokenFile, JSON.stringify(freshWriteTokens()));
+    await expect(auth.getWriteAccessToken()).resolves.toBe("secret-access-token");
+    await expect(auth.getAccessToken()).rejects.toMatchObject({ code: "GOOGLE_NOT_CONNECTED" });
+  });
+
+  it("refreshes an expired write-scope token independently and validates the returned scope", async () => {
+    await mkdir(dirname(writeTokenFile), { recursive: true });
+    await writeFile(writeTokenFile, JSON.stringify({ ...freshWriteTokens(), expiry_date: 0 }));
+    mocks.refresh.mockResolvedValue({ credentials: { ...freshWriteTokens(), access_token: "refreshed-write-access" } });
+    await expect(auth.getWriteAccessToken()).resolves.toBe("refreshed-write-access");
+    expect(JSON.parse(await readFile(writeTokenFile, "utf8")).access_token).toBe("refreshed-write-access");
+  });
+
+  it("rejects a refreshed write token that drops back to read-only scope", async () => {
+    await mkdir(dirname(writeTokenFile), { recursive: true });
+    await writeFile(writeTokenFile, JSON.stringify({ ...freshWriteTokens(), expiry_date: 0 }));
+    mocks.refresh.mockResolvedValue({ credentials: { ...freshTokens(), access_token: "downgraded" } });
+    await expect(auth.getWriteAccessToken()).rejects.toMatchObject({ code: "GOOGLE_WRITE_REFRESH_INVALID" });
+  });
+
+  it("disconnects only the write-scope credential, preserving the read-only backup connection", async () => {
+    await mkdir(dirname(tokenFile), { recursive: true });
+    const readOnlyTokens = JSON.stringify(freshTokens());
+    await writeFile(tokenFile, readOnlyTokens);
+    await writeFile(writeTokenFile, JSON.stringify(freshWriteTokens()));
+    await auth.disconnectWrite();
+    expect(mocks.revoke).toHaveBeenCalledWith("secret-refresh-token");
+    await expect(readFile(writeTokenFile)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(tokenFile, "utf8")).toBe(readOnlyTokens);
+    expect(await auth.getAccessToken()).toBe("secret-access-token");
   });
 });

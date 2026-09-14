@@ -110,7 +110,16 @@ describe("executeSyncRun", () => {
     expect((await store.read()).baselines["pair-1"]).toBeUndefined();
   });
 
-  it("mirrors additions and removals through the real target provider and persists a new baseline plus removal audit", async () => {
+  // Pairs are always cross-provider (same-provider pairing is rejected by
+  // SyncStateStore.pair). Cross-provider entries have no verified target-native
+  // translation yet (see README "The path to Spotify / YouTube sync"), so
+  // planBidirectionalSync always returns "review-required" for a real pair
+  // rather than writing untranslated source-native identifiers to the other
+  // platform. This is the safe outcome the reviewer suggested explicitly
+  // ("...or return review-required instead of issuing a remote write"), so a
+  // run can never reach a destructive replacePlaylist call today, whatever the
+  // diverged baseline looks like.
+  it("requires review instead of mirroring a cross-provider pair, even with a diverged baseline, and never mutates either side", async () => {
     const store = await makeStore();
     await store.pair({
       id: "pair-1",
@@ -130,43 +139,19 @@ describe("executeSyncRun", () => {
     const youtube = new FakeProvider("youtube", [playlist("yt-1", "youtube")], new Map([["yt-1", newLeft]]));
     const spotify = new FakeProvider("spotify", [playlist("sp-1", "spotify")], new Map([["sp-1", right]]));
     const run = await executeSyncRun(store, { youtube, spotify }, "pair-1");
-    expect(run.status).toBe("complete");
-    expect(spotify.replaceCalls).toHaveLength(1);
-    expect(spotify.replaceCalls[0]?.entries.map((item) => item.mediaId)).toEqual(["a"]);
+    expect(run.status).toBe("review-required");
+    expect(run.removals).toEqual([]);
     expect(youtube.replaceCalls).toHaveLength(0);
+    expect(spotify.replaceCalls).toHaveLength(0);
     const state = await store.read();
-    expect(state.baselines["pair-1"]).toBeDefined();
-    expect(run.removals).toEqual([expect.objectContaining({ itemIdentity: "media:b", outcome: "success", direction: "left-to-right" })]);
-  });
-
-  it("records a failed run and a failed removal audit when the destination mutation is rejected", async () => {
-    const store = await makeStore();
-    await store.pair({
-      id: "pair-1",
-      left: { provider: "youtube", accountId: "acct", playlistId: "yt-1" },
-      right: { provider: "spotify", accountId: "acct", playlistId: "sp-1" },
-      enabled: true, createdAt: now, updatedAt: now,
-    });
-    const oldLeft = [entry("old-a", "a"), entry("old-b", "b")];
-    const newLeft = [entry("new-a", "a")];
-    const right = [entry("r-a", "a"), entry("r-b", "b")];
-    await store.update((state) => {
-      state.baselines["pair-1"] = {
-        sourceFingerprint: fingerprintPlaylist("youtube", oldLeft),
-        targetFingerprint: fingerprintPlaylist("spotify", right),
-      };
-    });
-    const youtube = new FakeProvider("youtube", [playlist("yt-1", "youtube")], new Map([["yt-1", newLeft]]));
-    const spotify = new FakeProvider("spotify", [playlist("sp-1", "spotify")], new Map([["sp-1", right]]), () => {
-      throw new Error("Spotify rejected the mutation");
-    });
-    await expect(executeSyncRun(store, { youtube, spotify }, "pair-1")).rejects.toThrow("Spotify rejected the mutation");
-    const state = await store.read();
-    expect(state.runs[0]?.status).toBe("failed");
     expect(state.baselines["pair-1"]).toEqual({
       sourceFingerprint: fingerprintPlaylist("youtube", oldLeft),
       targetFingerprint: fingerprintPlaylist("spotify", right),
     });
-    expect(state.runs[0]?.removals.some((removal) => removal.outcome === "failed" && removal.itemIdentity === "media:b")).toBe(true);
   });
 });
+
+// Destination-mutation failure and its per-removal "unknown" audit outcome are
+// exercised directly against applySyncPlan in tests/sync.test.ts (a same-provider
+// plan reaching "ready"), since no currently-creatable pair can reach that path
+// through executeSyncRun (see the comment above).

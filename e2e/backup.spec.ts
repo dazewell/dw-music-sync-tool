@@ -338,6 +338,108 @@ test("explicit pairs stay selectable and drive the manual mirror trigger", async
   await expect(page.locator("#notice")).toContainText("Synchronization completed.");
   expect(triggered).toEqual([{ pairId: "pair-1" }]);
 });
+test("removing a pair updates the removal audit list immediately without a manual refresh", async ({ page, serverUrl }) => {
+  const pair = {
+    id: "pair-1",
+    left: { provider: "youtube", accountId: "account-1", playlistId: "yt-1" },
+    right: { provider: "spotify", accountId: "account-1", playlistId: "sp-1" },
+    enabled: true, createdAt: "2026-09-12T17:00:00.000Z", updatedAt: "2026-09-12T17:00:00.000Z",
+  };
+  const removal = {
+    runId: "run-1", runStatus: "complete", pairId: "pair-1", platform: "spotify", playlistId: "sp-1",
+    itemIdentity: "media:spotify-track-abc", direction: "left-to-right", sourcePlatform: "youtube",
+    timestamp: "2026-09-12T18:00:00.000Z", outcome: "success", error: null,
+  };
+  let deleted = false;
+  await page.route("**/api/sync", async (route) => {
+    await route.fulfill({ json: { pairs: deleted ? [] : [pair], ignores: [], runs: [], removals: [removal] } });
+  });
+  const removalRequests: string[] = [];
+  await page.route("**/api/sync/removals*", async (route) => {
+    removalRequests.push(route.request().url());
+    await route.fulfill({ json: { removals: [removal] } });
+  });
+  await page.route("**/api/sync/pairs/pair-1", async (route) => {
+    deleted = true;
+    await route.fulfill({ json: { pairs: [], ignores: [], runs: [], removals: [] } });
+  });
+  await page.goto(serverUrl);
+  await page.getByText("Removal audit records", { exact: true }).click();
+  await expect(page.locator("#removal-rows tr")).toHaveCount(1);
+  const requestsBeforeRemoval = removalRequests.length;
+  await page.getByRole("button", { name: "Remove", exact: true }).click();
+  await expect(page.locator("#sync-pairs")).toContainText("No pairs have been confirmed.");
+  await expect(page.locator("#removal-rows tr")).toHaveCount(0);
+  expect(removalRequests.length).toBe(requestsBeforeRemoval);
+});
+
+test("a persisted failed sync run is worded distinctly from a run that never started", async ({ page, serverUrl }) => {
+  const pair = {
+    id: "pair-1",
+    left: { provider: "youtube", accountId: "account-1", playlistId: "yt-1" },
+    right: { provider: "spotify", accountId: "account-1", playlistId: "sp-1" },
+    enabled: true, createdAt: "2026-09-12T17:00:00.000Z", updatedAt: "2026-09-12T17:00:00.000Z",
+  };
+  const state = { pairs: [pair], ignores: [], runs: [], removals: [] };
+  await page.route("**/api/sync", async (route) => { await route.fulfill({ json: state }); });
+  await page.route("**/api/sync/removals*", async (route) => { await route.fulfill({ json: { removals: [] } }); });
+  let runCall = 0;
+  await page.route("**/api/sync/run", async (route) => {
+    runCall += 1;
+    if (runCall === 1) {
+      await route.fulfill({
+        status: 409,
+        json: { error: { code: "SYNC_BUSY", message: "Another sync run is already in progress." } },
+      });
+    } else {
+      await route.fulfill({
+        status: 502,
+        json: { error: { code: "YOUTUBE_MUSIC_UNAVAILABLE", message: "YouTube Music rejected the mirrored write." } },
+      });
+    }
+  });
+  await page.goto(serverUrl);
+  await page.getByRole("button", { name: "Sync Pair", exact: true }).click();
+  await expect(page.locator("#notice")).toContainText("Synchronization did not start.");
+  await expect(page.locator("#notice")).not.toContainText("recorded");
+  await page.getByRole("button", { name: "Sync Pair", exact: true }).click();
+  await expect(page.locator("#notice")).toContainText("Synchronization failed.");
+  await expect(page.locator("#notice")).toContainText("recorded");
+});
+
+test("removal filters submit platform, playlist, identity, direction and outcome as query parameters", async ({ page, serverUrl }) => {
+  const pair = {
+    id: "pair-1",
+    left: { provider: "youtube", accountId: "account-1", playlistId: "yt-1" },
+    right: { provider: "spotify", accountId: "account-1", playlistId: "sp-1" },
+    enabled: true, createdAt: "2026-09-12T17:00:00.000Z", updatedAt: "2026-09-12T17:00:00.000Z",
+  };
+  await page.route("**/api/sync", async (route) => {
+    await route.fulfill({ json: { pairs: [pair], ignores: [], runs: [], removals: [] } });
+  });
+  const removalRequests: string[] = [];
+  await page.route("**/api/sync/removals*", async (route) => {
+    removalRequests.push(route.request().url());
+    await route.fulfill({ json: { removals: [] } });
+  });
+  await page.goto(serverUrl);
+  await page.getByText("Removal audit records", { exact: true }).click();
+  await page.locator("#removal-filter-platform").selectOption("spotify");
+  await page.locator("#removal-filter-playlist").fill("sp-1");
+  await page.locator("#removal-filter-identity").fill("track-abc");
+  await page.locator("#removal-filter-direction").selectOption("left-to-right");
+  await page.locator("#removal-filter-outcome").selectOption("success");
+  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await expect.poll(() => removalRequests.at(-1)).toContain("platform=spotify");
+  const lastUrl = new URL(removalRequests.at(-1)!);
+  expect(lastUrl.searchParams.get("playlistId")).toBe("sp-1");
+  expect(lastUrl.searchParams.get("itemIdentity")).toBe("track-abc");
+  expect(lastUrl.searchParams.get("direction")).toBe("left-to-right");
+  expect(lastUrl.searchParams.get("outcome")).toBe("success");
+  await page.getByRole("button", { name: "Clear filters", exact: true }).click();
+  await expect.poll(() => removalRequests.at(-1)).not.toContain("platform=");
+});
+
 
 test("cleanup warnings remain visible and an explicit recheck recovers", async ({ page, serverUrl }) => {
   let cleanupFailed = true;

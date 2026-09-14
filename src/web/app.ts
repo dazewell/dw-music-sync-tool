@@ -104,6 +104,13 @@ const ui = {
   removalTableWrap: element("removal-table-wrap"),
   removalRows: element<HTMLTableSectionElement>("removal-rows"),
   refreshRemovals: element<HTMLButtonElement>("refresh-removals"),
+  removalFilters: element<HTMLFormElement>("removal-filters"),
+  removalFilterPlatform: element<HTMLSelectElement>("removal-filter-platform"),
+  removalFilterPlaylist: element<HTMLInputElement>("removal-filter-playlist"),
+  removalFilterIdentity: element<HTMLInputElement>("removal-filter-identity"),
+  removalFilterDirection: element<HTMLSelectElement>("removal-filter-direction"),
+  removalFilterOutcome: element<HTMLSelectElement>("removal-filter-outcome"),
+  removalFiltersClear: element<HTMLButtonElement>("removal-filters-clear"),
 };
 
 let status: StatusResponse | null = null;
@@ -156,6 +163,13 @@ function text<K extends keyof HTMLElementTagNameMap>(
   if (className) node.className = className;
   return node;
 }
+/** An HTTP API error, carrying the server-issued error code so callers can
+ * distinguish specific failure conditions from a generic message string. */
+class RequestError extends Error {
+  constructor(message: string, readonly code: string | null) {
+    super(message);
+  }
+}
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "An unexpected error occurred. Please try again.";
@@ -190,9 +204,10 @@ async function request<T>(path: string, method: "GET" | "POST" | "DELETE" = "GET
     if (!response.ok) {
       const apiError = data as Partial<ApiError> | null;
       const detail = apiError?.error?.message;
-      throw new Error(typeof detail === "string" && detail
+      const code = typeof apiError?.error?.code === "string" ? apiError.error.code : null;
+      throw new RequestError(typeof detail === "string" && detail
         ? detail
-        : `The request failed (${response.status}). Please try again.`);
+        : `The request failed (${response.status}). Please try again.`, code);
     }
     return data as T;
   } catch (error) {
@@ -583,6 +598,13 @@ function pairLabel(pair: SyncPair): string {
 function renderRemovals(): void {
   const available = sync !== null;
   ui.refreshRemovals.disabled = removalsLoading || syncBusy || !available;
+  const filtersDisabled = removalsLoading || syncBusy || !available;
+  ui.removalFilterPlatform.disabled = filtersDisabled;
+  ui.removalFilterPlaylist.disabled = filtersDisabled;
+  ui.removalFilterIdentity.disabled = filtersDisabled;
+  ui.removalFilterDirection.disabled = filtersDisabled;
+  ui.removalFilterOutcome.disabled = filtersDisabled;
+  ui.removalFiltersClear.disabled = filtersDisabled;
   ui.refreshRemovals.textContent = removalsLoading ? "Refreshing…" : "Refresh Removal Records";
   ui.removalFeedback.dataset.error = String(Boolean(removalsError));
   ui.removalRows.replaceChildren();
@@ -633,6 +655,22 @@ function renderRemovals(): void {
   }
 }
 
+function removalFilterQuery(): string {
+  const params = new URLSearchParams();
+  const platform = ui.removalFilterPlatform.value;
+  const playlistId = ui.removalFilterPlaylist.value.trim();
+  const itemIdentity = ui.removalFilterIdentity.value.trim();
+  const direction = ui.removalFilterDirection.value;
+  const outcome = ui.removalFilterOutcome.value;
+  if (platform) params.set("platform", platform);
+  if (playlistId) params.set("playlistId", playlistId);
+  if (itemIdentity) params.set("itemIdentity", itemIdentity);
+  if (direction) params.set("direction", direction);
+  if (outcome) params.set("outcome", outcome);
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
 async function loadRemovals(): Promise<void> {
   if (removalsLoading || sync === null) {
     renderRemovals();
@@ -642,7 +680,7 @@ async function loadRemovals(): Promise<void> {
   removalsError = null;
   renderRemovals();
   try {
-    const response = await request<{ removals: SyncRemovalRecord[] }>("/api/sync/removals");
+    const response = await request<{ removals: SyncRemovalRecord[] }>(`/api/sync/removals${removalFilterQuery()}`);
     if (disposed) return;
     removals = response.removals;
     removalsLoaded = true;
@@ -653,6 +691,7 @@ async function loadRemovals(): Promise<void> {
     if (!disposed) renderRemovals();
   }
 }
+
 
 function renderSync(): void {
   const available = sync !== null;
@@ -733,6 +772,22 @@ async function loadSync(): Promise<void> {
   }
 }
 
+/** Codes the API returns before a run is ever persisted (validation, disabled
+ * services, an unknown pair, or an already-running operation). Any other
+ * error reaching this point means the run was recorded, then failed. */
+const RUN_NOT_STARTED_CODES = new Set([
+  "SYNC_UNAVAILABLE",
+  "INVALID_SYNC_RUN",
+  "SYNC_BUSY",
+  "SYNC_PAIR_NOT_FOUND",
+  "SYNC_PAIR_DISABLED",
+]);
+
+function runDidNotStart(error: unknown): boolean {
+  if (!(error instanceof RequestError)) return true;
+  return error.code === null || RUN_NOT_STARTED_CODES.has(error.code);
+}
+
 async function syncNow(): Promise<void> {
   if (ui.syncNow.disabled) return;
   const pairId = ui.syncPairSelect.value;
@@ -752,7 +807,10 @@ async function syncNow(): Promise<void> {
     );
     await loadSync();
   } catch (error) {
-    notify(`Synchronization did not start. ${message(error)}`, "error");
+    notify(runDidNotStart(error)
+      ? `Synchronization did not start. ${message(error)}`
+      : `Synchronization failed. ${message(error)} The outcome was recorded; check Recent sync runs.`, "error");
+    await loadSync();
   } finally {
     syncBusy = false;
     if (!disposed) renderSync();
@@ -762,7 +820,10 @@ async function syncNow(): Promise<void> {
 async function removePair(id: string): Promise<void> {
   syncBusy = true;
   renderSync();
-  try { sync = await request<SyncState>(`/api/sync/pairs/${encodeURIComponent(id)}`, "DELETE"); }
+  try {
+    sync = await request<SyncState>(`/api/sync/pairs/${encodeURIComponent(id)}`, "DELETE");
+    removals = sync.removals ?? removals;
+  }
   catch (error) { notify(`Could not remove the pair. ${message(error)}`, "error"); }
   finally { syncBusy = false; if (!disposed) renderSync(); }
 }
@@ -1137,6 +1198,8 @@ ui.retryJob.addEventListener("click", () => { void loadCurrentJob(); });
 ui.syncNow.addEventListener("click", () => { void syncNow(); });
 ui.pairForm.addEventListener("submit", (event) => { void savePair(event); });
 ui.refreshRemovals.addEventListener("click", () => { void loadRemovals(); });
+ui.removalFilters.addEventListener("submit", (event) => { event.preventDefault(); void loadRemovals(); });
+ui.removalFiltersClear.addEventListener("click", () => { ui.removalFilters.reset(); void loadRemovals(); });
 ui.retryStatus.addEventListener("click", () => { void boot(false); });
 ui.recheckConnection.addEventListener("click", () => { void boot(false); });
 ui.dismissNotice.addEventListener("click", () => { ui.notice.hidden = true; });
