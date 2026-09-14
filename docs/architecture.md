@@ -238,6 +238,30 @@ verified before triggering. No trigger idempotency key or reliable per-run resul
 history is documented; an uncertain timeout must be reconciled, not blindly
 triggered again.
 
+**Direct executor wiring (implemented).** `src/services/sync-executor.ts`
+connects step 6 (approve and execute) to the composition root: an explicit
+`pairId` from the web app's sync run control re-reads both playlists through
+fresh discovery (never the just-listed summary), plans against the stored
+baseline with `planBidirectionalSync`, and, when ready, applies and verifies
+through whichever real authenticated `PlaylistProvider & PlaylistMutation` is
+actually wired for the changed side. Triggering a run is the user's approval;
+there is no separate preview/confirm step yet. Every outcome - complete,
+review-required or failed - is persisted as a `SyncRun`, and every mirrored
+removal is recorded as a durable, per-item audit entry through
+`SyncStateStore`, whether the mutation succeeds or fails. `src/cli.ts` supplies
+the real `YouTubeProvider` (backed by the already-connected Google account,
+never in demo mode) and, only when `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`
+and `SPOTIFY_REFRESH_TOKEN` are all configured, a real `SpotifyProvider` backed
+by `src/auth/spotify.ts`'s refresh-token exchange. There is no in-app Spotify
+connect flow yet (building one needs its own product decision per
+`PRODUCT.md`), so an unwired or demo-mode side fails the run closed with an
+explicit `SPOTIFY_NOT_CONFIGURED` or `YOUTUBE_SYNC_NOT_AVAILABLE` error instead
+of a fake success. Recording-identity resolution across platforms (item 4) is
+still not implemented, so a mirrored entry still carries its source platform's
+native identifiers; a destination provider that cannot accept them (for
+example, Spotify requiring a track URI) fails the mutation explicitly rather
+than silently dropping or mismatching an item.
+
 ## Planned durable sync state
 
 Keep portable backup files. Introduce **SQLite** for transactional sync state when

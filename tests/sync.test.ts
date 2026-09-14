@@ -1,11 +1,17 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
-import type { Playlist, PlaylistEntry, ProviderId } from "../src/core/models.js";
+import type { Playlist, PlaylistContents, PlaylistEntry, ProviderId } from "../src/core/models.js";
 import {
+  applySyncPlan,
   compareFingerprints,
   fingerprintPlaylist,
   normalizePlaylistName,
+  planBidirectionalSync,
   proposePlaylistPairs,
 } from "../src/core/sync.js";
+import { SyncStateStore } from "../src/core/sync-state.js";
 
 function playlist(id: string, title: string, provider: ProviderId = "youtube"): Playlist {
   return {
@@ -93,6 +99,93 @@ describe("common sync baseline comparison", () => {
     ["same-new-value", "same-new-value", "conflict"],
   ] as const)("compares %s and %s as %s", (source, target, expected) => {
     expect(compareFingerprints(source, target, baseline)).toBe(expected);
+  });
+
+  describe("removal audit persistence", () => {
+    it("retains one inspectable audit record per mirrored removal", async () => {
+      const directory = await mkdtemp(path.join(os.tmpdir(), "music-sync-audit-"));
+      try {
+        const store = new SyncStateStore(path.join(directory, "sync-state.json"));
+        const run = await store.startRun("pair-1");
+        await store.recordRemovalAudits(run.id, [{
+          pairId: "pair-1", platform: "spotify", playlistId: "target",
+          itemIdentity: "media:removed-track", direction: "left-to-right",
+          timestamp: "2026-09-13T20:00:00.000Z", outcome: "success", error: null,
+        }]);
+        const state = await store.read();
+        expect(state.runs[0]?.removals).toEqual([{
+          pairId: "pair-1", platform: "spotify", playlistId: "target",
+          itemIdentity: "media:removed-track", direction: "left-to-right",
+          timestamp: "2026-09-13T20:00:00.000Z", outcome: "success", error: null,
+        }]);
+        expect(JSON.parse(await readFile(path.join(directory, "sync-state.json"), "utf8")).runs[0].removals).toHaveLength(1);
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    });
+
+    it("records failed removal outcomes when destination mutation fails", async () => {
+      const left: PlaylistContents = {
+        playlist: playlist("left", "left", "youtube"),
+        entries: [entry("a", "a")],
+        warnings: [],
+      };
+      const right: PlaylistContents = {
+        playlist: playlist("right", "right", "spotify"),
+        entries: [entry("a", "a"), entry("b", "b")],
+        warnings: [],
+      };
+      const plan = planBidirectionalSync(left, right, {
+        sourceFingerprint: fingerprintPlaylist("youtube", [entry("old", "a"), entry("old-b", "b")]),
+        targetFingerprint: fingerprintPlaylist("spotify", right.entries),
+      });
+      const audits: Array<{ outcome: string; itemIdentity: string; error: string | null }> = [];
+      const provider = {
+        id: "spotify" as const, coverage: "", listPlaylists: async () => [], getPlaylist: async () => right,
+        replacePlaylist: async () => { throw new Error("mutation rejected"); },
+      };
+      await expect(applySyncPlan(plan, provider, {
+        runId: "run-1", pairId: "pair-1",
+        sink: { recordRemovalAudits: async (_runId, records) => audits.push(...records.map(record => ({ outcome: record.outcome, itemIdentity: record.itemIdentity, error: record.error }))) },
+      })).rejects.toThrow("mutation rejected");
+      expect(audits).toEqual([{ outcome: "failed", itemIdentity: "media:b", error: "The destination mutation failed." }]);
+    });
+  });
+
+  describe("bidirectional sync planning", () => {
+    function contents(provider: ProviderId, ids: string[]): import("../src/core/models.js").PlaylistContents {
+      return {
+        playlist: playlist(`${provider}-playlist`, provider, provider),
+        entries: ids.map((id, position) => ({ ...entry(`${provider}-${position}`, id), position })),
+        warnings: [],
+      };
+    }
+
+    it("mirrors the changed side, including removals and order", () => {
+      const left = contents("youtube", ["a", "c"]);
+      const right = contents("spotify", ["a", "b", "c"]);
+      const baseline = {
+        sourceFingerprint: fingerprintPlaylist("youtube", contents("youtube", ["a", "b", "c"]).entries),
+        targetFingerprint: fingerprintPlaylist("spotify", right.entries),
+      };
+      const plan = planBidirectionalSync(left, right, baseline);
+      expect(plan.status).toBe("ready");
+      expect(plan.direction).toBe("left-to-right");
+      expect(plan.entries.map(item => item.mediaId)).toEqual(["a", "c"]);
+      expect(plan.removals).toBe(1);
+    });
+
+    it("requires review for both-sided changes and ambiguous identities", () => {
+      const left = contents("youtube", ["a", "b"]);
+      const right = contents("spotify", ["a", "c"]);
+      const baseline = { sourceFingerprint: "old", targetFingerprint: "old" };
+      expect(planBidirectionalSync(left, right, baseline).status).toBe("review-required");
+      const duplicate = contents("youtube", ["a", "a"]);
+      expect(planBidirectionalSync(duplicate, right, {
+        sourceFingerprint: fingerprintPlaylist("youtube", ["a"].map((id) => ({ ...entry("x", id), position: 0 }))),
+        targetFingerprint: fingerprintPlaylist("spotify", right.entries),
+      }).status).toBe("review-required");
+    });
   });
 
   it("requires an acknowledged common baseline, even when current values match", () => {

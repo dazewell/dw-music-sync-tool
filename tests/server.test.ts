@@ -3,7 +3,9 @@ import path from "node:path";
 import request from "supertest";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig } from "../src/config.js";
-import { createApp } from "../src/server/app.js";
+import { createApp, type SyncIntegration, type SyncRemovalRecord } from "../src/server/app.js";
+import { SyncStateStore } from "../src/core/sync-state.js";
+import type { SyncPair, SyncRemovalAudit } from "../src/core/sync.js";
 import { DemoProvider } from "../src/providers/demo.js";
 import { acquireRuntimeLock } from "../src/runtime-lock.js";
 import type { BackupManifest } from "../src/core/models.js";
@@ -38,7 +40,7 @@ function completedManifest(): BackupManifest {
   };
 }
 
-async function setup(demo = true, backupRunner?: Parameters<typeof createApp>[0]["backupRunner"]) {
+async function setup(demo = true, backupRunner?: Parameters<typeof createApp>[0]["backupRunner"], sync?: SyncIntegration) {
   const directory = await mkdtemp(path.join(process.cwd(), "music-server-test-"));
   directories.push(directory);
   const config = loadConfig({ demo }, {
@@ -52,7 +54,7 @@ async function setup(demo = true, backupRunner?: Parameters<typeof createApp>[0]
     disconnect: vi.fn(async () => {}),
   };
   const provider = new DemoProvider();
-  const { app, stopRetention, isBusy } = createApp({ config, auth, provider, ...(backupRunner ? { backupRunner } : {}) });
+  const { app, stopRetention, isBusy } = createApp({ config, auth, provider, ...(backupRunner ? { backupRunner } : {}), ...(sync ? { sync } : {}) });
   stopControllers.push(stopRetention);
   const browser = request.agent(app);
   const host = new URL(config.baseUrl).host;
@@ -61,7 +63,146 @@ async function setup(demo = true, backupRunner?: Parameters<typeof createApp>[0]
   return { app, browser, config, auth, host, csrf, directory, provider, isBusy };
 }
 
+/** Backs the API with the durable core sync state store instead of a parallel model. */
+async function syncFixture() {
+  const directory = await mkdtemp(path.join(process.cwd(), "music-sync-test-"));
+  directories.push(directory);
+  const store = new SyncStateStore(path.join(directory, "sync-state.json"));
+  const now = new Date().toISOString();
+  const pair: SyncPair = {
+    id: "pair-1",
+    left: { provider: "youtube", accountId: "account-1", playlistId: "yt-1" },
+    right: { provider: "spotify", accountId: "account-1", playlistId: "sp-1" },
+    enabled: true, createdAt: now, updatedAt: now,
+  };
+  await store.pair(pair);
+  const run = await store.startRun("pair-1");
+  const audits: SyncRemovalAudit[] = [
+    {
+      pairId: "pair-1", platform: "spotify", playlistId: "sp-1", itemIdentity: "media:spotify-track-abc",
+      direction: "left-to-right", timestamp: "2026-09-12T18:00:00.000Z", outcome: "success", error: null,
+    },
+    {
+      pairId: "pair-2", platform: "youtube", playlistId: "yt-2", itemIdentity: "isrc:USTEST0000001",
+      direction: "right-to-left", timestamp: "2026-09-12T18:30:00.000Z", outcome: "failed",
+      error: "YouTube Music rejected the removal.",
+    },
+  ];
+  await store.recordRemovalAudits(run.id, audits);
+  await store.finishRun(run.id, "partial", "One mirrored removal failed.");
+  const integration: SyncIntegration = {
+    state: () => store.read(),
+    pair: (pairing) => store.pair(pairing),
+    unpair: (id) => store.update((state) => {
+      const index = state.pairs.findIndex((item) => item.id === id);
+      if (index < 0) throw new AppError("SYNC_PAIR_NOT_FOUND", "That playlist pair does not exist.", 404);
+      state.pairs.splice(index, 1);
+    }),
+    ignore: (ignore) => store.ignore(ignore),
+    unignore: (ref) => store.update((state) => {
+      const index = state.ignores.findIndex((item) => item.provider === ref.provider
+        && item.accountId === ref.accountId && item.playlistId === ref.playlistId);
+      if (index < 0) throw new AppError("SYNC_IGNORE_NOT_FOUND", "That playlist is not ignored.", 404);
+      state.ignores.splice(index, 1);
+    }),
+    run: async (pairId) => {
+      const started = await store.startRun(pairId);
+      await store.finishRun(started.id, "complete", "Mirrored verified changes.");
+      return { ...started, status: "complete", completedAt: new Date().toISOString(), message: "Mirrored verified changes." };
+    },
+  };
+  return { integration, store, runId: run.id };
+}
+
 describe("loopback server", () => {
+  it("exposes CSRF-protected pair, ignore, run and manual sync controls through the durable sync state", async () => {
+    const fixture = await syncFixture();
+    const { browser, host, csrf } = await setup(true, undefined, fixture.integration);
+    const initial = await browser.get("/api/sync").set("Host", host).expect(200);
+    expect(initial.body.pairs).toHaveLength(1);
+    expect(initial.body).not.toHaveProperty("baselines");
+    const created = await browser.post("/api/sync/pairs").set("Host", host).set("X-CSRF-Token", csrf).send({
+      left: { provider: "youtube", accountId: "account-1", playlistId: "yt-9" },
+      right: { provider: "spotify", accountId: "account-1", playlistId: "sp-9" },
+    }).expect(201);
+    expect(created.body.pairs).toHaveLength(2);
+    const addedId = created.body.pairs[1].id as string;
+    await browser.post("/api/sync/ignored").set("Host", host).set("X-CSRF-Token", csrf).send({
+      provider: "youtube", accountId: "account-1", playlistId: "yt-ignored", reason: "Review later",
+    }).expect(201);
+    const run = await browser.post("/api/sync/run").set("Host", host).set("X-CSRF-Token", csrf)
+      .send({ pairId: "pair-1" }).expect(200);
+    expect(run.body.run.status).toBe("complete");
+    const removed = await browser.delete(`/api/sync/pairs/${addedId}`).set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    expect(removed.body.pairs).toHaveLength(1);
+    const restored = await browser.delete("/api/sync/ignored/youtube/account-1/yt-ignored")
+      .set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    expect(restored.body.ignores).toHaveLength(0);
+    expect((await fixture.store.read()).runs).toHaveLength(2);
+    await browser.post("/api/sync/run").set("Host", host).send({ pairId: "pair-1" }).expect(403);
+  });
+
+  it("refuses to mirror without an explicit pair and rejects same-platform pairs", async () => {
+    const fixture = await syncFixture();
+    const started = vi.spyOn(fixture.integration, "run");
+    const { browser, host, csrf } = await setup(true, undefined, fixture.integration);
+    for (const body of [{}, { pairId: "" }, { pairId: 7 }]) {
+      const rejected = await browser.post("/api/sync/run").set("Host", host).set("X-CSRF-Token", csrf).send(body).expect(400);
+      expect(rejected.body.error.code).toBe("INVALID_SYNC_RUN");
+    }
+    expect(started).not.toHaveBeenCalled();
+    const invalid = await browser.post("/api/sync/pairs").set("Host", host).set("X-CSRF-Token", csrf).send({
+      left: { provider: "spotify", accountId: "account-1", playlistId: "sp-1" },
+      right: { provider: "spotify", accountId: "account-1", playlistId: "sp-2" },
+    }).expect(400);
+    expect(invalid.body.error.code).toBe("INVALID_SYNC_PAIR");
+    expect((await fixture.store.read()).pairs).toHaveLength(1);
+  });
+
+  it("fails closed with an explicit unavailable response when no sync service is configured", async () => {
+    const { browser, host, csrf } = await setup();
+    await browser.get("/api/sync").set("Host", host).expect(501);
+    await browser.post("/api/sync/run").set("Host", host).set("X-CSRF-Token", csrf).send({ pairId: "pair-1" }).expect(501);
+    const audit = await browser.get("/api/sync/removals").set("Host", host).expect(501);
+    expect(audit.body.error.code).toBe("SYNC_UNAVAILABLE");
+  });
+
+  it("exposes durable removal audit records with platform, identity, direction and outcome", async () => {
+    const fixture = await syncFixture();
+    const { browser, host } = await setup(true, undefined, fixture.integration);
+    const all = await browser.get("/api/sync/removals").set("Host", host).expect(200);
+    expect(all.body.removals).toHaveLength(2);
+    expect(all.body.removals[0]).toMatchObject({
+      runId: fixture.runId, runStatus: "partial", pairId: "pair-2", platform: "youtube", playlistId: "yt-2",
+      itemIdentity: "isrc:USTEST0000001", direction: "right-to-left", sourcePlatform: null,
+      timestamp: "2026-09-12T18:30:00.000Z", outcome: "failed", error: "YouTube Music rejected the removal.",
+    });
+    expect(all.body.removals[1]).toMatchObject({
+      pairId: "pair-1", platform: "spotify", itemIdentity: "media:spotify-track-abc",
+      direction: "left-to-right", sourcePlatform: "youtube", outcome: "success", error: null,
+    });
+    const state = await browser.get("/api/sync").set("Host", host).expect(200);
+    expect(state.body.removals).toHaveLength(2);
+    expect(state.body.runs[0].message).toBe("One mirrored removal failed.");
+    const scoped = await browser.get("/api/sync/removals?pairId=pair-2").set("Host", host).expect(200);
+    expect(scoped.body.removals.map((record: SyncRemovalRecord) => record.itemIdentity)).toEqual(["isrc:USTEST0000001"]);
+    const limited = await browser.get("/api/sync/removals?limit=1").set("Host", host).expect(200);
+    expect(limited.body.removals).toHaveLength(1);
+    expect(limited.body.removals[0].pairId).toBe("pair-2");
+  });
+
+  it.each(["limit=0", "limit=-1", "limit=abc", "limit=1001", "pairId=", "pairId=a&pairId=b"])(
+    "rejects the malformed removal audit query %s without reading records",
+    async (query) => {
+      const fixture = await syncFixture();
+      const read = vi.spyOn(fixture.integration, "state");
+      const { browser, host } = await setup(true, undefined, fixture.integration);
+      const rejected = await browser.get(`/api/sync/removals?${query}`).set("Host", host).expect(400);
+      expect(rejected.body.error.code).toBe("INVALID_SYNC_QUERY");
+      expect(read).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     ["GOOGLE_TOKEN_INVALID", true, 401, "The local Google token file is malformed. Reconnect Google."],
     ["GOOGLE_CONFIG_INVALID", false, 400, "Replace the invalid OAuth client file with a Desktop app JSON."],

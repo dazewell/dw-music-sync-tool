@@ -4,13 +4,17 @@ import path from "node:path";
 import { parseArgs } from "node:util";
 import { setTimeout } from "node:timers/promises";
 import { GoogleAuth } from "./auth/google.js";
-import { loadConfig } from "./config.js";
+import { SpotifyAuth } from "./auth/spotify.js";
+import { loadConfig, type AppConfig } from "./config.js";
 import { recoverInterruptedBackups, runBackup } from "./core/backup.js";
 import { AppError, errorMessage } from "./core/errors.js";
 import { DemoProvider } from "./providers/demo.js";
+import { SpotifyProvider } from "./providers/spotify.js";
 import { YouTubeProvider } from "./providers/youtube.js";
 import { acquireRuntimeLocks } from "./runtime-lock.js";
-import { createApp } from "./server/app.js";
+import { SyncStateStore } from "./core/sync-state.js";
+import { collectRemovalRecords, createApp, type SyncIntegration } from "./server/app.js";
+import { executeSyncRun, type SyncExecutorProviders } from "./services/sync-executor.js";
 import { RetentionController } from "./services/retention.js";
 
 const help = `Music library - local playlist backups
@@ -22,18 +26,58 @@ Usage:
   npm run backup -- --output D:\\Music\\Backups
   node dist/cli.js backup --demo     Export synthetic demo playlists
 
-Commands: serve (default), backup
+Commands: serve (default), backup, sync
 Options:
   --port <number>    Local web port (default 8787)
   --output <path>    Local backup directory (default backups)
   --demo            Use synthetic data, isolated under a demo subdirectory
+  --removals        With sync: print the durable removal audit records only
   --help            Show this help
+
+The sync command reports explicit playlist pairs, ignored playlists and recent
+runs from the local sync state. Removals are mirrored in both directions, so
+each one is recorded in a durable audit record with its platform, playlist,
+track identity, direction, time and outcome. Use sync --removals to review
+those records. Triggering a run (from the web app) mirrors an explicitly
+selected pair through the real YouTube provider and, if SPOTIFY_CLIENT_ID,
+SPOTIFY_CLIENT_SECRET and SPOTIFY_REFRESH_TOKEN are configured, the real
+Spotify provider; an unconfigured or demo side fails the run closed instead of
+pretending to succeed.
 
 Set up a Google Desktop OAuth client and connect in the web app first.
 App-managed exports expire after 30 days and are removed while this app is running.
 See README.md for coverage, credential storage and API retention limitations.
 Close the web app before running the standalone backup command.
 `;
+
+/**
+ * Binds the HTTP/CLI sync surface to durable core state. Pairing, ignoring and
+ * auditing are state decisions the store already owns. Executing a run needs
+ * real authenticated mutation providers; the caller supplies whichever ones
+ * are actually available in this process (never a fake/no-op writer), and an
+ * unavailable side fails the run closed with an actionable message instead of
+ * guessing.
+ */
+function createSyncIntegration(config: AppConfig, providers: SyncExecutorProviders): SyncIntegration {
+  const store = new SyncStateStore(path.join(config.dataDirectory, "sync-state.json"));
+  return {
+    state: () => store.read(),
+    pair: (pairing) => store.pair(pairing),
+    unpair: (id) => store.update((state) => {
+      const index = state.pairs.findIndex((item) => item.id === id);
+      if (index < 0) throw new AppError("SYNC_PAIR_NOT_FOUND", "That playlist pair does not exist.", 404);
+      state.pairs.splice(index, 1);
+    }),
+    ignore: (ignore) => store.ignore(ignore),
+    unignore: (ref) => store.update((state) => {
+      const index = state.ignores.findIndex((item) => item.provider === ref.provider
+        && item.accountId === ref.accountId && item.playlistId === ref.playlistId);
+      if (index < 0) throw new AppError("SYNC_IGNORE_NOT_FOUND", "That playlist is not ignored.", 404);
+      state.ignores.splice(index, 1);
+    }),
+    run: (pairId) => executeSyncRun(store, providers, pairId),
+  };
+}
 
 async function main(): Promise<void> {
   try {
@@ -47,21 +91,45 @@ async function main(): Promise<void> {
       port: { type: "string" },
       output: { type: "string" },
       demo: { type: "boolean" },
+      removals: { type: "boolean" },
       help: { type: "boolean", short: "h" },
     },
   });
   if (values.help) { console.log(help); return; }
   const command = positionals[0] ?? "serve";
-  if (!["serve", "backup"].includes(command) || positionals.length > 1) {
+  if (!["serve", "backup", "sync"].includes(command) || positionals.length > 1) {
     throw new AppError("INVALID_COMMAND", `Unknown command. Use --help for usage.`, 400);
   }
+  if (values.removals && command !== "sync") {
+    throw new AppError("INVALID_COMMAND", "--removals applies only to the sync command.", 400);
+  }
   const config = loadConfig(values);
+  if (command === "sync") {
+    // Reporting pairs/ignores/runs never mutates a remote playlist, so no providers are wired here.
+    const state = await createSyncIntegration(config, { youtube: null, spotify: null }).state();
+    if (values.removals) {
+      console.log(JSON.stringify({ removals: collectRemovalRecords(state) }, null, 2));
+      return;
+    }
+    console.log(JSON.stringify({
+      pairs: state.pairs,
+      ignores: state.ignores,
+      runs: state.runs,
+      removals: collectRemovalRecords(state, { limit: 20 }),
+    }, null, 2));
+    return;
+  }
   const auth = new GoogleAuth({
     credentialsFile: config.credentialsFile,
     tokenFile: config.tokenFile,
     redirectUri: config.redirectUri,
   });
   const provider = config.demo ? new DemoProvider() : new YouTubeProvider(() => auth.getAccessToken());
+  const spotifyAuth = config.spotify ? new SpotifyAuth(config.spotify) : null;
+  const syncProviders: SyncExecutorProviders = {
+    youtube: config.demo ? null : (provider as YouTubeProvider),
+    spotify: spotifyAuth ? new SpotifyProvider(() => spotifyAuth.getAccessToken()) : null,
+  };
 
   if (command === "backup") {
     const release = await acquireRuntimeLocks([config.dataDirectory, config.backupDirectory]);
@@ -104,7 +172,7 @@ async function main(): Promise<void> {
     await release();
     throw error;
   }
-  const { app, isBusy, stopRetention } = createApp({ config, auth, provider });
+  const { app, isBusy, stopRetention } = createApp({ config, auth, provider, sync: createSyncIntegration(config, syncProviders) });
   const server = app.listen(config.port, "127.0.0.1");
   try {
     await new Promise<void>((resolve, reject) => {

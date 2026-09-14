@@ -160,9 +160,88 @@ Direction: seed895a4aee / candidate4, mixing-desk studio console.
         </aside>
       </div>
 
+      <section class="sync-console" aria-labelledby="sync-title">
+        <div class="section-heading">
+          <div>
+            <h2 id="sync-title">Cross-platform sync</h2>
+            <p>Direct Spotify and YouTube Music APIs only. Removals mirror in both directions after the sync service verifies the plan.</p>
+          </div>
+          <div class="sync-trigger">
+            <label for="sync-pair">Pair to synchronize</label>
+            <select id="sync-pair" disabled></select>
+            <button id="sync-now" class="primary-button" type="button" disabled>Sync Pair</button>
+          </div>
+        </div>
+        <div id="sync-feedback" class="table-feedback" role="status" aria-live="polite">Checking sync service…</div>
+        <div class="sync-grid">
+          <section aria-labelledby="pair-list-title">
+            <h3 id="pair-list-title">Active pairs</h3>
+            <div id="sync-pairs"></div>
+          </section>
+          <section aria-labelledby="ignored-list-title">
+            <h3 id="ignored-list-title">Ignored playlists</h3>
+            <div id="sync-ignored"></div>
+          </section>
+          <section aria-labelledby="pair-form-title">
+            <h3 id="pair-form-title">Manage a pair</h3>
+            <form id="pair-form" class="sync-form">
+              <label for="pair-left-provider">First platform</label>
+              <select id="pair-left-provider" name="pair-left-provider">
+                <option value="spotify">Spotify</option>
+                <option value="youtube">YouTube Music</option>
+              </select>
+              <label for="pair-left-account">First account ID</label>
+              <input id="pair-left-account" name="pair-left-account" autocomplete="off" required>
+              <label for="pair-left-playlist">First playlist ID</label>
+              <input id="pair-left-playlist" name="pair-left-playlist" autocomplete="off" required>
+              <label for="pair-right-provider">Second platform</label>
+              <select id="pair-right-provider" name="pair-right-provider">
+                <option value="youtube">YouTube Music</option>
+                <option value="spotify">Spotify</option>
+              </select>
+              <label for="pair-right-account">Second account ID</label>
+              <input id="pair-right-account" name="pair-right-account" autocomplete="off" required>
+              <label for="pair-right-playlist">Second playlist ID</label>
+              <input id="pair-right-playlist" name="pair-right-playlist" autocomplete="off" required>
+              <button class="secondary-button" type="submit">Save pair</button>
+            </form>
+          </section>
+        </div>
+        <details class="sync-history">
+          <summary>Recent sync runs</summary>
+          <div id="sync-logs"></div>
+        </details>
+        <details class="sync-history" id="removal-audit">
+          <summary>Removal audit records</summary>
+          <div class="details-body">
+            <p>Removals are mirrored in both directions. Each attempt is kept as a durable record of the platform changed, the playlist, the provider-native track identity, the direction, the time and the outcome.</p>
+            <div class="section-heading">
+              <p id="removal-feedback" role="status" aria-live="polite">Checking removal audit records…</p>
+              <button id="refresh-removals" class="text-button" type="button" disabled>Refresh Removal Records</button>
+            </div>
+            <div id="removal-table-wrap" class="table-scroll" role="region" aria-label="Removal audit records" tabindex="0" hidden>
+              <table>
+                <caption class="visually-hidden">Durable records of mirrored playlist removals</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Platform</th>
+                    <th scope="col">Playlist</th>
+                    <th scope="col">Track identity</th>
+                    <th scope="col">Direction</th>
+                    <th scope="col">Time</th>
+                    <th scope="col">Outcome</th>
+                  </tr>
+                </thead>
+                <tbody id="removal-rows"></tbody>
+              </table>
+            </div>
+          </div>
+        </details>
+      </section>
+
       <footer class="workspace-footer">
         <p>Files stay local. Account authorization is read-only.</p>
-        <p><strong>Spotify sync</strong> <span class="future-label">Future · not available</span></p>
+        <p><strong>Spotify sync</strong> <span id="sync-footer-state" class="future-label">Checking availability…</span></p>
       </footer>
     </main>
   </body>

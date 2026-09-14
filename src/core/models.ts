@@ -38,6 +38,15 @@ export interface PlaylistProvider {
   getPlaylist(playlist: Playlist): Promise<PlaylistContents>;
 }
 
+export interface PlaylistMutation {
+  /** Replace the complete ordered occurrence list after a fresh observation. */
+  replacePlaylist(
+    playlist: Playlist,
+    entries: readonly PlaylistEntry[],
+    expectedSnapshotId?: string,
+  ): Promise<void>;
+}
+
 export interface PlaylistArchive extends PlaylistContents {
   schemaVersion: 1;
   exportedAt: string;

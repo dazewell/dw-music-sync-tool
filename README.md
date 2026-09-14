@@ -151,6 +151,17 @@ Copy `.env.example` to `.env` to override defaults, or set environment variables
 | `MUSIC_DATA_DIR` | `.local` |
 | `MUSIC_BACKUP_DIR` | `backups` |
 | `GOOGLE_CLIENT_SECRET_FILE` | `.local\client-secret.json` |
+| `SPOTIFY_CLIENT_ID` | unset (direct Spotify sync execution disabled) |
+| `SPOTIFY_CLIENT_SECRET` | unset (direct Spotify sync execution disabled) |
+| `SPOTIFY_REFRESH_TOKEN` | unset (direct Spotify sync execution disabled) |
+
+The three `SPOTIFY_*` variables are optional and must be set together, or all
+left unset; a partial set fails startup with an explicit configuration error.
+There is no in-app Spotify connect flow yet, so the refresh token must be
+obtained out-of-band (for example, with Spotify's Authorization Code flow and a
+one-time script) and stored only in your local, Git-ignored `.env`. Without
+them, an explicitly paired run whose changed side is Spotify fails closed with
+an actionable `SPOTIFY_NOT_CONFIGURED` error instead of pretending to sync.
 
 Relative paths resolve from the directory where the command runs. Demo mode uses
 a `demo` subdirectory for data and backups so it never uses real Google tokens.
@@ -279,15 +290,30 @@ action, not an infinite retry loop.
 
 ## The path to Spotify / YouTube sync
 
-This release **does not sync or modify platform playlists**. It establishes a
-provider interface, ordered fingerprints, ambiguity-aware same-name pairing
-logic and baseline change classification. These are the foundation for
-[#1](https://github.com/dazewell/dw-music-sync-tool/issues/1), not a pretend sync button.
+An explicitly paired playlist can now be mirrored bidirectionally through the
+real YouTube and Spotify APIs (no Soundiiz), directly from the web app's sync
+run control. Pairing, ignoring, ordered fingerprints, baseline change
+classification and plan/apply are implemented in `src/core/sync.ts` and
+`src/core/sync-state.ts`; running a pair re-observes both sides fresh, plans
+the changed direction, applies it through the authenticated provider, verifies
+the destination and records a new baseline plus a durable per-removal audit
+entry for every mirrored deletion (readable with `sync --removals` or
+`GET /api/sync/removals`). Only an explicit, already-created pair can be run;
+there is no name-based auto-matching or scheduling yet, and cross-platform
+recording-identity resolution (matching a YouTube video to the equivalent
+Spotify track) remains future work, so a mirrored entry still carries its
+source platform's native identifiers.
 
-The next feature should confirm a same-name pair, choose source/destination,
-preview matches and changes, protect the destination with a backup, apply the
-approved plan and verify the result. Timestamps alone cannot determine direction
-or conflicts. Matching tracks across platforms is separate from matching names.
+Direct Spotify execution additionally needs `SPOTIFY_CLIENT_ID`,
+`SPOTIFY_CLIENT_SECRET` and `SPOTIFY_REFRESH_TOKEN` (see Configuration above);
+there is no in-app Spotify connect flow yet, so an unconfigured or demo-mode
+run fails closed with an actionable `SPOTIFY_NOT_CONFIGURED` /
+`YOUTUBE_SYNC_NOT_AVAILABLE` error rather than a fake success.
+
+[#1](https://github.com/dazewell/dw-music-sync-tool/issues/1) still calls for
+richer review UI (preview before applying), scheduling and Soundiiz as an
+optional alternate executor. Timestamps alone cannot determine direction or
+conflicts; matching tracks across platforms is separate from matching names.
 
 **Research correction:** as checked on September 13, 2026, Soundiiz's live
 [User API documentation](https://soundiiz.com/api/doc) **does document**

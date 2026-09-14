@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { AppError } from "../core/errors.js";
-import type { Playlist, PlaylistContents, PlaylistEntry, PlaylistProvider } from "../core/models.js";
+import type { Playlist, PlaylistContents, PlaylistEntry, PlaylistMutation, PlaylistProvider } from "../core/models.js";
 
 const API_ROOT = "https://www.googleapis.com/youtube/v3/";
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -67,7 +67,7 @@ export interface YouTubeProviderOptions {
   sleep?: (ms: number) => Promise<void>;
 }
 
-export class YouTubeProvider implements PlaylistProvider {
+export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
   readonly id = "youtube" as const;
   readonly coverage = "Owned playlists exposed by the official YouTube Data API, including non-music videos; not a complete YouTube Music library. Saved third-party playlists and special Music collections (mixes, audio uploads, liked Music) are outside this backup's coverage. Private/deleted entries may have incomplete metadata. Metadata only; no audio downloads.";
   private readonly fetcher: typeof fetch;
@@ -117,6 +117,7 @@ export class YouTubeProvider implements PlaylistProvider {
     if (playlist.provider !== this.id || !playlist.id) {
       throw new AppError("YOUTUBE_PLAYLIST_INVALID", "A YouTube playlist is required.", 400);
     }
+
     const { items, totals } = await this.pages(
       "playlistItems",
       { part: "snippet,contentDetails,status", playlistId: playlist.id, maxResults: "50" },
@@ -144,6 +145,25 @@ export class YouTubeProvider implements PlaylistProvider {
       warnings.push("Some entries have no video ID in the API response; the entries were preserved without a media link.");
     }
     return { playlist, entries, warnings };
+  }
+
+  async replacePlaylist(playlist: Playlist, entries: readonly PlaylistEntry[]): Promise<void> {
+    if (playlist.provider !== this.id || !playlist.id) {
+      throw new AppError("YOUTUBE_PLAYLIST_INVALID", "A YouTube playlist is required.", 400);
+    }
+    if (entries.some(entry => entry.mediaId === null)) {
+      throw new AppError("YOUTUBE_ENTRY_UNSUPPORTED", "Unavailable entries cannot be written to YouTube without a video ID.", 409);
+    }
+    const current = await this.getPlaylist(playlist);
+    for (const entry of current.entries) {
+      await this.request(new URL(`playlistItems?${new URLSearchParams({ id: entry.id }).toString()}`, API_ROOT), { method: "DELETE" });
+    }
+    for (const entry of entries) {
+      await this.request(new URL("playlistItems", API_ROOT), {
+        method: "POST",
+        body: JSON.stringify({ snippet: { playlistId: playlist.id, resourceId: { kind: "youtube#video", videoId: entry.mediaId } } }),
+      });
+    }
   }
 
   private entry(item: YouTubeItem): PlaylistEntry {
@@ -194,7 +214,7 @@ export class YouTubeProvider implements PlaylistProvider {
     return { items, totals };
   }
 
-  private async request(url: URL): Promise<unknown> {
+  private async request(url: URL, init: RequestInit = {}): Promise<unknown> {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
       let token: string;
       try {
@@ -213,8 +233,9 @@ export class YouTubeProvider implements PlaylistProvider {
         const result = await Promise.race([
           (async () => {
             const fetched = await this.fetcher(url, {
-              method: "GET",
-              headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+              ...init,
+              method: init.method ?? "GET",
+              headers: { Authorization: `Bearer ${token}`, Accept: "application/json", ...(init.headers ?? {}) },
               signal: controller.signal,
               redirect: "error",
             });

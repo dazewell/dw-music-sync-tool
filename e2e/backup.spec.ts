@@ -73,6 +73,7 @@ const test = base.extend<{ serverUrl: string; demoMode: boolean; auth: Synthetic
       config.redirectUri = `${config.baseUrl}/auth/google/callback`;
       await use(config.baseUrl);
     } finally {
+      server.closeAllConnections();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       await stopRetention();
       await rm(directory, { recursive: true, force: true });
@@ -257,6 +258,85 @@ test("API errors stay explicit and refreshing the inventory recovers", async ({ 
   await page.getByRole("button", { name: "Refresh library", exact: true }).click();
   await expect(page.locator("#playlist-rows tr")).toHaveCount(4);
   await expect(page.locator("#library-feedback")).toBeHidden();
+});
+
+test("removal audit records are visible with platform, identity, direction and outcome", async ({ page, serverUrl }) => {
+  const removals = [
+    {
+      runId: "run-1", runStatus: "partial", pairId: "pair-1", platform: "youtube", playlistId: "yt-2",
+      itemIdentity: "isrc:USTEST0000001", direction: "right-to-left", sourcePlatform: "spotify",
+      timestamp: "2026-09-12T18:30:00.000Z", outcome: "failed", error: "YouTube Music rejected the removal.",
+    },
+    {
+      runId: "run-1", runStatus: "partial", pairId: "pair-1", platform: "spotify", playlistId: "sp-1",
+      itemIdentity: "media:spotify-track-abc", direction: "left-to-right", sourcePlatform: "youtube",
+      timestamp: "2026-09-12T18:00:00.000Z", outcome: "success", error: null,
+    },
+  ];
+  await page.route("**/api/sync", async (route) => {
+    await route.fulfill({ json: { pairs: [], ignores: [], runs: [], removals } });
+  });
+  await page.route("**/api/sync/removals*", async (route) => {
+    await route.fulfill({ json: { removals } });
+  });
+  await page.goto(serverUrl);
+  await page.getByText("Removal audit records", { exact: true }).click();
+  await expect(page.locator("#removal-feedback")).toContainText("2 recorded removals");
+  const rows = page.locator("#removal-rows tr");
+  await expect(rows).toHaveCount(2);
+  await expect(rows.nth(0)).toContainText("YouTube Music");
+  await expect(rows.nth(0)).toContainText("isrc:USTEST0000001");
+  await expect(rows.nth(0)).toContainText("Spotify → YouTube Music");
+  await expect(rows.nth(0)).toContainText("Failed");
+  await expect(rows.nth(0)).toContainText("YouTube Music rejected the removal.");
+  await expect(rows.nth(1)).toContainText("Spotify");
+  await expect(rows.nth(1)).toContainText("YouTube Music → Spotify");
+  await expect(rows.nth(1)).toContainText("Removed");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth)).toBe(false);
+});
+
+test("an unpaired library cannot trigger a mirror and reports unconfigured sync explicitly", async ({ page, serverUrl }) => {
+  await page.goto(serverUrl);
+  await expect(page.locator("#sync-feedback")).toContainText("not configured");
+  await expect(page.getByRole("button", { name: "Sync Pair", exact: true })).toBeDisabled();
+  await expect(page.getByLabel("Pair to synchronize")).toBeDisabled();
+  await expect(page.locator("#sync-pairs")).toContainText("No pairs have been confirmed.");
+  await page.getByText("Removal audit records", { exact: true }).click();
+  await expect(page.locator("#removal-feedback")).toContainText("require a configured synchronization service");
+  await expect(page.getByRole("button", { name: "Refresh Removal Records", exact: true })).toBeDisabled();
+  await expect(page.locator("#removal-table-wrap")).toBeHidden();
+});
+
+test("explicit pairs stay selectable and drive the manual mirror trigger", async ({ page, serverUrl }) => {
+  const pair = {
+    id: "pair-1",
+    left: { provider: "youtube", accountId: "account-1", playlistId: "yt-1" },
+    right: { provider: "spotify", accountId: "account-1", playlistId: "sp-1" },
+    enabled: true, createdAt: "2026-09-12T17:00:00.000Z", updatedAt: "2026-09-12T17:00:00.000Z",
+  };
+  const state = {
+    pairs: [pair],
+    ignores: [{ provider: "spotify", accountId: "account-1", playlistId: "sp-9", reason: "Ambiguous name", createdAt: "2026-09-12T17:00:00.000Z" }],
+    runs: [{ id: "run-1", pairId: "pair-1", status: "partial", startedAt: "2026-09-12T18:00:00.000Z", completedAt: "2026-09-12T18:31:00.000Z", message: "One mirrored removal failed." }],
+    removals: [],
+  };
+  await page.route("**/api/sync", async (route) => { await route.fulfill({ json: state }); });
+  const triggered: unknown[] = [];
+  await page.route("**/api/sync/run", async (route) => {
+    triggered.push(route.request().postDataJSON());
+    await route.fulfill({ json: { run: { ...state.runs[0], status: "complete", message: "Mirrored verified changes." } } });
+  });
+  await page.goto(serverUrl);
+  await expect(page.locator("#sync-pairs")).toContainText("YouTube Music yt-1 ↔ Spotify sp-1");
+  await expect(page.locator("#sync-pairs .badge")).toHaveText("Active");
+  await expect(page.locator("#sync-ignored")).toContainText("Spotify sp-9");
+  await expect(page.locator("#sync-ignored .badge")).toHaveText("Ignored");
+  await page.getByText("Recent sync runs", { exact: true }).click();
+  await expect(page.locator("#sync-logs")).toContainText("One mirrored removal failed.");
+  await expect(page.getByLabel("Pair to synchronize")).toHaveValue("pair-1");
+  await page.getByRole("button", { name: "Sync Pair", exact: true }).click();
+  await expect(page.locator("#notice")).toContainText("Synchronization completed.");
+  expect(triggered).toEqual([{ pairId: "pair-1" }]);
 });
 
 test("cleanup warnings remain visible and an explicit recheck recovers", async ({ page, serverUrl }) => {
