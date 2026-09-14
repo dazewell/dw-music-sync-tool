@@ -50,7 +50,9 @@ async function setup(demo = true, backupRunner?: Parameters<typeof createApp>[0]
   const auth = {
     status: vi.fn(async () => ({ configured: true, connected: true })),
     begin: vi.fn(async () => ({ url: "https://accounts.google.com/example", state: "test-state", codeVerifier: "test-verifier" })),
+    beginWrite: vi.fn(async () => ({ url: "https://accounts.google.com/write-example", state: "test-write-state", codeVerifier: "test-write-verifier" })),
     complete: vi.fn(async () => {}),
+    completeWrite: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
   };
   const provider = new DemoProvider();
@@ -322,6 +324,51 @@ describe("loopback server", () => {
     expect(auth.complete).toHaveBeenCalledExactlyOnceWith("code", "test-verifier");
     await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
     expect(auth.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("exposes a separate YouTube write authorization callback without replacing read credentials", async () => {
+    const { browser, host, csrf, auth } = await setup(false);
+    const started = await browser.post("/api/auth/connect-write").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    expect(started.body.url).toBe("https://accounts.google.com/write-example");
+    expect(auth.beginWrite).toHaveBeenCalledTimes(1);
+    const mismatch = await browser.get("/auth/google/callback?state=wrong-state&code=code").set("Host", host).expect(302);
+    expect(mismatch.headers.location).toContain("authError=");
+    expect(auth.completeWrite).not.toHaveBeenCalled();
+    await browser.get("/auth/google/callback?state=test-write-state&code=code").set("Host", host)
+      .expect(302).expect("Location", "/?writeConnected=1");
+    expect(auth.completeWrite).toHaveBeenCalledExactlyOnceWith("code", "test-write-verifier");
+    expect(auth.complete).not.toHaveBeenCalled();
+  });
+
+  it("rejects YouTube write authorization in demo mode", async () => {
+    const { browser, host, csrf, auth } = await setup(true);
+    const rejected = await browser.post("/api/auth/connect-write").set("Host", host).set("X-CSRF-Token", csrf).expect(400);
+    expect(rejected.body.error.code).toBe("DEMO_MODE");
+    expect(auth.beginWrite).not.toHaveBeenCalled();
+  });
+
+  it("rejects overlapping Google authorization starts without discarding the pending callback", async () => {
+    const { browser, host, csrf, auth } = await setup(false);
+    await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    const rejected = await browser.post("/api/auth/connect-write").set("Host", host).set("X-CSRF-Token", csrf).expect(409);
+    expect(rejected.body.error.code).toBe("AUTH_PENDING");
+    expect(auth.begin).toHaveBeenCalledTimes(1);
+    expect(auth.beginWrite).not.toHaveBeenCalled();
+    await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host)
+      .expect(302).expect("Location", "/?connected=1");
+    expect(auth.complete).toHaveBeenCalledExactlyOnceWith("code", "test-verifier");
+  });
+
+  it("rate-limits repeated Google authorization starts for one session", async () => {
+    const { browser, host, csrf, auth } = await setup(false);
+    for (let index = 0; index < 5; index += 1) {
+      await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+      await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
+    }
+    const limited = await browser.post("/api/auth/connect-write").set("Host", host).set("X-CSRF-Token", csrf).expect(429);
+    expect(limited.body.error.code).toBe("AUTH_RATE_LIMITED");
+    expect(auth.begin).toHaveBeenCalledTimes(5);
+    expect(auth.beginWrite).not.toHaveBeenCalled();
   });
 
   it.each([

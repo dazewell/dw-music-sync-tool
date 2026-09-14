@@ -164,7 +164,9 @@ async function main(): Promise<void> {
     tokenFile: config.tokenFile,
     redirectUri: config.redirectUri,
   });
-  const provider = config.demo ? new DemoProvider() : new YouTubeProvider(() => auth.getAccessToken());
+  const provider = config.demo
+    ? new DemoProvider()
+    : new YouTubeProvider(() => auth.getAccessToken(), { writeAccessToken: () => auth.getWriteAccessToken() });
   const spotifyAuth = config.spotify ? new SpotifyAuth(config.spotify) : null;
   const syncProviders: SyncExecutorProviders = {
     youtube: config.demo ? null : (provider as YouTubeProvider),

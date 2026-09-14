@@ -49,6 +49,8 @@ export interface SyncIntegration {
 
 const RECENT_RUNS = 20;
 const RECENT_REMOVALS = 100;
+const AUTH_START_WINDOW_MS = 600_000;
+const AUTH_START_LIMIT = 5;
 
 /** Optional filters for the durable removal audit history: safe equality checks
  * plus a case-insensitive substring search on the provider-native track identity. */
@@ -116,7 +118,7 @@ function readRef(value: unknown): SyncPairRef {
 
 export interface ServerDependencies {
   config: AppConfig;
-  auth: Pick<GoogleAuth, "status" | "begin" | "complete" | "disconnect">;
+  auth: Pick<GoogleAuth, "status" | "begin" | "beginWrite" | "complete" | "completeWrite" | "disconnect">;
   provider: PlaylistProvider;
   backupRunner?: typeof runBackup;
   sync?: SyncIntegration;
@@ -125,7 +127,7 @@ export interface ServerDependencies {
 interface BrowserSession {
   expiresAt: number;
   csrfToken: string;
-  oauth: { state: string; codeVerifier: string; expiresAt: number } | null;
+  oauth: { kind: "read" | "write"; state: string; codeVerifier: string; expiresAt: number } | null;
 }
 
 function sameSecret(actual: string | undefined, expected: string): boolean {
@@ -139,6 +141,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
   const app = express();
   const sessions = new Map<string, BrowserSession>();
   const jobs = new Map<string, BackupJob>();
+  const authStarts = new Map<string, { count: number; resetAt: number }>();
   let latestJob: BackupJob | null = null;
   let operation: "backup" | "auth" | "inventory" | "sync" | null = null;
   const expireJobs = () => {
@@ -197,6 +200,63 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     const status = await auth.status();
     if (!status.configured) throw new AppError("SETUP_REQUIRED", "Configure your Google Desktop OAuth client first. See README.", 400);
     if (!status.connected) throw new AppError("CONNECT_REQUIRED", "Connect your Google account before reading playlists.", 401);
+  }
+
+  async function beginGoogleAuthorization(req: Request, res: Response, kind: NonNullable<BrowserSession["oauth"]>["kind"]): Promise<void> {
+    if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
+    const current = session(req, res);
+    const pending = kind === "write" ? await auth.beginWrite() : await auth.begin();
+    current.oauth = { kind, state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
+    res.json({ url: pending.url });
+  }
+
+  function rejectPendingGoogleAuthorization(req: Request, res: Response, next: NextFunction): void {
+    const current = session(req, res);
+    if (current.oauth !== null) {
+      if (current.oauth.expiresAt <= Date.now()) {
+        current.oauth = null;
+      } else {
+        throw new AppError("AUTH_PENDING", "A Google authorization is already pending in this browser. Complete it or wait for it to expire before starting another.", 409);
+      }
+    }
+    next();
+  }
+
+  function rejectGoogleAuthorizationWhenBusy(_req: Request, _res: Response, next: NextFunction): void {
+    if (operation === "backup") {
+      throw new AppError("BACKUP_RUNNING", "A backup is already running. Wait for it to finish.", 409);
+    }
+    if (operation === "auth") {
+      throw new AppError("AUTH_BUSY", "Google authorization is changing. Wait for it to finish, then try again.", 409);
+    }
+    if (operation === "inventory") {
+      throw new AppError("INVENTORY_BUSY", "Playlists are being read. Wait for discovery to finish, then try again.", 409);
+    }
+    if (operation === "sync") {
+      throw new AppError("SYNC_BUSY", "A synchronization operation is already running. Wait for it to finish, then try again.", 409);
+    }
+    next();
+  }
+
+  function limitGoogleAuthorizationStarts(req: Request, res: Response, next: NextFunction): void {
+    if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
+    const current = session(req, res);
+    const now = Date.now();
+    for (const [key, value] of authStarts) {
+      if (value.resetAt <= now) authStarts.delete(key);
+    }
+    const key = current.csrfToken;
+    const attempt = authStarts.get(key);
+    if (attempt === undefined || attempt.resetAt <= now) {
+      authStarts.set(key, { count: 1, resetAt: now + AUTH_START_WINDOW_MS });
+      next();
+      return;
+    }
+    if (attempt.count >= AUTH_START_LIMIT) {
+      throw new AppError("AUTH_RATE_LIMITED", "Too many Google authorization attempts. Wait a few minutes, then try again.", 429);
+    }
+    attempt.count += 1;
+    next();
   }
 
   app.disable("x-powered-by");
@@ -261,14 +321,19 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     next();
   });
 
-  app.post("/api/auth/connect", async (req, res) => {
+  app.post("/api/auth/connect", rejectGoogleAuthorizationWhenBusy, rejectPendingGoogleAuthorization, limitGoogleAuthorizationStarts, async (req, res) => {
     const release = reserve("auth");
     try {
-      if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
-      const current = session(req, res);
-      const pending = await auth.begin();
-      current.oauth = { state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
-      res.json({ url: pending.url });
+      await beginGoogleAuthorization(req, res, "read");
+    } finally {
+      release();
+    }
+  });
+
+  app.post("/api/auth/connect-write", rejectGoogleAuthorizationWhenBusy, rejectPendingGoogleAuthorization, limitGoogleAuthorizationStarts, async (req, res) => {
+    const release = reserve("auth");
+    try {
+      await beginGoogleAuthorization(req, res, "write");
     } finally {
       release();
     }
@@ -300,8 +365,13 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
           throw new AppError("INVALID_AUTH_CODE", "Google did not return a valid authorization code.", 400);
         }
         current.oauth = null;
-        await auth.complete(code, pending.codeVerifier);
-        res.redirect("/?connected=1");
+        if (pending.kind === "write") {
+          await auth.completeWrite(code, pending.codeVerifier);
+          res.redirect("/?writeConnected=1");
+        } else {
+          await auth.complete(code, pending.codeVerifier);
+          res.redirect("/?connected=1");
+        }
       } finally {
         release();
       }
