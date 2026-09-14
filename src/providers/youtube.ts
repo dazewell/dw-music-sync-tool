@@ -278,7 +278,11 @@ export class YouTubeProvider implements PlaylistProvider, PlaylistMutation {
       let token: string;
       try {
         token = tokenKind === "write" ? await this.writeAccessToken!() : await this.accessToken();
-      } catch {
+      } catch (error) {
+        // Preserve a specific, actionable AppError from the token supplier (e.g. a distinct
+        // "write access not connected" or refresh failure) instead of masking it with a generic
+        // "check your Google connection" message that loses that detail.
+        if (error instanceof AppError) throw error;
         throw new AppError(
           tokenKind === "write" ? "YOUTUBE_WRITE_AUTH_FAILED" : "YOUTUBE_AUTH_FAILED",
           "Unable to obtain YouTube access. Check your Google connection and reconnect if needed.",

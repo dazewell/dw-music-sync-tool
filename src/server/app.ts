@@ -121,7 +121,7 @@ function readRef(value: unknown): SyncPairRef {
 
 export interface ServerDependencies {
   config: AppConfig;
-  auth: Pick<GoogleAuth, "status" | "begin" | "beginWrite" | "complete" | "completeWrite" | "disconnect">;
+  auth: Pick<GoogleAuth, "status" | "begin" | "beginWrite" | "complete" | "completeWrite" | "disconnect" | "disconnectWrite">;
   provider: PlaylistProvider;
   backupRunner?: typeof runBackup;
   sync?: SyncIntegration;
@@ -394,7 +394,17 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     try {
       if (config.demo) throw new AppError("DEMO_MODE", "Demo mode has no Google connection to disconnect.", 400);
       for (const current of sessions.values()) current.oauth = null;
-      await auth.disconnect();
+      // Revoke both the read-only and the separately-consented write-scope credential so
+      // Disconnect actually removes all Google access this app holds, not just the backup
+      // connection. Attempt both even if one fails, so a failure in either scope is reported
+      // and neither credential is silently left behind because the other one errored first.
+      const [readResult, writeResult] = await Promise.allSettled([auth.disconnect(), auth.disconnectWrite()]);
+      const failure = readResult.status === "rejected" ? readResult.reason
+        : writeResult.status === "rejected" ? writeResult.reason : null;
+      if (failure !== null) {
+        throw failure instanceof AppError ? failure
+          : new AppError("GOOGLE_DISCONNECT_LOCAL_FAILED", "Google disconnect did not complete for all credentials.", 500);
+      }
       res.json({ ok: true });
     } finally {
       release();

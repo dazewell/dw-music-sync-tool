@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SpotifyProvider } from "../src/providers/spotify.js";
+import { AppError } from "../src/core/errors.js";
 import type { Playlist, PlaylistEntry } from "../src/core/models.js";
 
 const playlist: Playlist = {
@@ -148,6 +149,29 @@ describe("SpotifyProvider.replacePlaylist", () => {
     expect(postBody).toMatchObject({ uris: ["spotify:track:new"] });
   });
 
+  it("chunks a delete of more than 100 current tracks and carries the returned snapshot id forward", async () => {
+    const trackCount = 150;
+    const items = Array.from({ length: trackCount }, (_, index) => trackItem(`spotify:track:old-${index}`, `Old ${index}`, index));
+    const { provider, fetcher } = fixture([
+      json({ snapshot_id: "snap-1" }),
+      json({ items, next: null }),
+      json({ snapshot_id: "snap-2" }),
+      json({ snapshot_id: "snap-3" }),
+      json({}),
+    ]);
+    await provider.replacePlaylist(playlist, [entry("spotify:track:new", "new")]);
+    const methods = fetcher.mock.calls.map(([, init]) => (init as RequestInit | undefined)?.method ?? "GET");
+    // Two GETs to read the playlist, two chunked DELETEs (100 + 50), then one POST insert.
+    expect(methods).toEqual(["GET", "GET", "DELETE", "DELETE", "POST"]);
+    const firstDeleteBody = JSON.parse((fetcher.mock.calls[2]![1] as RequestInit).body as string);
+    const secondDeleteBody = JSON.parse((fetcher.mock.calls[3]![1] as RequestInit).body as string);
+    expect(firstDeleteBody.tracks).toHaveLength(100);
+    expect(firstDeleteBody.snapshot_id).toBe("snap-1");
+    expect(secondDeleteBody.tracks).toHaveLength(50);
+    // The second batch must use the snapshot returned by the first, not the original read.
+    expect(secondDeleteBody.snapshot_id).toBe("snap-2");
+  });
+
   it("surfaces a partial failure explicitly when the insert fails after the delete succeeded", async () => {
     const { provider, fetcher } = fixture([
       json({ snapshot_id: "snap-1" }),
@@ -186,5 +210,27 @@ describe("SpotifyProvider.listPlaylists", () => {
       url: "https://open.spotify.com/playlist/playlist-2", owner: "user-1", itemCount: 0, visibility: "public",
     }]);
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("SpotifyProvider request auth failures", () => {
+  it("preserves a specific AppError thrown by the token supplier instead of masking it", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const supplier = vi.fn(async () => {
+      throw new AppError("SPOTIFY_AUTH_REJECTED", "Spotify's refresh token was rejected; reconnect Spotify.", 401);
+    });
+    const provider = new SpotifyProvider(supplier, { fetch: fetcher });
+    await expect(provider.listPlaylists()).rejects.toMatchObject({ code: "SPOTIFY_AUTH_REJECTED" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a generic auth error for a non-AppError token supplier failure", async () => {
+    const fetcher = vi.fn<typeof fetch>();
+    const supplier = vi.fn(async () => {
+      throw new Error("network blip");
+    });
+    const provider = new SpotifyProvider(supplier, { fetch: fetcher });
+    await expect(provider.listPlaylists()).rejects.toMatchObject({ code: "SPOTIFY_AUTH_FAILED" });
+    expect(fetcher).not.toHaveBeenCalled();
   });
 });

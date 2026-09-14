@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { YouTubeProvider } from "../src/providers/youtube.js";
+import { AppError } from "../src/core/errors.js";
 import type { Playlist } from "../src/core/models.js";
 
 const playlist: Playlist = {
@@ -478,6 +479,14 @@ describe("YouTubeProvider failures and retry policy", () => {
     expect(error).toMatchObject({ code: "YOUTUBE_NETWORK" });
     expect(String(error)).not.toContain("secret");
   });
+
+  it("preserves a specific AppError thrown by the token supplier instead of masking it", async () => {
+    const tokenFailure = new YouTubeProvider(async () => {
+      throw new AppError("GOOGLE_WRITE_NOT_CONNECTED", "Connect write access before syncing.", 401);
+    });
+    await expect(tokenFailure.listPlaylists()).rejects.toMatchObject({ code: "GOOGLE_WRITE_NOT_CONNECTED" });
+  });
+
 
   it("bounds a hung request and aborts its fetch signal", async () => {
     vi.useFakeTimers();

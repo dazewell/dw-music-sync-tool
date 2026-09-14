@@ -58,8 +58,8 @@ describe("executeSyncRun", () => {
     const store = await makeStore();
     await store.pair({
       id: "pair-1",
-      left: { provider: "youtube", accountId: "acct", playlistId: "yt-1" },
-      right: { provider: "spotify", accountId: "acct", playlistId: "sp-1" },
+      left: { provider: "youtube", accountId: "default", playlistId: "yt-1" },
+      right: { provider: "spotify", accountId: "default", playlistId: "sp-1" },
       enabled: true, createdAt: now, updatedAt: now,
     });
     const providers: SyncExecutorProviders = { youtube: new FakeProvider("youtube", [], new Map()), spotify: null };
@@ -80,8 +80,8 @@ describe("executeSyncRun", () => {
     const store = await makeStore();
     await store.pair({
       id: "pair-1",
-      left: { provider: "youtube", accountId: "acct", playlistId: "yt-1" },
-      right: { provider: "spotify", accountId: "acct", playlistId: "sp-1" },
+      left: { provider: "youtube", accountId: "default", playlistId: "yt-1" },
+      right: { provider: "spotify", accountId: "default", playlistId: "sp-1" },
       enabled: true, createdAt: now, updatedAt: now,
     });
     const providers: SyncExecutorProviders = {
@@ -93,12 +93,32 @@ describe("executeSyncRun", () => {
     expect(state.runs[0]?.status).toBe("failed");
   });
 
+  it("fails closed when a fresh discovery finds the paired playlist ID under a different account", async () => {
+    const store = await makeStore();
+    await store.pair({
+      id: "pair-1",
+      left: { provider: "youtube", accountId: "old-account", playlistId: "yt-1" },
+      right: { provider: "spotify", accountId: "default", playlistId: "sp-1" },
+      enabled: true, createdAt: now, updatedAt: now,
+    });
+    const providers: SyncExecutorProviders = {
+      // Same playlist ID as the pair, but now discovered under a different owner - for example
+      // after the configured account changed, or the ID collides with a followed/collaborative
+      // playlist the current account can see but does not own.
+      youtube: new FakeProvider("youtube", [{ ...playlist("yt-1", "youtube"), owner: "new-account" }], new Map()),
+      spotify: new FakeProvider("spotify", [playlist("sp-1", "spotify")], new Map()),
+    };
+    await expect(executeSyncRun(store, providers, "pair-1")).rejects.toMatchObject({ code: "SYNC_PLAYLIST_ACCOUNT_MISMATCH" });
+    const state = await store.read();
+    expect(state.runs[0]?.status).toBe("failed");
+  });
+
   it("records an uninitialized pair as review-required without mutating either side", async () => {
     const store = await makeStore();
     await store.pair({
       id: "pair-1",
-      left: { provider: "youtube", accountId: "acct", playlistId: "yt-1" },
-      right: { provider: "spotify", accountId: "acct", playlistId: "sp-1" },
+      left: { provider: "youtube", accountId: "default", playlistId: "yt-1" },
+      right: { provider: "spotify", accountId: "default", playlistId: "sp-1" },
       enabled: true, createdAt: now, updatedAt: now,
     });
     const youtube = new FakeProvider("youtube", [playlist("yt-1", "youtube")], new Map([["yt-1", [entry("a", "a")]]]));
@@ -123,8 +143,8 @@ describe("executeSyncRun", () => {
     const store = await makeStore();
     await store.pair({
       id: "pair-1",
-      left: { provider: "youtube", accountId: "acct", playlistId: "yt-1" },
-      right: { provider: "spotify", accountId: "acct", playlistId: "sp-1" },
+      left: { provider: "youtube", accountId: "default", playlistId: "yt-1" },
+      right: { provider: "spotify", accountId: "default", playlistId: "sp-1" },
       enabled: true, createdAt: now, updatedAt: now,
     });
     const oldLeft = [entry("old-a", "a"), entry("old-b", "b")];

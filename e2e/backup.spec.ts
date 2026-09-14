@@ -58,6 +58,9 @@ const test = base.extend<{ serverUrl: string; demoMode: boolean; auth: Synthetic
           requireRealMode();
           auth.connected = false;
         },
+        disconnectWrite: async () => {
+          requireRealMode();
+        },
       },
     });
     const server = app.listen(0, "127.0.0.1");

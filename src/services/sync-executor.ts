@@ -54,6 +54,18 @@ async function observe(provider: MutablePlaylistProvider, ref: SyncPairRef) {
       404,
     );
   }
+  // A playlist ID alone is not sufficient: after switching the configured account, a fresh
+  // discovery can still return a followed/collaborative playlist that happens to share the same
+  // ID under a different owner. Verify the discovered owner still matches the account the pair
+  // was created against before reading or mutating anything.
+  const discoveredAccountId = playlist.owner.trim() || "default";
+  if (discoveredAccountId !== ref.accountId) {
+    throw new AppError(
+      "SYNC_PLAYLIST_ACCOUNT_MISMATCH",
+      `The paired ${ref.provider} playlist is no longer owned by the account this pair was created for; it may belong to a different or switched account.`,
+      409,
+    );
+  }
   // Re-read fresh content (not the just-listed summary) so a stale plan is never applied.
   return provider.getPlaylist(playlist);
 }

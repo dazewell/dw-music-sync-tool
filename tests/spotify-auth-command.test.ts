@@ -153,6 +153,23 @@ describe("runSpotifyAuth", () => {
       fetch: fetchMock as unknown as typeof fetch, openBrowser, log: () => {},
     })).rejects.toMatchObject({ code: "SPOTIFY_AUTH_TOKEN_INVALID" });
   });
+
+  it("aborts a hung token exchange instead of waiting forever", async () => {
+    const directory = await tempDir();
+    const envPath = path.join(directory, ".env");
+    await writeFile(envPath, "SPOTIFY_CLIENT_ID=abc\nSPOTIFY_CLIENT_SECRET=def\n", "utf8");
+    // Simulates a real fetch: never resolves on its own, but rejects once its abort signal fires.
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+    }));
+    const openBrowser = vi.fn((url: string) => driveCallback(url));
+
+    await expect(runSpotifyAuth({
+      envPath, port: 0, clientId: "abc", clientSecret: "def", tokenExchangeTimeoutMs: 20,
+      fetch: fetchMock as unknown as typeof fetch, openBrowser, log: () => {},
+    })).rejects.toMatchObject({ code: "SPOTIFY_AUTH_NETWORK" });
+    expect(fetchMock.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+  });
 });
 
 describe("defaultOpenBrowser", () => {

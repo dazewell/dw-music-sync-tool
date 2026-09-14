@@ -54,6 +54,7 @@ async function setup(demo = true, backupRunner?: Parameters<typeof createApp>[0]
     complete: vi.fn(async () => {}),
     completeWrite: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
+    disconnectWrite: vi.fn(async () => {}),
   };
   const provider = new DemoProvider();
   const { app, stopRetention, isBusy } = createApp({ config, auth, provider, ...(backupRunner ? { backupRunner } : {}), ...(sync ? { sync } : {}) });
@@ -585,6 +586,21 @@ describe("loopback server", () => {
     }
     expect(isBusy()).toBe(false);
     await browser.post("/api/auth/disconnect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    expect(auth.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("revokes both the read-only and write-scope Google credentials on disconnect", async () => {
+    const { browser, host, csrf, auth } = await setup(false);
+    await browser.post("/api/auth/disconnect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    expect(auth.disconnect).toHaveBeenCalledTimes(1);
+    expect(auth.disconnectWrite).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a failure to disconnect the write-scope credential instead of reporting success", async () => {
+    const { browser, host, csrf, auth } = await setup(false);
+    auth.disconnectWrite.mockRejectedValueOnce(new AppError("GOOGLE_DISCONNECT_LOCAL_FAILED", "Write credential could not be removed.", 500));
+    const response = await browser.post("/api/auth/disconnect").set("Host", host).set("X-CSRF-Token", csrf).expect(500);
+    expect(response.body.error.code).toBe("GOOGLE_DISCONNECT_LOCAL_FAILED");
     expect(auth.disconnect).toHaveBeenCalledTimes(1);
   });
 

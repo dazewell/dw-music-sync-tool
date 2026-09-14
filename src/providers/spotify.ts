@@ -184,10 +184,18 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
       .map((entry, position) => ({ uri: typeof entry.providerData.uri === "string" ? entry.providerData.uri : null, positions: [position] }))
       .filter((track): track is { uri: string; positions: number[] } => track.uri !== null);
     if (tracks.length) {
-      await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items`, {
-        method: "DELETE",
-        body: JSON.stringify({ tracks, snapshot_id: current.playlist.snapshotId }),
-      });
+      // Spotify's removal endpoint accepts at most 100 track objects per request, and each
+      // successful removal returns a fresh snapshot_id that the next batch must use, or the
+      // API rejects it as stale. Chunk removals and carry the returned snapshot forward.
+      let snapshotId = current.playlist.snapshotId;
+      for (let index = 0; index < tracks.length; index += 100) {
+        const body = await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items`, {
+          method: "DELETE",
+          body: JSON.stringify({ tracks: tracks.slice(index, index + 100), snapshot_id: snapshotId }),
+        });
+        const parsed = snapshotSchema.safeParse(body);
+        if (parsed.success) snapshotId = parsed.data.snapshot_id;
+      }
     }
     for (let index = 0; index < validatedUris.length; index += 100) {
       await this.request(`${API_ROOT}playlists/${encodeURIComponent(playlist.id)}/items`, {
@@ -199,7 +207,15 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
 
   private async request(url: string, init: RequestInit = {}): Promise<unknown> {
     let token: string;
-    try { token = await this.accessToken(); } catch { throw new AppError("SPOTIFY_AUTH_FAILED", "Unable to obtain Spotify access.", 401); }
+    try {
+      token = await this.accessToken();
+    } catch (error) {
+      // Preserve a specific, actionable AppError from the token supplier (e.g. a rejected or
+      // expired refresh token with reconfiguration instructions) instead of masking it with a
+      // generic message.
+      if (error instanceof AppError) throw error;
+      throw new AppError("SPOTIFY_AUTH_FAILED", "Unable to obtain Spotify access.", 401);
+    }
     if (!token) throw new AppError("SPOTIFY_AUTH_FAILED", "Connect Spotify before synchronizing playlists.", 401);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeout);

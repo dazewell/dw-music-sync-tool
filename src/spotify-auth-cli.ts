@@ -15,6 +15,7 @@ const TOKEN_URL = "https://accounts.spotify.com/api/token";
 const SCOPES = "playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private";
 const DEFAULT_PORT = 8888;
 const CALLBACK_TIMEOUT_MS = 5 * 60_000;
+const TOKEN_EXCHANGE_TIMEOUT_MS = 20_000;
 
 const HELP = `Spotify authorization - one-time local PKCE Authorization Code flow
 
@@ -136,10 +137,13 @@ interface ExchangeOptions {
   code: string;
   redirectUri: string;
   codeVerifier: string;
+  timeoutMs?: number;
 }
 
 async function exchangeCode(options: ExchangeOptions): Promise<string> {
   let response: Response;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? TOKEN_EXCHANGE_TIMEOUT_MS);
   try {
     response = await options.fetch(TOKEN_URL, {
       method: "POST",
@@ -154,9 +158,12 @@ async function exchangeCode(options: ExchangeOptions): Promise<string> {
         code_verifier: options.codeVerifier,
       }).toString(),
       redirect: "error",
+      signal: controller.signal,
     });
   } catch {
     throw new AppError("SPOTIFY_AUTH_NETWORK", "Unable to reach Spotify to exchange the authorization code.", 502);
+  } finally {
+    clearTimeout(timer);
   }
   if (!response.ok) {
     throw new AppError(
@@ -223,6 +230,8 @@ export interface SpotifyAuthCliOptions {
   fetch?: typeof fetch;
   openBrowser?: (url: string) => void;
   log?: (message: string) => void;
+  /** Overrides the token-exchange fetch timeout; intended for tests, defaults to TOKEN_EXCHANGE_TIMEOUT_MS. */
+  tokenExchangeTimeoutMs?: number;
 }
 
 /** Runs a local Authorization Code with PKCE flow and saves only the refresh token to .env. */
@@ -273,6 +282,7 @@ export async function runSpotifyAuth(options: SpotifyAuthCliOptions): Promise<{ 
 
   const refreshToken = await exchangeCode({
     fetch: fetcher, clientId: options.clientId, clientSecret: options.clientSecret, code, redirectUri, codeVerifier,
+    ...(options.tokenExchangeTimeoutMs !== undefined ? { timeoutMs: options.tokenExchangeTimeoutMs } : {}),
   });
 
   await updateEnvRefreshToken(options.envPath, refreshToken);
