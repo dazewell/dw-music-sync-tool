@@ -73,7 +73,9 @@ export function fingerprintPlaylist(provider: ProviderId, entries: readonly Play
 export type SyncComparison = "unchanged" | "source-changed" | "target-changed" | "conflict" | "uninitialized";
 
 export interface SyncBaseline {
+  /** Fingerprint of the pair's left side at the last verified sync. */
   sourceFingerprint: string;
+  /** Fingerprint of the pair's right side at the last verified sync. */
   targetFingerprint: string;
 }
 

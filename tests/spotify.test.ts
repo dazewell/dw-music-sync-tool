@@ -152,4 +152,12 @@ describe("SpotifyProvider.replacePlaylist", () => {
       .rejects.toMatchObject({ code: "SPOTIFY_REQUEST_FAILED" });
     expect(fetcher).toHaveBeenCalledTimes(4);
   });
+
+  it("refuses a continuation URL outside the Spotify Web API instead of sending the token there", async () => {
+    const { provider, fetcher } = fixture([
+      json({ items: [], next: "https://attacker.example.com/v1/me/playlists?limit=50" }),
+    ]);
+    await expect(provider.listPlaylists()).rejects.toMatchObject({ code: "SPOTIFY_RESPONSE_INVALID" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
 });

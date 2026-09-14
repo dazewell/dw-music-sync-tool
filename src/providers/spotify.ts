@@ -39,6 +39,20 @@ const playlistPageSchema = z.object({
 });
 const snapshotSchema = z.object({ snapshot_id: z.string().min(1) });
 
+/** Continuation URLs come from responses; they must never send the token elsewhere. */
+function requireApiUrl(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new AppError("SPOTIFY_RESPONSE_INVALID", "Spotify returned an unusable continuation URL.", 502);
+  }
+  if (!parsed.href.startsWith(API_ROOT)) {
+    throw new AppError("SPOTIFY_RESPONSE_INVALID", "Spotify returned a continuation URL outside the Spotify Web API.", 502);
+  }
+  return parsed.href;
+}
+
 export interface SpotifyProviderOptions {
   fetch?: typeof fetch;
   requestTimeoutMs?: number;
@@ -73,7 +87,7 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
           visibility: raw.collaborative ? "unknown" : raw.public ? "public" : "private",
         });
       }
-      next = page.data.next ?? null;
+      next = page.data.next ? requireApiUrl(page.data.next) : null;
     }
     return result;
   }
@@ -124,7 +138,7 @@ export class SpotifyProvider implements PlaylistProvider, PlaylistMutation {
           providerData: track ? { uri: track.uri, isrc: track.external_ids?.isrc, durationMs: track.duration_ms } : {},
         });
       }
-      next = page.data.next ?? null;
+      next = page.data.next ? requireApiUrl(page.data.next) : null;
     }
     return {
       playlist: { ...playlist, snapshotId },
