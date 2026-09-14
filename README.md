@@ -379,10 +379,13 @@ take effect once cross-platform matching lands. There is also no name-based
 auto-matching or scheduling yet.
 
 Direct Spotify execution additionally needs `SPOTIFY_CLIENT_ID`,
-`SPOTIFY_CLIENT_SECRET` and `SPOTIFY_REFRESH_TOKEN` (see Configuration above);
-there is no in-app Spotify connect flow yet, so an unconfigured or demo-mode
-run fails closed with an actionable `SPOTIFY_NOT_CONFIGURED` /
-`YOUTUBE_SYNC_NOT_AVAILABLE` error rather than a fake success.
+`SPOTIFY_CLIENT_SECRET` and `SPOTIFY_REFRESH_TOKEN` (see Configuration above).
+YouTube playlist writes require a separate write-scope Google consent; with the
+server running, POST `/api/auth/connect-write` from the local app session to
+open that authorization flow. There is no in-app Spotify connect flow yet, so
+an unconfigured or demo-mode run fails closed with an actionable
+`SPOTIFY_NOT_CONFIGURED` / `YOUTUBE_SYNC_NOT_AVAILABLE` error rather than a
+fake success.
 
 [#1](https://github.com/dazewell/dw-music-sync-tool/issues/1) still calls for
 richer review UI (preview before applying), scheduling and Soundiiz as an

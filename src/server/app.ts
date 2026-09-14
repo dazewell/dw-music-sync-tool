@@ -116,7 +116,7 @@ function readRef(value: unknown): SyncPairRef {
 
 export interface ServerDependencies {
   config: AppConfig;
-  auth: Pick<GoogleAuth, "status" | "begin" | "complete" | "disconnect">;
+  auth: Pick<GoogleAuth, "status" | "begin" | "beginWrite" | "complete" | "completeWrite" | "disconnect">;
   provider: PlaylistProvider;
   backupRunner?: typeof runBackup;
   sync?: SyncIntegration;
@@ -125,7 +125,7 @@ export interface ServerDependencies {
 interface BrowserSession {
   expiresAt: number;
   csrfToken: string;
-  oauth: { state: string; codeVerifier: string; expiresAt: number } | null;
+  oauth: { kind: "read" | "write"; state: string; codeVerifier: string; expiresAt: number } | null;
 }
 
 function sameSecret(actual: string | undefined, expected: string): boolean {
@@ -267,7 +267,20 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
       if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
       const current = session(req, res);
       const pending = await auth.begin();
-      current.oauth = { state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
+      current.oauth = { kind: "read", state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
+      res.json({ url: pending.url });
+    } finally {
+      release();
+    }
+  });
+
+  app.post("/api/auth/connect-write", async (req, res) => {
+    const release = reserve("auth");
+    try {
+      if (config.demo) throw new AppError("DEMO_MODE", "Demo mode does not connect to Google.", 400);
+      const current = session(req, res);
+      const pending = await auth.beginWrite();
+      current.oauth = { kind: "write", state: pending.state, codeVerifier: pending.codeVerifier, expiresAt: Date.now() + 600_000 };
       res.json({ url: pending.url });
     } finally {
       release();
@@ -300,8 +313,13 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
           throw new AppError("INVALID_AUTH_CODE", "Google did not return a valid authorization code.", 400);
         }
         current.oauth = null;
-        await auth.complete(code, pending.codeVerifier);
-        res.redirect("/?connected=1");
+        if (pending.kind === "write") {
+          await auth.completeWrite(code, pending.codeVerifier);
+          res.redirect("/?writeConnected=1");
+        } else {
+          await auth.complete(code, pending.codeVerifier);
+          res.redirect("/?connected=1");
+        }
       } finally {
         release();
       }

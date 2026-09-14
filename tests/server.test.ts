@@ -50,7 +50,9 @@ async function setup(demo = true, backupRunner?: Parameters<typeof createApp>[0]
   const auth = {
     status: vi.fn(async () => ({ configured: true, connected: true })),
     begin: vi.fn(async () => ({ url: "https://accounts.google.com/example", state: "test-state", codeVerifier: "test-verifier" })),
+    beginWrite: vi.fn(async () => ({ url: "https://accounts.google.com/write-example", state: "test-write-state", codeVerifier: "test-write-verifier" })),
     complete: vi.fn(async () => {}),
+    completeWrite: vi.fn(async () => {}),
     disconnect: vi.fn(async () => {}),
   };
   const provider = new DemoProvider();
@@ -322,6 +324,17 @@ describe("loopback server", () => {
     expect(auth.complete).toHaveBeenCalledExactlyOnceWith("code", "test-verifier");
     await browser.get("/auth/google/callback?state=test-state&code=code").set("Host", host).expect(302);
     expect(auth.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("exposes a separate YouTube write authorization callback without replacing read credentials", async () => {
+    const { browser, host, csrf, auth } = await setup(false);
+    const started = await browser.post("/api/auth/connect-write").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    expect(started.body.url).toBe("https://accounts.google.com/write-example");
+    expect(auth.beginWrite).toHaveBeenCalledTimes(1);
+    await browser.get("/auth/google/callback?state=test-write-state&code=code").set("Host", host)
+      .expect(302).expect("Location", "/?writeConnected=1");
+    expect(auth.completeWrite).toHaveBeenCalledExactlyOnceWith("code", "test-write-verifier");
+    expect(auth.complete).not.toHaveBeenCalled();
   });
 
   it.each([
