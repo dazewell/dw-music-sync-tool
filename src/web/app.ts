@@ -1255,7 +1255,7 @@ const callbackUrl = new URL(window.location.href);
 const authError = callbackUrl.searchParams.get("authError");
 if (authError) notify(`YouTube authorization was not completed. ${authError}`, "error");
 else if (callbackUrl.searchParams.get("connected") === "1") notify("YouTube authorization completed. Checking your connection…", "success");
-else if (callbackUrl.searchParams.get("writeConnected") === "1") notify("YouTube write authorization completed.", "success");
+else if (callbackUrl.searchParams.get("writeConnected") === "1") notify("YouTube write authorization completed. Playlist sync can now apply changes.", "success");
 if (callbackUrl.searchParams.has("authError") || callbackUrl.searchParams.has("connected") || callbackUrl.searchParams.has("writeConnected")) {
   callbackUrl.searchParams.delete("authError");
   callbackUrl.searchParams.delete("connected");

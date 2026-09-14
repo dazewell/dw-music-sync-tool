@@ -49,6 +49,8 @@ export interface SyncIntegration {
 
 const RECENT_RUNS = 20;
 const RECENT_REMOVALS = 100;
+const AUTH_START_WINDOW_MS = 600_000;
+const AUTH_START_LIMIT = 5;
 
 /** Optional filters for the durable removal audit history: safe equality checks
  * plus a case-insensitive substring search on the provider-native track identity. */
@@ -139,6 +141,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
   const app = express();
   const sessions = new Map<string, BrowserSession>();
   const jobs = new Map<string, BackupJob>();
+  const authStarts = new Map<string, { count: number; resetAt: number }>();
   let latestJob: BackupJob | null = null;
   let operation: "backup" | "auth" | "inventory" | "sync" | null = null;
   const expireJobs = () => {
@@ -207,6 +210,26 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     res.json({ url: pending.url });
   }
 
+  function limitGoogleAuthorizationStarts(req: Request, res: Response, next: NextFunction): void {
+    const current = session(req, res);
+    const now = Date.now();
+    for (const [key, value] of authStarts) {
+      if (value.resetAt <= now) authStarts.delete(key);
+    }
+    const key = current.csrfToken;
+    const attempt = authStarts.get(key);
+    if (attempt === undefined || attempt.resetAt <= now) {
+      authStarts.set(key, { count: 1, resetAt: now + AUTH_START_WINDOW_MS });
+      next();
+      return;
+    }
+    if (attempt.count >= AUTH_START_LIMIT) {
+      throw new AppError("AUTH_RATE_LIMITED", "Too many Google authorization attempts. Wait a few minutes, then try again.", 429);
+    }
+    attempt.count += 1;
+    next();
+  }
+
   app.disable("x-powered-by");
   app.use((req, res, next) => {
     res.set({
@@ -269,7 +292,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     next();
   });
 
-  app.post("/api/auth/connect", async (req, res) => {
+  app.post("/api/auth/connect", limitGoogleAuthorizationStarts, async (req, res) => {
     const release = reserve("auth");
     try {
       await beginGoogleAuthorization(req, res, "read");
@@ -278,7 +301,7 @@ export function createApp({ config, auth, provider, backupRunner = runBackup, sy
     }
   });
 
-  app.post("/api/auth/connect-write", async (req, res) => {
+  app.post("/api/auth/connect-write", limitGoogleAuthorizationStarts, async (req, res) => {
     const release = reserve("auth");
     try {
       await beginGoogleAuthorization(req, res, "write");

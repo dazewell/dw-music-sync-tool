@@ -347,6 +347,17 @@ describe("loopback server", () => {
     expect(auth.beginWrite).not.toHaveBeenCalled();
   });
 
+  it("rate-limits repeated Google authorization starts for one session", async () => {
+    const { browser, host, csrf, auth } = await setup(false);
+    for (let index = 0; index < 5; index += 1) {
+      await browser.post("/api/auth/connect").set("Host", host).set("X-CSRF-Token", csrf).expect(200);
+    }
+    const limited = await browser.post("/api/auth/connect-write").set("Host", host).set("X-CSRF-Token", csrf).expect(429);
+    expect(limited.body.error.code).toBe("AUTH_RATE_LIMITED");
+    expect(auth.begin).toHaveBeenCalledTimes(5);
+    expect(auth.beginWrite).not.toHaveBeenCalled();
+  });
+
   it.each([
     "state=wrong-state&code=code",
     "code=code",
